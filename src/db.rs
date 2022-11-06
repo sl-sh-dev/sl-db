@@ -1,8 +1,8 @@
+use crate::fxhasher::FxHasher;
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -149,7 +149,7 @@ impl Default for HdxHeader {
     }
 }
 
-pub struct Db<K, V, const KSIZE: u16, S = RandomState> {
+pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>> {
     _header: DataHeader,
     data_file: RefCell<File>,
     vdx_file: RefCell<File>,
@@ -196,23 +196,25 @@ where
     pub fn fetch(&self, key: K) -> Result<V, std::io::Error> {
         let hash = self.hash(&key);
         let bucket = self.get_bucket(hash);
+        println!("XXXX hash: {}, bucket {}", hash, bucket);
 
         // Load the initial bucket into self.buffer for the call to search_bucket.
         let mut hdx_file = self.hdx_file.borrow_mut();
         let bucket_pos: u64 =
             (HdxHeader::SIZE + (bucket as usize * self.hdx_header.bucket_size as usize)) as u64;
+        println!("XXXX hash: {}, bucket {}, pos {}", hash, bucket, bucket_pos);
         hdx_file.seek(SeekFrom::Start(bucket_pos))?;
         let mut buffer = self.buffer.take();
         buffer.resize(self.hdx_header.bucket_size as usize, 0);
         hdx_file.read_exact(&mut buffer)?;
         self.buffer.set(buffer);
 
-        if let Some(val) = self.search_bucket(key, hash) {
+        if let Some(val) = self.search_bucket(&key, hash) {
             Ok(val)
         } else {
             Err(std::io::Error::new(
                 ErrorKind::Other,
-                "key not found".to_string(),
+                format!("key {:?} not found", key),
             ))
         }
     }
@@ -458,7 +460,7 @@ where
         }
     }
 
-    /// Save the (hash, position) tuble to the bucket.  Handles overflow records.
+    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     fn save_to_bucket(&mut self, hash_pos: (u64, u64), bucket: u64) -> Result<(), std::io::Error> {
         let (hash, record_pos) = hash_pos;
         let mut hdx_file = self.hdx_file.borrow_mut();
@@ -473,8 +475,12 @@ where
             let mut buf = [0_u8; 8];
             buf.copy_from_slice(&buffer[pos..(pos + 8)]);
             let rec_hash = u64::from_ne_bytes(buf);
-            pos += 16; // skip hash and over the record pos.
-            if rec_hash == 0 {
+            pos += 8;
+            buf.copy_from_slice(&buffer[pos..(pos + 8)]);
+            let rec_pos = u64::from_ne_bytes(buf);
+            pos += 8;
+            // Test rec_pos == 0 to handle degenerate case of a hash of 0.
+            if rec_hash == 0 && rec_pos == 0 {
                 // Seek to the element we found that was empty and write the hash and position into it.
                 hdx_file.seek(SeekFrom::Start(bucket_pos + 8 + (i * 16)))?;
                 hdx_file.write_all(&hash.to_ne_bytes())?;
@@ -516,13 +522,17 @@ where
     /// Search a bucket for hash and return the value if found.
     /// This expects self.buffer to contain the bucket data.
     /// Will recursively search overflow buckets as well.
-    fn search_bucket(&self, key: K, hash: u64) -> Option<V> {
+    fn search_bucket(&self, key: &K, hash: u64) -> Option<V> {
         // buffer contains the bucket data.
         let mut buffer = self.buffer.take();
         let mut pos = 8;
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
         let overflow_position = u64::from_ne_bytes(buf);
+        println!(
+            "XXXX searching for {}, overflow {}",
+            hash, overflow_position
+        );
         for _ in 0..self.hdx_header.elements {
             buf.copy_from_slice(&buffer[pos..(pos + 8)]);
             let rec_hash = u64::from_ne_bytes(buf);
@@ -530,9 +540,13 @@ where
             buf.copy_from_slice(&buffer[pos..(pos + 8)]);
             let rec_pos = u64::from_ne_bytes(buf);
             pos += 8;
-            if hash == rec_hash {
+            if overflow_position == 0 {
+                println!("XXXX h {}, pos {}", rec_hash, rec_pos);
+            }
+            // rec_pos > 0 handles degenerate case of a 0 hash.
+            if hash == rec_hash && rec_pos > 0 {
                 let ((rkey, val), _) = self.read_record(rec_pos).ok()?;
-                if rkey == key {
+                if &rkey == key {
                     self.buffer.set(buffer);
                     return Some(val);
                 }
@@ -792,6 +806,7 @@ mod tests {
 
     #[test]
     fn test_50k() {
+        //let mut db = Db::<u64, String, 8, std::collections::hash_map::RandomState>::open(".", "xxx50k").unwrap();
         let mut db = Db::<u64, String, 8>::open(".", "xxx50k").unwrap();
         for i in 0..50_000 {
             db.insert(i as u64, format!("Value {}", i)).unwrap();
@@ -808,14 +823,14 @@ mod tests {
                 &format!("Value {}", i)
             );
         }
-        assert_eq!(&db.fetch(35_000).unwrap(), "Value 35000");
+        //assert_eq!(&db.fetch(35_000).unwrap(), "Value 35000");
         for i in 0..50_000 {
             assert_eq!(&db.fetch(i as u64).unwrap(), &format!("Value {}", i));
         }
     }
 
     #[test]
-    fn test_50k_str() {
+    fn test_x50k_str() {
         let mut db = Db::<String, String, 0>::open(".", "xxx50k_str").unwrap();
         for i in 0..50_000 {
             db.insert(format!("key {i}"), format!("Value {}", i))
