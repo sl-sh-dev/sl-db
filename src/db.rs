@@ -110,11 +110,12 @@ struct HdxHeader {
     uid: u64,         // Unique ID generated on creation
     appnum: u64,      // Application defined constant
     buckets: u32,
-    elements: u16,
+    bucket_elements: u16,
     bucket_size: u16,
     salt: u64,
     pepper: u64,
     load_factor: u16,
+    values: u64,
     reserved: [u8; 64], // Zeroes
 }
 
@@ -139,11 +140,12 @@ impl Default for HdxHeader {
             uid: 0,
             appnum: 0,
             buckets,
-            elements,
+            bucket_elements: elements,
             bucket_size,
             salt: 0,
             pepper: 0,
             load_factor: u16::MAX / 2, // .5
+            values: 0,
             reserved: [0; 64],
         }
     }
@@ -159,6 +161,9 @@ pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>> {
     buffer: Cell<Vec<u8>>,
     hdx_header: HdxHeader,
     modulus: u32,
+    load_factor: f32,
+    capacity: u64,
+    allow_bucket_expansion: bool, // don't allow more buckets- for testing lots of overflows...
     _key: PhantomData<K>,
     _value: PhantomData<V>,
 }
@@ -177,7 +182,8 @@ where
         let (data_file, header) = Self::open_data_file(&data_name)?;
         let (vdx_file, _) = Self::open_vdx_file(&vdx_name)?;
         let (hdx_file, hdx_header) = Self::open_hdx_file(&hdx_name)?;
-        let modulus = hdx_header.buckets.next_power_of_two();
+        // Don't want buckets and modulus to be the same, so +1
+        let modulus = (hdx_header.buckets + 1).next_power_of_two();
         Ok(Self {
             _header: header,
             data_file: RefCell::new(data_file),
@@ -186,7 +192,10 @@ where
             hasher: S::default(),
             hdx_header,
             modulus,
+            load_factor: hdx_header.load_factor as f32 / u16::MAX as f32,
+            capacity: hdx_header.buckets as u64 * hdx_header.bucket_elements as u64,
             buffer: Cell::new(Vec::new()),
+            allow_bucket_expansion: true,
             _key: PhantomData,
             _value: PhantomData,
         })
@@ -195,28 +204,21 @@ where
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&self, key: K) -> Result<V, std::io::Error> {
         let hash = self.hash(&key);
-        let bucket = self.get_bucket(hash);
-        println!("XXXX hash: {}, bucket {}", hash, bucket);
-
-        // Load the initial bucket into self.buffer for the call to search_bucket.
-        let mut hdx_file = self.hdx_file.borrow_mut();
-        let bucket_pos: u64 =
-            (HdxHeader::SIZE + (bucket as usize * self.hdx_header.bucket_size as usize)) as u64;
-        println!("XXXX hash: {}, bucket {}, pos {}", hash, bucket, bucket_pos);
-        hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-        let mut buffer = self.buffer.take();
-        buffer.resize(self.hdx_header.bucket_size as usize, 0);
-        hdx_file.read_exact(&mut buffer)?;
-        self.buffer.set(buffer);
-
-        if let Some(val) = self.search_bucket(&key, hash) {
-            Ok(val)
-        } else {
-            Err(std::io::Error::new(
-                ErrorKind::Other,
-                format!("key {:?} not found", key),
-            ))
+        let bucket = self.get_bucket(hash) as usize;
+        let iter = self.bucket_iter(bucket)?;
+        for (rec_hash, rec_pos) in iter {
+            // rec_pos > 0 handles degenerate case of a 0 hash.
+            if hash == rec_hash && rec_pos > 0 {
+                let ((rkey, val), _) = self.read_record(rec_pos)?;
+                if rkey == key {
+                    return Ok(val);
+                }
+            }
         }
+        Err(std::io::Error::new(
+            ErrorKind::Other,
+            format!("key {:?} not found", key),
+        ))
     }
 
     /// Fetch the (key, value) stored at index.  Will return an error if not found.
@@ -291,18 +293,22 @@ where
         drop(file);
         drop(vdx_file);
         self.save_to_bucket((hash, record_pos), bucket)?;
+        self.hdx_header.values += 1;
+        let mut hdx_file = self.hdx_file.borrow_mut();
+        hdx_file.seek(SeekFrom::Start(0))?;
+        hdx_file.write_all(self.hdx_header.as_ref())?;
+        drop(hdx_file);
+        if self.allow_bucket_expansion
+            && self.len() >= (self.capacity as f32 * self.load_factor) as usize
+        {
+            self.expand_buckets()?;
+        }
         Ok(())
     }
 
-    /// Return the number of records in Db.  Uses the size of the vdx to determine this.
+    /// Return the number of records in Db.
     pub fn len(&self) -> usize {
-        let mut vdx_file = self.vdx_file.borrow_mut();
-        //vdx_file.flush();
-        let _ = vdx_file.seek(SeekFrom::End(0)).unwrap();
-        let record_pos = vdx_file
-            .seek(SeekFrom::Current(0))
-            .unwrap_or(VdxHeader::SIZE as u64);
-        (record_pos as usize - VdxHeader::SIZE) / 16
+        self.hdx_header.values as usize
     }
 
     /// Is the DB empty?
@@ -453,16 +459,80 @@ where
     fn get_bucket(&self, hash: u64) -> u64 {
         let modulus = self.modulus as u64;
         let bucket = hash % modulus;
-        if bucket > self.hdx_header.buckets as u64 {
+        if bucket >= self.hdx_header.buckets as u64 {
             bucket - modulus / 2
         } else {
             bucket
         }
     }
 
+    /// Add one new bucket hash index.
+    fn split_one_bucket(&mut self) -> Result<(), std::io::Error> {
+        let old_modulus = self.modulus;
+        let split_bucket = (self.hdx_header.buckets - (old_modulus / 2)) as usize;
+        self.hdx_header.buckets += 1;
+        // Don't want buckets and modulus to be the same, so +1
+        self.modulus = (self.hdx_header.buckets + 1).next_power_of_two();
+        // Grab the iter before we clear the bucket in the block below.
+        let iter = self.bucket_iter(split_bucket)?;
+
+        {
+            let mut buffer = self.buffer.take();
+            buffer.clear();
+            buffer.resize(self.hdx_header.bucket_size as usize, 0);
+            // Overwrite the existing bucket with a new blank bucket and add a new empty bucket to the end.
+            let mut hdx_file = self.hdx_file.borrow_mut();
+            let bucket_pos: u64 = (HdxHeader::SIZE
+                + (split_bucket as usize * self.hdx_header.bucket_size as usize))
+                as u64;
+            hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+            hdx_file.write_all(&buffer)?;
+            hdx_file.seek(SeekFrom::End(0))?;
+            hdx_file.write_all(&buffer)?;
+            self.buffer.set(buffer);
+        }
+
+        for (rec_hash, rec_pos) in iter {
+            // rec_pos > 0 indicates a live entry.
+            if rec_pos > 0 {
+                let bucket = self.get_bucket(rec_hash);
+                if bucket != split_bucket as u64 && bucket != self.hdx_header.buckets as u64 - 1 {
+                    panic!(
+                        "got bucket {}, expected {} or {}, mod {}",
+                        bucket,
+                        split_bucket,
+                        self.hdx_header.buckets - 1,
+                        self.modulus
+                    );
+                }
+                self.save_to_bucket((rec_hash, rec_pos), bucket)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add buckets to expand capacity.
+    fn expand_buckets(&mut self) -> Result<(), std::io::Error> {
+        //return Ok(());
+        // arbitrarily add 10 buckets when we need more capacity.
+        for _ in 0..10 {
+            self.split_one_bucket()?;
+        }
+        self.capacity = self.hdx_header.buckets as u64 * self.hdx_header.bucket_elements as u64;
+        Ok(())
+    }
+
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     fn save_to_bucket(&mut self, hash_pos: (u64, u64), bucket: u64) -> Result<(), std::io::Error> {
         let (hash, record_pos) = hash_pos;
+        if self.get_bucket(hash) != bucket {
+            panic!(
+                "tried to insert into wrong bucket! {} into {}",
+                self.get_bucket(hash),
+                bucket
+            );
+        }
         let mut hdx_file = self.hdx_file.borrow_mut();
         let bucket_pos: u64 =
             (HdxHeader::SIZE + (bucket as usize * self.hdx_header.bucket_size as usize)) as u64;
@@ -471,7 +541,7 @@ where
         buffer.resize(self.hdx_header.bucket_size as usize, 0);
         hdx_file.read_exact(&mut buffer)?;
         let mut pos = 8; // Skip the overflow file pos.
-        for i in 0..self.hdx_header.elements as u64 {
+        for i in 0..self.hdx_header.bucket_elements as u64 {
             let mut buf = [0_u8; 8];
             buf.copy_from_slice(&buffer[pos..(pos + 8)]);
             let rec_hash = u64::from_ne_bytes(buf);
@@ -517,55 +587,6 @@ where
         hdx_file.write_all(&buffer)?;
         self.buffer.set(buffer);
         Ok(())
-    }
-
-    /// Search a bucket for hash and return the value if found.
-    /// This expects self.buffer to contain the bucket data.
-    /// Will recursively search overflow buckets as well.
-    fn search_bucket(&self, key: &K, hash: u64) -> Option<V> {
-        // buffer contains the bucket data.
-        let mut buffer = self.buffer.take();
-        let mut pos = 8;
-        let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
-        buf.copy_from_slice(&buffer[0..8]);
-        let overflow_position = u64::from_ne_bytes(buf);
-        println!(
-            "XXXX searching for {}, overflow {}",
-            hash, overflow_position
-        );
-        for _ in 0..self.hdx_header.elements {
-            buf.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_hash = u64::from_ne_bytes(buf);
-            pos += 8;
-            buf.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_pos = u64::from_ne_bytes(buf);
-            pos += 8;
-            if overflow_position == 0 {
-                println!("XXXX h {}, pos {}", rec_hash, rec_pos);
-            }
-            // rec_pos > 0 handles degenerate case of a 0 hash.
-            if hash == rec_hash && rec_pos > 0 {
-                let ((rkey, val), _) = self.read_record(rec_pos).ok()?;
-                if &rkey == key {
-                    self.buffer.set(buffer);
-                    return Some(val);
-                }
-            }
-        }
-        if overflow_position > 0 {
-            // We have an overflow bucket to search as well.
-            let mut dat_file = self.data_file.borrow_mut();
-            dat_file.seek(SeekFrom::Start(overflow_position)).ok()?;
-            buffer.clear();
-            buffer.resize(self.hdx_header.bucket_size as usize, 0);
-            dat_file.read_exact(&mut buffer).ok()?;
-            self.buffer.set(buffer);
-            drop(dat_file);
-            self.search_bucket(key, hash)
-        } else {
-            self.buffer.set(buffer);
-            None
-        }
     }
 
     /// Read the record at position.
@@ -614,6 +635,18 @@ where
         // An early return on error could cause a new buffer to be created, should not be a big deal.
         self.buffer.set(buffer);
         Ok(((key, val), pos))
+    }
+
+    fn bucket_iter(&self, bucket: usize) -> Result<BucketIter, std::io::Error> {
+        let dat_file = { self.data_file.borrow().try_clone()? };
+        let mut hdx_file = self.hdx_file.borrow_mut();
+        BucketIter::new(
+            dat_file,
+            &mut hdx_file,
+            self.hdx_header.bucket_size,
+            self.hdx_header.bucket_elements,
+            bucket,
+        )
     }
 }
 
@@ -670,6 +703,78 @@ where
             Some(ret)
         } else {
             None
+        }
+    }
+}
+
+/// Iterates over the (hash, record_position) values contained in a bucket.
+struct BucketIter {
+    dat_file: File,
+    buffer: Vec<u8>,
+    bucket_pos: usize,
+    overflow_pos: u64,
+    elements: u16,
+}
+
+impl BucketIter {
+    fn new(
+        dat_file: File,
+        hdx_file: &mut File,
+        bucket_size: u16,
+        elements: u16,
+        bucket: usize,
+    ) -> Result<Self, std::io::Error> {
+        let mut buffer = Vec::with_capacity(bucket_size as usize);
+
+        let bucket_pos: u64 = (HdxHeader::SIZE + (bucket * bucket_size as usize)) as u64;
+        hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+        buffer.resize(bucket_size as usize, 0);
+        hdx_file.read_exact(&mut buffer)?;
+        let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
+        buf.copy_from_slice(&buffer[0..8]);
+        let overflow_pos = u64::from_ne_bytes(buf);
+        Ok(Self {
+            dat_file,
+            buffer,
+            bucket_pos: 0,
+            overflow_pos,
+            elements,
+        })
+    }
+}
+
+impl Iterator for BucketIter {
+    type Item = (u64, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // For reading u64 values, needs an array.
+        let mut buf = [0_u8; 8];
+        loop {
+            if self.bucket_pos < self.elements as usize {
+                let mut pos = 8 + (self.bucket_pos * 16);
+                buf.copy_from_slice(&self.buffer[pos..(pos + 8)]);
+                let hash = u64::from_ne_bytes(buf);
+                pos += 8;
+                buf.copy_from_slice(&self.buffer[pos..(pos + 8)]);
+                let rec_pos = u64::from_ne_bytes(buf);
+                if hash == 0 && rec_pos == 0 {
+                    self.bucket_pos += 1;
+                } else {
+                    self.bucket_pos += 1;
+                    return Some((hash, rec_pos));
+                }
+            } else if self.overflow_pos > 0 {
+                // We have an overflow bucket to search as well.
+                self.dat_file
+                    .seek(SeekFrom::Start(self.overflow_pos))
+                    .ok()?;
+                self.dat_file.read_exact(&mut self.buffer).ok()?;
+                self.bucket_pos = 0;
+                buf.copy_from_slice(&self.buffer[0..8]);
+                self.overflow_pos = u64::from_ne_bytes(buf);
+            } else {
+                return None;
+            }
         }
     }
 }
@@ -823,7 +928,7 @@ mod tests {
                 &format!("Value {}", i)
             );
         }
-        //assert_eq!(&db.fetch(35_000).unwrap(), "Value 35000");
+        assert_eq!(&db.fetch(35_000).unwrap(), "Value 35000");
         for i in 0..50_000 {
             assert_eq!(&db.fetch(i as u64).unwrap(), &format!("Value {}", i));
         }
