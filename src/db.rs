@@ -1,6 +1,6 @@
 use crate::error::DBError;
 use crate::error::DBResult;
-use crate::fxhasher::FxHasher;
+use crate::fxhasher::{FxHashMap, FxHasher};
 use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
@@ -101,12 +101,12 @@ impl AsRef<[u8]> for HdxHeader {
 
 impl Default for HdxHeader {
     fn default() -> Self {
-        let buckets = 128;
-        let elements = 5;
-        // Each bucket is:
-        // u64 (pos of overflow record)
-        // elements[] each one is:
-        //     (u64 (hash), u64 (record pos)).
+        let buckets = 1; //128;
+        let elements = 255; //5;
+                            // Each bucket is:
+                            // u64 (pos of overflow record)
+                            // elements[] each one is:
+                            //     (u64 (hash), u64 (record pos)).
         let bucket_size = 8 + (16 * elements);
         Self {
             type_id: *b"sldb.hdx",
@@ -125,7 +125,12 @@ impl Default for HdxHeader {
     }
 }
 
-pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>> {
+pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
     _header: DataHeader,
     data_file: RefCell<File>,
     hdx_file: RefCell<File>,
@@ -133,6 +138,7 @@ pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>> {
     // Keep a buffer around to share and avoid allocations.
     buffer: Cell<Vec<u8>>,
     write_buffer: Vec<u8>,
+    index_cache: FxHashMap<K, (u64, u64)>,
     hdx_header: HdxHeader,
     modulus: u32,
     load_factor: f32,
@@ -140,6 +146,17 @@ pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>> {
     allow_bucket_expansion: bool, // don't allow more buckets- for testing lots of overflows...
     _key: PhantomData<K>,
     _value: PhantomData<V>,
+}
+
+impl<K, V, const KSIZE: u16, S> Drop for Db<K, V, KSIZE, S>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
+    fn drop(&mut self) {
+        let _ = self.commit();
+    }
 }
 
 impl<K, V, const KSIZE: u16, S> Db<K, V, KSIZE, S>
@@ -167,6 +184,7 @@ where
             capacity: hdx_header.buckets as u64 * hdx_header.bucket_elements as u64,
             buffer: Cell::new(Vec::new()),
             write_buffer: Vec::new(),
+            index_cache: FxHashMap::default(),
             allow_bucket_expansion: true,
             _key: PhantomData,
             _value: PhantomData,
@@ -175,15 +193,22 @@ where
 
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&self, key: K) -> DBResult<V> {
-        let hash = self.hash(&key);
-        let bucket = self.get_bucket(hash) as usize;
-        let iter = self.bucket_iter(bucket)?;
-        for (rec_hash, rec_pos) in iter {
-            // rec_pos > 0 handles degenerate case of a 0 hash.
-            if hash == rec_hash && rec_pos > 0 {
-                let ((rkey, val), _) = self.read_record(rec_pos)?;
-                if rkey == key {
-                    return Ok(val);
+        if let Some((_hash, rec_pos)) = self.index_cache.get(&key) {
+            // Try the index cache.
+            let ((_, val), _) = self.read_record(*rec_pos)?;
+            return Ok(val);
+        } else {
+            // Then check the on disk index.
+            let hash = self.hash(&key);
+            let bucket = self.get_bucket(hash) as usize;
+            let iter = self.bucket_iter(bucket)?;
+            for (rec_hash, rec_pos) in iter {
+                // rec_pos > 0 handles degenerate case of a 0 hash.
+                if hash == rec_hash && rec_pos > 0 {
+                    let ((rkey, val), _) = self.read_record(rec_pos)?;
+                    if rkey == key {
+                        return Ok(val);
+                    }
                 }
             }
         }
@@ -231,19 +256,12 @@ where
         file.write_all(&self.write_buffer)?;
         // An early return on error could cause a new buffer to be created, should not be a big deal.
         self.buffer.set(buffer);
-        let bucket = self.get_bucket(hash);
-        drop(file);
-        self.save_to_bucket((hash, record_pos), bucket)?;
+        self.index_cache.insert(key, (hash, record_pos));
         self.hdx_header.values += 1;
-        let mut hdx_file = self.hdx_file.borrow_mut();
-        // XXXSLS
-        hdx_file.seek(SeekFrom::Start(0))?;
-        hdx_file.write_all(self.hdx_header.as_ref())?;
-        drop(hdx_file);
-        if self.allow_bucket_expansion
-            && self.len() >= (self.capacity as f32 * self.load_factor) as usize
-        {
+        drop(file);
+        if self.index_cache.len() > 1000 {
             self.expand_buckets()?;
+            self.flush_index()?;
         }
         Ok(())
     }
@@ -256,6 +274,26 @@ where
     /// Is the DB empty?
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn commit(&mut self) -> DBResult<()> {
+        self.data_file.borrow_mut().sync_all()?;
+        self.expand_buckets()?;
+        self.flush_index()?;
+        self.hdx_file.borrow_mut().sync_all()?;
+        Ok(())
+    }
+
+    fn flush_index(&mut self) -> DBResult<()> {
+        for (hash, pos) in self.index_cache.values() {
+            let bucket = self.get_bucket(*hash);
+            self.save_to_bucket((*hash, *pos), bucket)?;
+        }
+        self.index_cache.clear();
+        let mut hdx_file = self.hdx_file.borrow_mut();
+        hdx_file.seek(SeekFrom::Start(0))?;
+        hdx_file.write_all(self.hdx_header.as_ref())?;
+        Ok(())
     }
 
     fn open_data_file(data_name: &Path) -> DBResult<(File, DataHeader)> {
@@ -352,21 +390,10 @@ where
         // Grab the iter before we clear the bucket in the block below.
         let iter = self.bucket_iter(split_bucket)?;
 
-        {
-            let mut buffer = self.buffer.take();
-            buffer.clear();
-            buffer.resize(self.hdx_header.bucket_size as usize, 0);
-            // Overwrite the existing bucket with a new blank bucket and add a new empty bucket to the end.
-            let mut hdx_file = self.hdx_file.borrow_mut();
-            let bucket_pos: u64 = (HdxHeader::SIZE
-                + (split_bucket as usize * self.hdx_header.bucket_size as usize))
-                as u64;
-            hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-            hdx_file.write_all(&buffer)?;
-            hdx_file.seek(SeekFrom::End(0))?;
-            hdx_file.write_all(&buffer)?;
-            self.buffer.set(buffer);
-        }
+        let mut buffer = self.buffer.take();
+        buffer.clear();
+        buffer.resize(self.hdx_header.bucket_size as usize, 0);
+        let mut buffer2 = vec![0; self.hdx_header.bucket_size as usize];
 
         for (rec_hash, rec_pos) in iter {
             // rec_pos > 0 indicates a live entry.
@@ -381,27 +408,46 @@ where
                         self.modulus
                     );
                 }
-                self.save_to_bucket((rec_hash, rec_pos), bucket)?;
+                if bucket as usize == split_bucket {
+                    self.save_to_bucket_buffer((rec_hash, rec_pos), &mut buffer)?;
+                } else {
+                    self.save_to_bucket_buffer((rec_hash, rec_pos), &mut buffer2)?;
+                }
             }
         }
+
+        // Overwrite the existing bucket with a new blank bucket and add a new empty bucket to the end.
+        let mut hdx_file = self.hdx_file.borrow_mut();
+        let bucket_pos: u64 = (HdxHeader::SIZE
+            + (split_bucket as usize * self.hdx_header.bucket_size as usize))
+            as u64;
+        hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+        hdx_file.write_all(&buffer)?;
+        hdx_file.seek(SeekFrom::End(0))?;
+        hdx_file.write_all(&buffer2)?;
+        self.buffer.set(buffer);
 
         Ok(())
     }
 
     /// Add buckets to expand capacity.
     fn expand_buckets(&mut self) -> DBResult<()> {
-        //return Ok(());
-        // arbitrarily add 10 buckets when we need more capacity.
-        for _ in 0..10 {
-            self.split_one_bucket()?;
+        if self.allow_bucket_expansion {
+            while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
+                // arbitrarily add 10 buckets when we need more capacity.
+                //for _ in 0..10 {
+                self.split_one_bucket()?;
+                //}
+                self.capacity =
+                    self.hdx_header.buckets as u64 * self.hdx_header.bucket_elements as u64;
+            }
         }
-        self.capacity = self.hdx_header.buckets as u64 * self.hdx_header.bucket_elements as u64;
         Ok(())
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket(&mut self, hash_pos: (u64, u64), bucket: u64) -> DBResult<()> {
-        let (hash, record_pos) = hash_pos;
+    fn save_to_bucket(&self, hash_pos: (u64, u64), bucket: u64) -> DBResult<()> {
+        let (hash, _record_pos) = hash_pos;
         if self.get_bucket(hash) != bucket {
             panic!(
                 "tried to insert into wrong bucket! {} into {}",
@@ -416,6 +462,19 @@ where
         let mut buffer = self.buffer.take();
         buffer.resize(self.hdx_header.bucket_size as usize, 0);
         hdx_file.read_exact(&mut buffer)?;
+
+        let res = self.save_to_bucket_buffer(hash_pos, &mut buffer);
+        if res.is_ok() {
+            hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+            hdx_file.write_all(&buffer)?;
+        }
+        self.buffer.set(buffer);
+        res
+    }
+
+    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
+    fn save_to_bucket_buffer(&self, hash_pos: (u64, u64), buffer: &mut [u8]) -> DBResult<()> {
+        let (hash, record_pos) = hash_pos;
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.hdx_header.bucket_elements as u64 {
             let mut buf = [0_u8; 8];
@@ -428,11 +487,10 @@ where
             // Test rec_pos == 0 to handle degenerate case of a hash of 0.
             if rec_hash == 0 && rec_pos == 0 {
                 // Seek to the element we found that was empty and write the hash and position into it.
-                hdx_file.seek(SeekFrom::Start(bucket_pos + 8 + (i * 16)))?;
-                hdx_file.write_all(&hash.to_ne_bytes())?;
-                hdx_file.write_all(&record_pos.to_ne_bytes())?;
-                //hdx_file.flush()?;
-                self.buffer.set(buffer);
+                let mut pos = 8 + (i as usize * 16);
+                buffer[pos..pos + 8].copy_from_slice(&hash.to_ne_bytes());
+                pos += 8;
+                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_ne_bytes());
                 return Ok(());
             }
         }
@@ -449,19 +507,14 @@ where
         }
         let overflow_pos = dat_file.seek(SeekFrom::Current(0))?;
         // Write the old buffer into the data file as an overflow record.
-        dat_file.write_all(&buffer)?;
+        dat_file.write_all(buffer)?;
         // clear buffer and reset to 0.
-        buffer.clear();
-        buffer.resize(self.hdx_header.bucket_size as usize, 0);
+        buffer.fill(0);
         // Copy the position of the overflow record into the first u64.
         buffer[0..8].copy_from_slice(&overflow_pos.to_ne_bytes());
         // First element will be the hash and position being saved (rest of new bucket is empty).
         buffer[8..16].copy_from_slice(&hash.to_ne_bytes());
         buffer[16..24].copy_from_slice(&record_pos.to_ne_bytes());
-        // Write the new bucket out.
-        hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-        hdx_file.write_all(&buffer)?;
-        self.buffer.set(buffer);
         Ok(())
     }
 
@@ -553,7 +606,12 @@ where
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
-pub struct DbRawIter<'db, K, V, const KSIZE: u16, S> {
+pub struct DbRawIter<'db, K, V, const KSIZE: u16, S>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
     db: &'db Db<K, V, KSIZE, S>,
     file: BufReader<File>,
     buffer: Vec<u8>,
