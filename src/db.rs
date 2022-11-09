@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -76,34 +76,6 @@ impl Default for DataHeader {
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
-struct VdxHeader {
-    type_id: [u8; 8],   // The characters "sldb.vdx"
-    version: u16,       //Holds the version number
-    uid: u64,           // Unique ID generated on creation
-    appnum: u64,        // Application defined constant
-    reserved: [u8; 64], // Zeroes
-}
-
-impl AsRef<[u8]> for VdxHeader {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { Self::as_bytes(self) }
-    }
-}
-
-impl Default for VdxHeader {
-    fn default() -> Self {
-        Self {
-            type_id: *b"sldb.vdx",
-            version: 0,
-            uid: 0,
-            appnum: 0,
-            reserved: [0; 64],
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-#[repr(C)]
 struct HdxHeader {
     type_id: [u8; 8], // The characters "sldb.hdx"
     version: u16,     //Holds the version number
@@ -154,11 +126,11 @@ impl Default for HdxHeader {
 pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>> {
     _header: DataHeader,
     data_file: RefCell<File>,
-    vdx_file: RefCell<File>,
     hdx_file: RefCell<File>,
     hasher: S,
     // Keep a buffer around to share and avoid allocations.
     buffer: Cell<Vec<u8>>,
+    write_buffer: Vec<u8>,
     hdx_header: HdxHeader,
     modulus: u32,
     load_factor: f32,
@@ -177,17 +149,14 @@ where
     /// Open a new or reopen an existing database.
     pub fn open<P: AsRef<Path>>(dir: P, base_name: P) -> Result<Self, std::io::Error> {
         let data_name = dir.as_ref().join(base_name.as_ref()).with_extension("dat");
-        let vdx_name = dir.as_ref().join(base_name.as_ref()).with_extension("vdx");
         let hdx_name = dir.as_ref().join(base_name.as_ref()).with_extension("hdx");
         let (data_file, header) = Self::open_data_file(&data_name)?;
-        let (vdx_file, _) = Self::open_vdx_file(&vdx_name)?;
         let (hdx_file, hdx_header) = Self::open_hdx_file(&hdx_name)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets + 1).next_power_of_two();
         Ok(Self {
             _header: header,
             data_file: RefCell::new(data_file),
-            vdx_file: RefCell::new(vdx_file),
             hdx_file: RefCell::new(hdx_file),
             hasher: S::default(),
             hdx_header,
@@ -195,6 +164,7 @@ where
             load_factor: hdx_header.load_factor as f32 / u16::MAX as f32,
             capacity: hdx_header.buckets as u64 * hdx_header.bucket_elements as u64,
             buffer: Cell::new(Vec::new()),
+            write_buffer: Vec::new(),
             allow_bucket_expansion: true,
             _key: PhantomData,
             _value: PhantomData,
@@ -221,21 +191,6 @@ where
         ))
     }
 
-    /// Fetch the (key, value) stored at index.  Will return an error if not found.
-    /// index is 0 based and in order of insertion (0 is first record inserted etc).
-    pub fn fetch_idx(&self, index: usize) -> Result<(K, V), std::io::Error> {
-        let mut vdx_file = self.vdx_file.borrow_mut();
-        let pos: u64 = (VdxHeader::SIZE + (index * 16)) as u64;
-        vdx_file.seek(SeekFrom::Start(pos))?;
-        let mut buf = [0_u8; 8];
-        vdx_file.read_exact(&mut buf)?;
-        let _hash = u64::from_ne_bytes(buf);
-        vdx_file.read_exact(&mut buf)?;
-        let data_pos = u64::from_ne_bytes(buf);
-        let rec = self.read_record(data_pos);
-        rec.map(|(kv, _)| kv)
-    }
-
     /// Insert a new key/value pair in Db.
     /// For the data file this means inserting:
     ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
@@ -244,17 +199,17 @@ where
     ///   - value data
     pub fn insert(&mut self, key: K, value: V) -> Result<(), std::io::Error> {
         let mut file = self.data_file.borrow_mut();
-        let mut vdx_file = self.vdx_file.borrow_mut();
         let mut buffer = self.buffer.take();
+        self.write_buffer.clear();
         file.seek(SeekFrom::End(0))?;
         let record_pos = file.seek(SeekFrom::Current(0))?;
         let hash = self.hash(&key);
         key.serialize(&mut buffer);
-        let mut write_buffer = Vec::new();
         // If we have a variable sized key write it's size otherwise no need.
         if K::is_variable_key_size() {
             // We have to write the key size when variable.
-            write_buffer.write_all(&(buffer.len() as u16).to_ne_bytes())?;
+            self.write_buffer
+                .write_all(&(buffer.len() as u16).to_ne_bytes())?;
         } else if K::KEY_SIZE as usize != buffer.len() {
             return Err(std::io::Error::new(
                 ErrorKind::Other,
@@ -266,35 +221,30 @@ where
             ));
         }
         // Space for the value length.
-        let val_size_pos = write_buffer.len();
-        write_buffer.write_all(&[0_u8; 4])?;
+        let val_size_pos = self.write_buffer.len();
+        self.write_buffer.write_all(&[0_u8; 4])?;
 
         // Write the key to the buffer.
-        write_buffer.write_all(&buffer)?;
+        self.write_buffer.write_all(&buffer)?;
 
         value.serialize(&mut buffer);
 
         // Save current pos, then jump back to the value size and write that then finally write
         // the value into the saved position.
-        write_buffer[val_size_pos..val_size_pos + 4]
+        self.write_buffer[val_size_pos..val_size_pos + 4]
             .copy_from_slice(&(buffer.len() as u32).to_ne_bytes());
-        write_buffer.write_all(&buffer)?;
+        self.write_buffer.write_all(&buffer)?;
 
         // Write the buffer to the actual file (avoid excess IO syscalls).
-        file.write_all(&write_buffer)?;
+        file.write_all(&self.write_buffer)?;
         // An early return on error could cause a new buffer to be created, should not be a big deal.
         self.buffer.set(buffer);
-        vdx_file.seek(SeekFrom::End(0))?;
-        write_buffer.clear();
-        write_buffer.write_all(&hash.to_ne_bytes())?;
-        write_buffer.write_all(&record_pos.to_ne_bytes())?;
-        vdx_file.write_all(&write_buffer)?;
         let bucket = self.get_bucket(hash);
         drop(file);
-        drop(vdx_file);
         self.save_to_bucket((hash, record_pos), bucket)?;
         self.hdx_header.values += 1;
         let mut hdx_file = self.hdx_file.borrow_mut();
+        // XXXSLS
         hdx_file.seek(SeekFrom::Start(0))?;
         hdx_file.write_all(self.hdx_header.as_ref())?;
         drop(hdx_file);
@@ -314,12 +264,6 @@ where
     /// Is the DB empty?
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Return an iterator over the key values in insertion order.
-    /// Note this iterator only uses the data file not the indexes.
-    pub fn raw_iter(&self) -> DbRawIter<K, V, KSIZE, S> {
-        DbRawIter::new(self)
     }
 
     fn open_data_file(data_name: &Path) -> Result<(File, DataHeader), std::io::Error> {
@@ -363,52 +307,10 @@ where
         Ok((file, header))
     }
 
-    fn open_vdx_file(data_name: &Path) -> Result<(File, VdxHeader), std::io::Error> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(data_name)?;
-        file.seek(SeekFrom::End(0))?;
-        let file_end = file.seek(SeekFrom::Current(0))?;
-
-        let header = if file_end == 0 {
-            let header = VdxHeader::default();
-            file.write_all(header.as_ref())?;
-            header
-        } else if file_end >= VdxHeader::SIZE as u64 {
-            let mut header = VdxHeader::default();
-            file.seek(SeekFrom::Start(0))?;
-            unsafe {
-                file.read_exact(VdxHeader::as_bytes_mut(&mut header))?;
-            }
-            file.seek(SeekFrom::End(0))?;
-
-            if &header.type_id != b"sldb.vdx" {
-                return Err(std::io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "Invalid type. Expected sldb.vdx got {}.",
-                        String::from_utf8_lossy(&header.type_id)
-                    ),
-                ));
-            }
-            header
-        } else {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
-                "Invalid vdx file.".to_string(),
-            ));
-        };
-        Ok((file, header))
-    }
-
     fn open_hdx_file(data_name: &Path) -> Result<(File, HdxHeader), std::io::Error> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            //.append(true)
             .create(true)
             .open(data_name)?;
         file.seek(SeekFrom::End(0))?;
@@ -593,9 +495,11 @@ where
     /// Returns the key, value tuple as well as the position of the next record.
     /// Will produce an error for IO or if the record at position is actually an overflow bucket not
     /// a data record.
-    fn read_record(&self, position: u64) -> Result<((K, V), u64), std::io::Error> {
-        let mut file = self.data_file.borrow_mut();
-        let mut buffer = self.buffer.take();
+    fn read_record_raw<R: Read + Seek>(
+        file: &mut R,
+        buffer: &mut Vec<u8>,
+        position: u64,
+    ) -> Result<((K, V), u64), std::io::Error> {
         // Move the rea cursor to position.  Note the data file is opened in append mode so write
         // cursor is always EOF.
         file.seek(SeekFrom::Start(position))?;
@@ -626,15 +530,38 @@ where
             ));
         }
         buffer.resize(key_size as usize, 0);
-        file.read_exact(&mut buffer)?;
-        let key = K::deserialize(&buffer)?;
+        file.read_exact(buffer)?;
+        let key = K::deserialize(buffer)?;
         buffer.resize(val_size as usize, 0);
-        file.read_exact(&mut buffer)?;
-        let val = V::deserialize(&buffer)?;
+        file.read_exact(buffer)?;
+        let val = V::deserialize(buffer)?;
         let pos = file.seek(SeekFrom::Current(0))?;
         // An early return on error could cause a new buffer to be created, should not be a big deal.
-        self.buffer.set(buffer);
         Ok(((key, val), pos))
+    }
+
+    /// Read the record at position.
+    /// Returns the key, value tuple as well as the position of the next record.
+    /// Will produce an error for IO or if the record at position is actually an overflow bucket not
+    /// a data record.
+    fn read_record(&self, position: u64) -> Result<((K, V), u64), std::io::Error> {
+        let mut buffer = self.buffer.take();
+        //let dat_file = { self.data_file.borrow().try_clone()? };
+        //let mut file = BufReader::with_capacity(4096, dat_file);
+        //let result = Self::read_record_raw(&mut file, &mut buffer, position);
+        let result =
+            Self::read_record_raw(&mut *self.data_file.borrow_mut(), &mut buffer, position);
+        self.buffer.set(buffer);
+        result
+    }
+
+    fn read_record_file<R: Read + Seek>(
+        &self,
+        file: &mut R,
+        buffer: &mut Vec<u8>,
+        position: u64,
+    ) -> Result<((K, V), u64), std::io::Error> {
+        Self::read_record_raw(file, buffer, position)
     }
 
     fn bucket_iter(&self, bucket: usize) -> Result<BucketIter, std::io::Error> {
@@ -648,12 +575,20 @@ where
             bucket,
         )
     }
+
+    /// Return an iterator over the key values in insertion order.
+    /// Note this iterator only uses the data file not the indexes.
+    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, std::io::Error> {
+        DbRawIter::new(self)
+    }
 }
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 pub struct DbRawIter<'db, K, V, const KSIZE: u16, S> {
     db: &'db Db<K, V, KSIZE, S>,
+    file: BufReader<File>,
+    buffer: Vec<u8>,
     position: u64,
 }
 
@@ -663,11 +598,15 @@ where
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
-    fn new(db: &'db Db<K, V, KSIZE, S>) -> Self {
-        Self {
+    fn new(db: &'db Db<K, V, KSIZE, S>) -> Result<Self, std::io::Error> {
+        let dat_file = { db.data_file.borrow().try_clone()? };
+        let file = BufReader::new(dat_file);
+        Ok(Self {
             db,
+            file,
+            buffer: Vec::new(),
             position: DataHeader::SIZE as u64,
-        }
+        })
     }
 }
 
@@ -680,14 +619,18 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut rec = self.db.read_record(self.position);
+        let mut rec = self
+            .db
+            .read_record_file(&mut self.file, &mut self.buffer, self.position);
         let mut el = 1_u64;
         while let Err(err) = &rec {
             // TODO- proper errors....
             if err.kind() != ErrorKind::Other || err.to_string() != "found overflow bucket" {
                 break;
             }
-            rec = self.db.read_record(
+            rec = self.db.read_record_file(
+                &mut self.file,
+                &mut self.buffer,
                 // A overflow bucket has a slightly different size for fixed and variable keys.
                 // Fixed keys don't need a key size (u16) but have to set value size (u32).
                 if K::is_variable_key_size() {
@@ -860,7 +803,7 @@ mod tests {
             let v = db.fetch(key).unwrap();
             assert_eq!(v, "Value Four");
 
-            let mut iter = db.raw_iter();
+            let mut iter = db.raw_iter().unwrap();
             let key = Key([1_u8; 32]);
             assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
             let key = Key([2_u8; 32]);
@@ -882,7 +825,7 @@ mod tests {
         let key = Key([8_u8; 32]);
         db.insert(key, "Value Three2".to_string()).unwrap();
 
-        let mut iter = db.raw_iter();
+        let mut iter = db.raw_iter().unwrap();
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
         let key = Key([2_u8; 32]);
@@ -899,34 +842,19 @@ mod tests {
         assert_eq!(iter.next().unwrap(), (key, "Value Two2".to_string()));
         let key = Key([8_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
-
-        let key = Key([1_u8; 32]);
-        assert_eq!(db.fetch_idx(0).unwrap(), (key, "Value One".to_string()));
-        let key = Key([8_u8; 32]);
-        assert_eq!(db.fetch_idx(7).unwrap(), (key, "Value Three2".to_string()));
-        let key = Key([5_u8; 32]);
-        assert_eq!(db.fetch_idx(4).unwrap(), (key, "Value Five".to_string()));
-        assert_eq!(db.len(), 8);
     }
 
     #[test]
     fn test_50k() {
-        //let mut db = Db::<u64, String, 8, std::collections::hash_map::RandomState>::open(".", "xxx50k").unwrap();
         let mut db = Db::<u64, String, 8>::open(".", "xxx50k").unwrap();
         for i in 0..50_000 {
             db.insert(i as u64, format!("Value {}", i)).unwrap();
         }
         assert_eq!(db.len(), 50_000);
-        let vals: Vec<String> = db.raw_iter().map(|(_k, v)| v).collect();
+        let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
         assert_eq!(vals.len(), 50_000);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
-        }
-        for i in 0..50_000 {
-            assert_eq!(
-                &db.fetch_idx(i).map(|(_k, v)| v).unwrap(),
-                &format!("Value {}", i)
-            );
         }
         assert_eq!(&db.fetch(35_000).unwrap(), "Value 35000");
         for i in 0..50_000 {
@@ -942,16 +870,10 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(db.len(), 50_000);
-        let vals: Vec<String> = db.raw_iter().map(|(_k, v)| v).collect();
+        let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
         assert_eq!(vals.len(), 50_000);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
-        }
-        for i in 0..50_000 {
-            assert_eq!(
-                &db.fetch_idx(i).map(|(_k, v)| v).unwrap(),
-                &format!("Value {}", i)
-            );
         }
         assert_eq!(&db.fetch("key 35000".to_string()).unwrap(), "Value 35000");
         for i in 0..50_000 {
