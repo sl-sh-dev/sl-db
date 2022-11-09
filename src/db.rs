@@ -1,9 +1,11 @@
+use crate::error::DBError;
+use crate::error::DBResult;
 use crate::fxhasher::FxHasher;
 use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -43,7 +45,7 @@ pub trait VariableKey {}
 
 pub trait DbBytes<T> {
     fn serialize(&self, buffer: &mut Vec<u8>);
-    fn deserialize(buffer: &[u8]) -> Result<T, std::io::Error>;
+    fn deserialize(buffer: &[u8]) -> DBResult<T>;
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -147,7 +149,7 @@ where
     S: BuildHasher + Default,
 {
     /// Open a new or reopen an existing database.
-    pub fn open<P: AsRef<Path>>(dir: P, base_name: P) -> Result<Self, std::io::Error> {
+    pub fn open<P: AsRef<Path>>(dir: P, base_name: P) -> DBResult<Self> {
         let data_name = dir.as_ref().join(base_name.as_ref()).with_extension("dat");
         let hdx_name = dir.as_ref().join(base_name.as_ref()).with_extension("hdx");
         let (data_file, header) = Self::open_data_file(&data_name)?;
@@ -172,7 +174,7 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&self, key: K) -> Result<V, std::io::Error> {
+    pub fn fetch(&self, key: K) -> DBResult<V> {
         let hash = self.hash(&key);
         let bucket = self.get_bucket(hash) as usize;
         let iter = self.bucket_iter(bucket)?;
@@ -185,10 +187,7 @@ where
                 }
             }
         }
-        Err(std::io::Error::new(
-            ErrorKind::Other,
-            format!("key {:?} not found", key),
-        ))
+        Err(DBError::NotFound)
     }
 
     /// Insert a new key/value pair in Db.
@@ -197,7 +196,7 @@ where
     ///   - value size (u32)
     ///   - key data
     ///   - value data
-    pub fn insert(&mut self, key: K, value: V) -> Result<(), std::io::Error> {
+    pub fn insert(&mut self, key: K, value: V) -> DBResult<()> {
         let mut file = self.data_file.borrow_mut();
         let mut buffer = self.buffer.take();
         self.write_buffer.clear();
@@ -211,14 +210,7 @@ where
             self.write_buffer
                 .write_all(&(buffer.len() as u16).to_ne_bytes())?;
         } else if K::KEY_SIZE as usize != buffer.len() {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "Invalid key length, expected {} found {}",
-                    K::KEY_SIZE,
-                    buffer.len()
-                ),
-            ));
+            return Err(DBError::InvalidKeyLength);
         }
         // Space for the value length.
         let val_size_pos = self.write_buffer.len();
@@ -266,7 +258,7 @@ where
         self.len() == 0
     }
 
-    fn open_data_file(data_name: &Path) -> Result<(File, DataHeader), std::io::Error> {
+    fn open_data_file(data_name: &Path) -> DBResult<(File, DataHeader)> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -289,25 +281,16 @@ where
             file.seek(SeekFrom::End(0))?;
 
             if &header.type_id != b"sldb.dat" {
-                return Err(std::io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "Invalid type. Expected sldb.dat got {}.",
-                        String::from_utf8_lossy(&header.type_id)
-                    ),
-                ));
+                return Err(DBError::InvalidDataHeader);
             }
             header
         } else {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
-                "Invalid data file.".to_string(),
-            ));
+            return Err(DBError::InvalidDataFile);
         };
         Ok((file, header))
     }
 
-    fn open_hdx_file(data_name: &Path) -> Result<(File, HdxHeader), std::io::Error> {
+    fn open_hdx_file(data_name: &Path) -> DBResult<(File, HdxHeader)> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -332,20 +315,11 @@ where
             file.seek(SeekFrom::End(0))?;
 
             if &header.type_id != b"sldb.hdx" {
-                return Err(std::io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "Invalid type. Expected sldb.hdx got {}.",
-                        String::from_utf8_lossy(&header.type_id)
-                    ),
-                ));
+                return Err(DBError::InvalidIndexHeader);
             }
             header
         } else {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
-                "Invalid hdx file.".to_string(),
-            ));
+            return Err(DBError::InvalidIndexFile);
         };
         Ok((file, header))
     }
@@ -369,7 +343,7 @@ where
     }
 
     /// Add one new bucket hash index.
-    fn split_one_bucket(&mut self) -> Result<(), std::io::Error> {
+    fn split_one_bucket(&mut self) -> DBResult<()> {
         let old_modulus = self.modulus;
         let split_bucket = (self.hdx_header.buckets - (old_modulus / 2)) as usize;
         self.hdx_header.buckets += 1;
@@ -415,7 +389,7 @@ where
     }
 
     /// Add buckets to expand capacity.
-    fn expand_buckets(&mut self) -> Result<(), std::io::Error> {
+    fn expand_buckets(&mut self) -> DBResult<()> {
         //return Ok(());
         // arbitrarily add 10 buckets when we need more capacity.
         for _ in 0..10 {
@@ -426,7 +400,7 @@ where
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket(&mut self, hash_pos: (u64, u64), bucket: u64) -> Result<(), std::io::Error> {
+    fn save_to_bucket(&mut self, hash_pos: (u64, u64), bucket: u64) -> DBResult<()> {
         let (hash, record_pos) = hash_pos;
         if self.get_bucket(hash) != bucket {
             panic!(
@@ -499,7 +473,7 @@ where
         file: &mut R,
         buffer: &mut Vec<u8>,
         position: u64,
-    ) -> Result<((K, V), u64), std::io::Error> {
+    ) -> DBResult<((K, V), u64)> {
         // Move the rea cursor to position.  Note the data file is opened in append mode so write
         // cursor is always EOF.
         file.seek(SeekFrom::Start(position))?;
@@ -509,10 +483,7 @@ where
             let key_size = u16::from_ne_bytes(key_size);
             if key_size == 0 {
                 // Overflow bucket, can not read as data so error.
-                return Err(std::io::Error::new(
-                    ErrorKind::Other,
-                    "found overflow bucket".to_string(),
-                ));
+                return Err(DBError::UnexpectedOverflowBucket);
             }
             key_size
         } else {
@@ -524,10 +495,7 @@ where
         let val_size = u32::from_ne_bytes(val_size_buf);
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
-                "found overflow bucket".to_string(),
-            ));
+            return Err(DBError::UnexpectedOverflowBucket);
         }
         buffer.resize(key_size as usize, 0);
         file.read_exact(buffer)?;
@@ -544,7 +512,7 @@ where
     /// Returns the key, value tuple as well as the position of the next record.
     /// Will produce an error for IO or if the record at position is actually an overflow bucket not
     /// a data record.
-    fn read_record(&self, position: u64) -> Result<((K, V), u64), std::io::Error> {
+    fn read_record(&self, position: u64) -> DBResult<((K, V), u64)> {
         let mut buffer = self.buffer.take();
         //let dat_file = { self.data_file.borrow().try_clone()? };
         //let mut file = BufReader::with_capacity(4096, dat_file);
@@ -560,11 +528,11 @@ where
         file: &mut R,
         buffer: &mut Vec<u8>,
         position: u64,
-    ) -> Result<((K, V), u64), std::io::Error> {
+    ) -> DBResult<((K, V), u64)> {
         Self::read_record_raw(file, buffer, position)
     }
 
-    fn bucket_iter(&self, bucket: usize) -> Result<BucketIter, std::io::Error> {
+    fn bucket_iter(&self, bucket: usize) -> DBResult<BucketIter> {
         let dat_file = { self.data_file.borrow().try_clone()? };
         let mut hdx_file = self.hdx_file.borrow_mut();
         BucketIter::new(
@@ -578,7 +546,7 @@ where
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
-    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, std::io::Error> {
+    pub fn raw_iter(&self) -> DBResult<DbRawIter<K, V, KSIZE, S>> {
         DbRawIter::new(self)
     }
 }
@@ -598,7 +566,7 @@ where
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
-    fn new(db: &'db Db<K, V, KSIZE, S>) -> Result<Self, std::io::Error> {
+    fn new(db: &'db Db<K, V, KSIZE, S>) -> DBResult<Self> {
         let dat_file = { db.data_file.borrow().try_clone()? };
         let file = BufReader::new(dat_file);
         Ok(Self {
@@ -625,21 +593,22 @@ where
         let mut el = 1_u64;
         while let Err(err) = &rec {
             // TODO- proper errors....
-            if err.kind() != ErrorKind::Other || err.to_string() != "found overflow bucket" {
+            if let DBError::UnexpectedOverflowBucket = err {
+                rec = self.db.read_record_file(
+                    &mut self.file,
+                    &mut self.buffer,
+                    // A overflow bucket has a slightly different size for fixed and variable keys.
+                    // Fixed keys don't need a key size (u16) but have to set value size (u32).
+                    if K::is_variable_key_size() {
+                        self.position + (el * (2 + self.db.hdx_header.bucket_size as u64))
+                    } else {
+                        self.position + (el * (4 + self.db.hdx_header.bucket_size as u64))
+                    },
+                );
+                el += 1;
+            } else {
                 break;
             }
-            rec = self.db.read_record_file(
-                &mut self.file,
-                &mut self.buffer,
-                // A overflow bucket has a slightly different size for fixed and variable keys.
-                // Fixed keys don't need a key size (u16) but have to set value size (u32).
-                if K::is_variable_key_size() {
-                    self.position + (el * (2 + self.db.hdx_header.bucket_size as u64))
-                } else {
-                    self.position + (el * (4 + self.db.hdx_header.bucket_size as u64))
-                },
-            );
-            el += 1;
         }
         if let Ok((ret, position)) = rec {
             self.position = position;
@@ -666,7 +635,7 @@ impl BucketIter {
         bucket_size: u16,
         elements: u16,
         bucket: usize,
-    ) -> Result<Self, std::io::Error> {
+    ) -> DBResult<Self> {
         let mut buffer = Vec::with_capacity(bucket_size as usize);
 
         let bucket_pos: u64 = (HdxHeader::SIZE + (bucket * bucket_size as usize)) as u64;
@@ -725,7 +694,6 @@ impl Iterator for BucketIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Error;
 
     #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
     struct Key([u8; 32]);
@@ -737,7 +705,7 @@ mod tests {
             buffer.copy_from_slice(&self.0);
         }
 
-        fn deserialize(buffer: &[u8]) -> Result<Key, Error> {
+        fn deserialize(buffer: &[u8]) -> DBResult<Key> {
             let mut key = [0_u8; 32];
             key.copy_from_slice(buffer);
             Ok(Key(key))
@@ -752,7 +720,7 @@ mod tests {
             buffer.copy_from_slice(bytes);
         }
 
-        fn deserialize(buffer: &[u8]) -> Result<String, Error> {
+        fn deserialize(buffer: &[u8]) -> DBResult<String> {
             Ok(String::from_utf8_lossy(buffer).to_string())
         }
     }
@@ -764,7 +732,7 @@ mod tests {
             buffer.copy_from_slice(&self.to_ne_bytes());
         }
 
-        fn deserialize(buffer: &[u8]) -> Result<u64, Error> {
+        fn deserialize(buffer: &[u8]) -> DBResult<u64> {
             let mut buf = [0_u8; 8];
             buf.copy_from_slice(buffer);
             Ok(Self::from_ne_bytes(buf))
