@@ -13,6 +13,7 @@ pub enum DBError {
     InvalidIndexHeader,
     InvalidIndexFile,
     UnexpectedOverflowBucket,
+    DuplicateInsert,
 }
 
 impl Error for DBError {}
@@ -29,6 +30,7 @@ impl fmt::Display for DBError {
             Self::InvalidIndexHeader => write!(f, "Invalid Index File Header"),
             Self::InvalidIndexFile => write!(f, "Invalid Index File"),
             Self::UnexpectedOverflowBucket => write!(f, "Unexpected Overflow Bucket"),
+            Self::DuplicateInsert => write!(f, "Key already in the database"),
         }
     }
 }
@@ -36,16 +38,6 @@ impl fmt::Display for DBError {
 impl From<io::Error> for DBError {
     fn from(io_err: io::Error) -> Self {
         DBError::IO(io_err)
-    }
-}
-
-impl DBError {
-    pub fn not_found() -> Self {
-        Self::NotFound
-    }
-
-    pub fn deserialize(msg: String) -> Self {
-        Self::Deserialize(msg)
     }
 }
 

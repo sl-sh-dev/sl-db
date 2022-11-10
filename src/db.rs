@@ -41,8 +41,6 @@ pub trait DbKey<const KSIZE: u16>: Eq + Hash + Debug {
     }
 }
 
-pub trait VariableKey {}
-
 pub trait DbBytes<T> {
     fn serialize(&self, buffer: &mut Vec<u8>);
     fn deserialize(buffer: &[u8]) -> DBResult<T>;
@@ -76,6 +74,9 @@ impl Default for DataHeader {
     }
 }
 
+// Each bucket element is a (u64, u64, u32)- (hash, record_pos, record_size).
+const BUCKET_ELEMENT_SIZE: usize = 20;
+
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 struct HdxHeader {
@@ -106,8 +107,8 @@ impl Default for HdxHeader {
                             // Each bucket is:
                             // u64 (pos of overflow record)
                             // elements[] each one is:
-                            //     (u64 (hash), u64 (record pos)).
-        let bucket_size = 8 + (16 * elements);
+                            //     (u64 (hash), u64 (record pos), u32 (record size)).
+        let bucket_size: u16 = 8 + (BUCKET_ELEMENT_SIZE as u16 * elements);
         Self {
             type_id: *b"sldb.hdx",
             version: 0,
@@ -138,7 +139,7 @@ where
     // Keep a buffer around to share and avoid allocations.
     buffer: Cell<Vec<u8>>,
     write_buffer: Vec<u8>,
-    index_cache: FxHashMap<K, (u64, u64)>,
+    index_cache: FxHashMap<K, (u64, u64, u32)>,
     hdx_header: HdxHeader,
     modulus: u32,
     load_factor: f32,
@@ -192,27 +193,50 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&self, key: K) -> DBResult<V> {
-        if let Some((_hash, rec_pos)) = self.index_cache.get(&key) {
+    pub fn fetch(&self, key: &K) -> DBResult<V> {
+        if let Some((_hash, rec_pos, rec_size)) = self.index_cache.get(key) {
             // Try the index cache.
-            let ((_, val), _) = self.read_record(*rec_pos)?;
+            let ((_, val), _) = self.read_record(*rec_pos, *rec_size as usize)?;
             return Ok(val);
         } else {
             // Then check the on disk index.
-            let hash = self.hash(&key);
+            let hash = self.hash(key);
             let bucket = self.get_bucket(hash) as usize;
             let iter = self.bucket_iter(bucket)?;
-            for (rec_hash, rec_pos) in iter {
+            for (rec_hash, rec_pos, rec_size) in iter {
                 // rec_pos > 0 handles degenerate case of a 0 hash.
                 if hash == rec_hash && rec_pos > 0 {
-                    let ((rkey, val), _) = self.read_record(rec_pos)?;
-                    if rkey == key {
+                    let ((rkey, val), _) = self.read_record(rec_pos, rec_size as usize)?;
+                    if &rkey == key {
                         return Ok(val);
                     }
                 }
             }
         }
         Err(DBError::NotFound)
+    }
+
+    /// True if the database contains key.
+    pub fn contains_key(&self, key: &K) -> DBResult<bool> {
+        if self.index_cache.contains_key(key) {
+            // Try the index cache.
+            return Ok(true);
+        } else {
+            // Then check the on disk index.
+            let hash = self.hash(key);
+            let bucket = self.get_bucket(hash) as usize;
+            let iter = self.bucket_iter(bucket)?;
+            for (rec_hash, rec_pos, _rec_size) in iter {
+                // rec_pos > 0 handles degenerate case of a 0 hash.
+                if hash == rec_hash && rec_pos > 0 {
+                    let rkey = self.read_key(rec_pos)?;
+                    if &rkey == key {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Insert a new key/value pair in Db.
@@ -222,6 +246,9 @@ where
     ///   - key data
     ///   - value data
     pub fn insert(&mut self, key: K, value: V) -> DBResult<()> {
+        if self.contains_key(&key)? {
+            return Err(DBError::DuplicateInsert);
+        }
         let mut file = self.data_file.borrow_mut();
         let mut buffer = self.buffer.take();
         self.write_buffer.clear();
@@ -256,7 +283,8 @@ where
         file.write_all(&self.write_buffer)?;
         // An early return on error could cause a new buffer to be created, should not be a big deal.
         self.buffer.set(buffer);
-        self.index_cache.insert(key, (hash, record_pos));
+        self.index_cache
+            .insert(key, (hash, record_pos, self.write_buffer.len() as u32));
         self.hdx_header.values += 1;
         drop(file);
         if self.index_cache.len() > 1000 {
@@ -276,6 +304,7 @@ where
         self.len() == 0
     }
 
+    /// Flush any caches to disk and sync the data and index file.
     pub fn commit(&mut self) -> DBResult<()> {
         self.data_file.borrow_mut().sync_all()?;
         self.expand_buckets()?;
@@ -285,9 +314,9 @@ where
     }
 
     fn flush_index(&mut self) -> DBResult<()> {
-        for (hash, pos) in self.index_cache.values() {
+        for (hash, pos, size) in self.index_cache.values() {
             let bucket = self.get_bucket(*hash);
-            self.save_to_bucket((*hash, *pos), bucket)?;
+            self.save_to_bucket((*hash, *pos, *size), bucket)?;
         }
         self.index_cache.clear();
         let mut hdx_file = self.hdx_file.borrow_mut();
@@ -395,7 +424,7 @@ where
         buffer.resize(self.hdx_header.bucket_size as usize, 0);
         let mut buffer2 = vec![0; self.hdx_header.bucket_size as usize];
 
-        for (rec_hash, rec_pos) in iter {
+        for (rec_hash, rec_pos, rec_size) in iter {
             // rec_pos > 0 indicates a live entry.
             if rec_pos > 0 {
                 let bucket = self.get_bucket(rec_hash);
@@ -409,9 +438,9 @@ where
                     );
                 }
                 if bucket as usize == split_bucket {
-                    self.save_to_bucket_buffer((rec_hash, rec_pos), &mut buffer)?;
+                    self.save_to_bucket_buffer((rec_hash, rec_pos, rec_size), &mut buffer)?;
                 } else {
-                    self.save_to_bucket_buffer((rec_hash, rec_pos), &mut buffer2)?;
+                    self.save_to_bucket_buffer((rec_hash, rec_pos, rec_size), &mut buffer2)?;
                 }
             }
         }
@@ -446,8 +475,8 @@ where
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket(&self, hash_pos: (u64, u64), bucket: u64) -> DBResult<()> {
-        let (hash, _record_pos) = hash_pos;
+    fn save_to_bucket(&self, hash_pos: (u64, u64, u32), bucket: u64) -> DBResult<()> {
+        let (hash, _record_pos, _record_size) = hash_pos;
         if self.get_bucket(hash) != bucket {
             panic!(
                 "tried to insert into wrong bucket! {} into {}",
@@ -472,25 +501,27 @@ where
         res
     }
 
-    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket_buffer(&self, hash_pos: (u64, u64), buffer: &mut [u8]) -> DBResult<()> {
-        let (hash, record_pos) = hash_pos;
+    /// Save the (hash, position, record_size) tuple to the bucket.  Handles overflow records.
+    fn save_to_bucket_buffer(&self, hash_pos: (u64, u64, u32), buffer: &mut [u8]) -> DBResult<()> {
+        let (hash, record_pos, record_size) = hash_pos;
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.hdx_header.bucket_elements as u64 {
-            let mut buf = [0_u8; 8];
-            buf.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_hash = u64::from_ne_bytes(buf);
+            let mut buf64 = [0_u8; 8];
+            buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+            let rec_hash = u64::from_ne_bytes(buf64);
             pos += 8;
-            buf.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_pos = u64::from_ne_bytes(buf);
-            pos += 8;
-            // Test rec_pos == 0 to handle degenerate case of a hash of 0.
+            buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+            let rec_pos = u64::from_ne_bytes(buf64);
+            pos += 12; // Skip over size
+                       // Test rec_pos == 0 to handle degenerate case of a hash of 0.
             if rec_hash == 0 && rec_pos == 0 {
                 // Seek to the element we found that was empty and write the hash and position into it.
-                let mut pos = 8 + (i as usize * 16);
+                let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
                 buffer[pos..pos + 8].copy_from_slice(&hash.to_ne_bytes());
                 pos += 8;
                 buffer[pos..pos + 8].copy_from_slice(&record_pos.to_ne_bytes());
+                pos += 8;
+                buffer[pos..pos + 4].copy_from_slice(&record_size.to_ne_bytes());
                 return Ok(());
             }
         }
@@ -515,6 +546,7 @@ where
         // First element will be the hash and position being saved (rest of new bucket is empty).
         buffer[8..16].copy_from_slice(&hash.to_ne_bytes());
         buffer[16..24].copy_from_slice(&record_pos.to_ne_bytes());
+        buffer[24..28].copy_from_slice(&record_size.to_ne_bytes());
         Ok(())
     }
 
@@ -526,9 +558,94 @@ where
         file: &mut R,
         buffer: &mut Vec<u8>,
         position: u64,
+        size: usize,
     ) -> DBResult<((K, V), u64)> {
+        buffer.resize(size, 0);
         // Move the rea cursor to position.  Note the data file is opened in append mode so write
         // cursor is always EOF.
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut buffer[..])?;
+        let mut pos = 0;
+        let key_size = if K::is_variable_key_size() {
+            let mut key_size = [0_u8; 2];
+            key_size.copy_from_slice(&buffer[0..2]);
+            pos += 2;
+            let key_size = u16::from_ne_bytes(key_size);
+            if key_size == 0 {
+                // Overflow bucket, can not read as data so error.
+                return Err(DBError::UnexpectedOverflowBucket);
+            }
+            key_size
+        } else {
+            K::KEY_SIZE
+        } as usize;
+
+        let mut val_size_buf = [0_u8; 4];
+        val_size_buf.copy_from_slice(&buffer[pos..pos + 4]);
+        pos += 4;
+        let val_size = u32::from_ne_bytes(val_size_buf) as usize;
+        if K::is_fixed_key_size() && val_size == 0 {
+            // No key size so overflow indicated by a 0 value size.
+            return Err(DBError::UnexpectedOverflowBucket);
+        }
+        let key = K::deserialize(&buffer[pos..pos + key_size])?;
+        pos += key_size;
+        let val = V::deserialize(&buffer[pos..pos + val_size])?;
+        let next_record_pos = file.seek(SeekFrom::Current(0))?;
+        // An early return on error could cause a new buffer to be created, should not be a big deal.
+        Ok(((key, val), next_record_pos))
+    }
+
+    /// Read the record at position.
+    /// Returns the (key, value) tuple as well as the position of the next record.
+    /// Will produce an error for IO or if the record at position is actually an overflow bucket not
+    /// a data record.
+    fn read_record(&self, position: u64, size: usize) -> DBResult<((K, V), u64)> {
+        let mut buffer = self.buffer.take();
+        //let dat_file = { self.data_file.borrow().try_clone()? };
+        //let mut file = BufReader::with_capacity(4096, dat_file);
+        //let result = Self::read_record_raw(&mut file, &mut buffer, position);
+        let result = Self::read_record_raw(
+            &mut *self.data_file.borrow_mut(),
+            &mut buffer,
+            position,
+            size,
+        );
+        self.buffer.set(buffer);
+        result
+    }
+
+    /// Read the key for the record at position.
+    /// The position needs to be valid, attempting to read an overflow bucket or other invalid area will
+    /// produce an error or invalid key.
+    fn read_key(&self, position: u64) -> DBResult<K> {
+        let mut buffer = self.buffer.take();
+
+        let mut file = self.data_file.borrow_mut();
+        file.seek(SeekFrom::Start(position))?;
+        let key_size = if K::is_variable_key_size() {
+            let mut key_size = [0_u8; 2];
+            file.read_exact(&mut key_size)?;
+            let key_size = u16::from_ne_bytes(key_size);
+            key_size as usize
+        } else {
+            K::KEY_SIZE as usize
+        };
+        buffer.resize(key_size + 4, 0);
+        file.read_exact(&mut buffer)?;
+        // Skip the value size and read the key.
+        let key = K::deserialize(&buffer[4..])?;
+
+        self.buffer.set(buffer);
+        Ok(key)
+    }
+
+    fn read_record_file<R: Read + Seek>(
+        &self,
+        file: &mut R,
+        buffer: &mut Vec<u8>,
+        position: u64,
+    ) -> DBResult<((K, V), u64)> {
         file.seek(SeekFrom::Start(position))?;
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
@@ -541,7 +658,7 @@ where
             key_size
         } else {
             K::KEY_SIZE
-        };
+        } as usize;
 
         let mut val_size_buf = [0_u8; 4];
         file.read_exact(&mut val_size_buf)?;
@@ -552,37 +669,13 @@ where
         }
         buffer.resize(key_size as usize, 0);
         file.read_exact(buffer)?;
-        let key = K::deserialize(buffer)?;
+        let key = K::deserialize(&buffer[..])?;
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
-        let val = V::deserialize(buffer)?;
-        let pos = file.seek(SeekFrom::Current(0))?;
+        let val = V::deserialize(&buffer[..])?;
+        let next_record_pos = file.seek(SeekFrom::Current(0))?;
         // An early return on error could cause a new buffer to be created, should not be a big deal.
-        Ok(((key, val), pos))
-    }
-
-    /// Read the record at position.
-    /// Returns the key, value tuple as well as the position of the next record.
-    /// Will produce an error for IO or if the record at position is actually an overflow bucket not
-    /// a data record.
-    fn read_record(&self, position: u64) -> DBResult<((K, V), u64)> {
-        let mut buffer = self.buffer.take();
-        //let dat_file = { self.data_file.borrow().try_clone()? };
-        //let mut file = BufReader::with_capacity(4096, dat_file);
-        //let result = Self::read_record_raw(&mut file, &mut buffer, position);
-        let result =
-            Self::read_record_raw(&mut *self.data_file.borrow_mut(), &mut buffer, position);
-        self.buffer.set(buffer);
-        result
-    }
-
-    fn read_record_file<R: Read + Seek>(
-        &self,
-        file: &mut R,
-        buffer: &mut Vec<u8>,
-        position: u64,
-    ) -> DBResult<((K, V), u64)> {
-        Self::read_record_raw(file, buffer, position)
+        Ok(((key, val), next_record_pos))
     }
 
     fn bucket_iter(&self, bucket: usize) -> DBResult<BucketIter> {
@@ -714,24 +807,29 @@ impl BucketIter {
 }
 
 impl Iterator for BucketIter {
-    type Item = (u64, u64);
+    type Item = (u64, u64, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
         // For reading u64 values, needs an array.
-        let mut buf = [0_u8; 8];
+        let mut buf64 = [0_u8; 8];
+        // For reading u32 values, needs an array.
+        let mut buf32 = [0_u8; 4];
         loop {
             if self.bucket_pos < self.elements as usize {
-                let mut pos = 8 + (self.bucket_pos * 16);
-                buf.copy_from_slice(&self.buffer[pos..(pos + 8)]);
-                let hash = u64::from_ne_bytes(buf);
+                let mut pos = 8 + (self.bucket_pos * BUCKET_ELEMENT_SIZE);
+                buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
+                let hash = u64::from_ne_bytes(buf64);
                 pos += 8;
-                buf.copy_from_slice(&self.buffer[pos..(pos + 8)]);
-                let rec_pos = u64::from_ne_bytes(buf);
+                buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
+                let rec_pos = u64::from_ne_bytes(buf64);
+                pos += 8;
+                buf32.copy_from_slice(&self.buffer[pos..(pos + 4)]);
+                let rec_size = u32::from_ne_bytes(buf32);
                 if hash == 0 && rec_pos == 0 {
                     self.bucket_pos += 1;
                 } else {
                     self.bucket_pos += 1;
-                    return Some((hash, rec_pos));
+                    return Some((hash, rec_pos, rec_size));
                 }
             } else if self.overflow_pos > 0 {
                 // We have an overflow bucket to search as well.
@@ -740,8 +838,8 @@ impl Iterator for BucketIter {
                     .ok()?;
                 self.dat_file.read_exact(&mut self.buffer).ok()?;
                 self.bucket_pos = 0;
-                buf.copy_from_slice(&self.buffer[0..8]);
-                self.overflow_pos = u64::from_ne_bytes(buf);
+                buf64.copy_from_slice(&self.buffer[0..8]);
+                self.overflow_pos = u64::from_ne_bytes(buf64);
             } else {
                 return None;
             }
@@ -814,19 +912,19 @@ mod tests {
             let key = Key([5_u8; 32]);
             db.insert(key, "Value Five".to_string()).unwrap();
 
-            let v = db.fetch(key).unwrap();
+            let v = db.fetch(&key).unwrap();
             assert_eq!(v, "Value Five");
             let key = Key([1_u8; 32]);
-            let v = db.fetch(key).unwrap();
+            let v = db.fetch(&key).unwrap();
             assert_eq!(v, "Value One");
             let key = Key([3_u8; 32]);
-            let v = db.fetch(key).unwrap();
+            let v = db.fetch(&key).unwrap();
             assert_eq!(v, "Value Three");
             let key = Key([2_u8; 32]);
-            let v = db.fetch(key).unwrap();
+            let v = db.fetch(&key).unwrap();
             assert_eq!(v, "Value Two");
             let key = Key([4_u8; 32]);
-            let v = db.fetch(key).unwrap();
+            let v = db.fetch(&key).unwrap();
             assert_eq!(v, "Value Four");
 
             let mut iter = db.raw_iter().unwrap();
@@ -873,18 +971,28 @@ mod tests {
     #[test]
     fn test_50k() {
         let mut db = Db::<u64, String, 8>::open(".", "xxx50k").unwrap();
+        assert!(!db.contains_key(&0).unwrap());
+        assert!(!db.contains_key(&10).unwrap());
+        assert!(!db.contains_key(&35_000).unwrap());
+        assert!(!db.contains_key(&49_000).unwrap());
+        assert!(!db.contains_key(&50_000).unwrap());
         for i in 0..50_000 {
             db.insert(i as u64, format!("Value {}", i)).unwrap();
         }
         assert_eq!(db.len(), 50_000);
+        assert!(db.contains_key(&0).unwrap());
+        assert!(db.contains_key(&10).unwrap());
+        assert!(db.contains_key(&35_000).unwrap());
+        assert!(db.contains_key(&49_000).unwrap());
+        assert!(!db.contains_key(&50_000).unwrap());
         let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
         assert_eq!(vals.len(), 50_000);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
         }
-        assert_eq!(&db.fetch(35_000).unwrap(), "Value 35000");
+        assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
         for i in 0..50_000 {
-            assert_eq!(&db.fetch(i as u64).unwrap(), &format!("Value {}", i));
+            assert_eq!(&db.fetch(&(i as u64)).unwrap(), &format!("Value {}", i));
         }
     }
 
@@ -901,10 +1009,10 @@ mod tests {
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
         }
-        assert_eq!(&db.fetch("key 35000".to_string()).unwrap(), "Value 35000");
+        assert_eq!(&db.fetch(&"key 35000".to_string()).unwrap(), "Value 35000");
         for i in 0..50_000 {
             assert_eq!(
-                &db.fetch(format!("key {i}")).unwrap(),
+                &db.fetch(&format!("key {i}")).unwrap(),
                 &format!("Value {}", i)
             );
         }
