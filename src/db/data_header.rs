@@ -1,3 +1,5 @@
+//! Define and manage a data file header.
+
 use crate::db::byte_trans::ByteTrans;
 use crate::error::{DBError, DBResult};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -66,10 +68,30 @@ impl DataHeader {
         Ok(())
     }
 
+    /// Version of the DB file.
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Generated uid for this DB.
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// User defined appnum.
+    pub fn appnum(&self) -> u64 {
+        self.appnum
+    }
+
     /// Return the bucket size for an index on this DB.
     /// The data file needs this to skip over overflow buckets in some cases and keeping it's own
     /// copy allows this to work without an index file.
     pub fn bucket_size(&self) -> u16 {
         self.bucket_size
+    }
+
+    /// Number of elements in each bucket.
+    pub fn bucket_elements(&self) -> u16 {
+        self.bucket_elements
     }
 }

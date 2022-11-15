@@ -1,7 +1,6 @@
 //! Raw iterator over a sldb data file.  This will work without an index file and can be used to
 //! open the file directly.
 
-use crate::db::byte_trans::ByteTrans;
 use crate::db::data_header::DataHeader;
 use crate::db::{DbBytes, DbKey};
 use crate::error::DBError;
@@ -26,7 +25,6 @@ where
     bucket_size: u16,
     file: BufReader<File>,
     buffer: Vec<u8>,
-    position: u64,
 }
 
 impl<K, V, const KSIZE: u16, S> DbRawIter<K, V, KSIZE, S>
@@ -53,7 +51,6 @@ where
             bucket_size: header.bucket_size(),
             file,
             buffer: Vec::new(),
-            position: DataHeader::SIZE as u64,
         })
     }
 
@@ -67,21 +64,15 @@ where
             bucket_size: header.bucket_size(),
             file,
             buffer: Vec::new(),
-            position: DataHeader::SIZE as u64,
         })
     }
 
-    fn read_record_file<R: Read + Seek>(
-        file: &mut R,
-        buffer: &mut Vec<u8>,
-        position: u64,
-    ) -> DBResult<((K, V), u64)> {
-        let mut next_record_pos = position;
-        file.seek(SeekFrom::Start(position))?;
+    /// Read the next record or return an error if an overflow bucket.
+    /// This expects the file cursor to be positioned at the records first byte.
+    fn read_record_file<R: Read + Seek>(file: &mut R, buffer: &mut Vec<u8>) -> DBResult<(K, V)> {
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
             file.read_exact(&mut key_size)?;
-            next_record_pos += 2;
             let key_size = u16::from_ne_bytes(key_size);
             if key_size == 0 {
                 // Overflow bucket, can not read as data so error.
@@ -94,7 +85,6 @@ where
 
         let mut val_size_buf = [0_u8; 4];
         file.read_exact(&mut val_size_buf)?;
-        next_record_pos += 4;
         let val_size = u32::from_ne_bytes(val_size_buf);
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
@@ -102,13 +92,11 @@ where
         }
         buffer.resize(key_size as usize, 0);
         file.read_exact(buffer)?;
-        next_record_pos += buffer.len() as u64;
         let key = K::deserialize(&buffer[..])?;
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
-        next_record_pos += buffer.len() as u64;
         let val = V::deserialize(&buffer[..])?;
-        Ok(((key, val), next_record_pos))
+        Ok((key, val))
     }
 }
 
@@ -121,28 +109,19 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut rec = Self::read_record_file(&mut self.file, &mut self.buffer, self.position);
-        let mut el = 1_u64;
+        let mut rec = Self::read_record_file(&mut self.file, &mut self.buffer);
         while let Err(err) = &rec {
             if let DBError::UnexpectedOverflowBucket = err {
-                rec = Self::read_record_file(
-                    &mut self.file,
-                    &mut self.buffer,
-                    // A overflow bucket has a slightly different size for fixed and variable keys.
-                    // Fixed keys don't need a key size (u16) but have to set value size (u32).
-                    if K::is_variable_key_size() {
-                        self.position + (el * (2 + self.bucket_size as u64))
-                    } else {
-                        self.position + (el * (4 + self.bucket_size as u64))
-                    },
-                );
-                el += 1;
+                // The key or value size has already been read in this case.
+                self.file
+                    .seek(SeekFrom::Current(self.bucket_size as i64))
+                    .ok()?;
+                rec = Self::read_record_file(&mut self.file, &mut self.buffer);
             } else {
                 break;
             }
         }
-        if let Ok((ret, position)) = rec {
-            self.position = position;
+        if let Ok(ret) = rec {
             Some(ret)
         } else {
             None
