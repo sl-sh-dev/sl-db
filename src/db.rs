@@ -96,7 +96,7 @@ where
     ///   - value size (u32)
     ///   - key data
     ///   - value data
-    pub fn insert(&mut self, key: K, value: &V) -> DBResult<()> {
+    pub fn insert(&self, key: K, value: &V) -> DBResult<()> {
         self.inner.borrow_mut().insert(key, value)
     }
 
@@ -112,13 +112,13 @@ where
 
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
-    pub fn commit(&mut self) -> DBResult<()> {
+    pub fn commit(&self) -> DBResult<()> {
         self.inner.borrow_mut().commit()
     }
 
     /// Flush any in memory caches to file.
     /// Note this is only a flush not a commit, it does not do a sync on the files.
-    pub fn flush(&mut self) -> DBResult<()> {
+    pub fn flush(&self) -> DBResult<()> {
         self.inner.borrow_mut().flush()
     }
 
@@ -138,12 +138,13 @@ where
     S: BuildHasher + Default,
 {
     _header: DataHeader,
-    data_file: RefCell<(File, u64)>,
-    hdx_file: RefCell<File>,
+    data_file: File,
+    data_file_end: u64,
+    hdx_file: File,
     hasher: S,
     // Keep a buffer around to share and avoid allocations.
-    // It is a Cell for interior mutability so we can use in &self functions.
-    buffer: Cell<Vec<u8>>,
+    // It is a Cell for interior mutability so we can use avoid borrow errors.
+    scratch_buffer: Cell<Vec<u8>>,
     write_buffer: Vec<u8>,
     bucket_elements_cache: Vec<(u64, u64, u32)>,
     index_cache: FxHashMap<K, (u64, u64, u32)>,
@@ -190,14 +191,15 @@ where
         index_cache.reserve(50000);
         Ok(Self {
             _header: header,
-            data_file: RefCell::new((data_file, data_file_end)),
-            hdx_file: RefCell::new(hdx_file),
+            data_file,
+            data_file_end,
+            hdx_file,
             hasher: S::default(),
             hdx_header,
             modulus,
             load_factor: hdx_header.load_factor(),
             capacity: hdx_header.buckets() as u64 * hdx_header.bucket_elements() as u64,
-            buffer: Cell::new(Vec::new()),
+            scratch_buffer: Cell::new(Vec::new()),
             write_buffer,
             bucket_elements_cache: Vec::with_capacity(header.bucket_elements() as usize),
             index_cache, //: FxHashMap::with_capacity(1000),//default(),
@@ -270,11 +272,10 @@ where
             return Err(DBError::DuplicateInsert);
         }
         {
-            let (_file, data_file_end) = &*self.data_file.borrow();
-            let mut buffer = self.buffer.take();
+            let mut buffer = self.scratch_buffer.take();
             //self.write_buffer.clear();
             let start_write_buffer_len = self.write_buffer.len();
-            let record_pos = *data_file_end + self.write_buffer.len() as u64;
+            let record_pos = self.data_file_end + self.write_buffer.len() as u64;
             let hash = self.hash(&key);
             key.serialize(&mut buffer);
             // If we have a variable sized key write it's size otherwise no need.
@@ -304,7 +305,7 @@ where
             //file.write_all(&self.write_buffer)?;
             //*data_file_end += self.write_buffer.len() as u64;
             // An early return on error could cause a new buffer to be created, should not be a big deal.
-            self.buffer.set(buffer);
+            self.scratch_buffer.set(buffer);
             self.index_cache.insert(
                 key,
                 (
@@ -336,8 +337,8 @@ where
     /// All data should be safely on disk if this call succeeds.
     pub fn commit(&mut self) -> DBResult<()> {
         self.flush()?;
-        self.data_file.borrow_mut().0.sync_all()?;
-        self.hdx_file.borrow_mut().sync_all()?;
+        self.data_file.sync_all()?;
+        self.hdx_file.sync_all()?;
         Ok(())
     }
 
@@ -345,9 +346,8 @@ where
     /// Note this is only a flush not a commit, it does not do a sync on the files.
     pub fn flush(&mut self) -> DBResult<()> {
         {
-            let (file, data_file_end) = &mut *self.data_file.borrow_mut();
-            file.write_all(&self.write_buffer)?;
-            *data_file_end += self.write_buffer.len() as u64;
+            self.data_file.write_all(&self.write_buffer)?;
+            self.data_file_end += self.write_buffer.len() as u64;
             self.write_buffer.clear();
         }
         self.expand_buckets()?;
@@ -360,9 +360,8 @@ where
             unsafe_db.save_to_bucket(key, *hash, (*pos, *size))?;
         }
         self.index_cache.clear();
-        let mut hdx_file = self.hdx_file.borrow_mut();
-        hdx_file.seek(SeekFrom::Start(0))?;
-        hdx_file.write_all(self.hdx_header.as_ref())?;
+        self.hdx_file.seek(SeekFrom::Start(0))?;
+        self.hdx_file.write_all(self.hdx_header.as_ref())?;
         Ok(())
     }
 
@@ -440,7 +439,7 @@ where
         // Grab the iter before we clear the bucket in the block below.
         self.load_bucket_elements_cache(split_bucket)?;
 
-        let mut buffer = self.buffer.take();
+        let mut buffer = self.scratch_buffer.take();
         buffer.clear();
         buffer.resize(self.hdx_header.bucket_size() as usize, 0);
         let mut buffer2 = vec![0; self.hdx_header.bucket_size() as usize];
@@ -467,15 +466,14 @@ where
         }
 
         // Overwrite the existing bucket with a new blank bucket and add a new empty bucket to the end.
-        let mut hdx_file = self.hdx_file.borrow_mut();
         let bucket_pos: u64 = (HdxHeader::SIZE
             + (split_bucket as usize * self.hdx_header.bucket_size() as usize))
             as u64;
-        hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-        hdx_file.write_all(&buffer)?;
-        hdx_file.seek(SeekFrom::End(0))?;
-        hdx_file.write_all(&buffer2)?;
-        self.buffer.set(buffer);
+        self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+        self.hdx_file.write_all(&buffer)?;
+        self.hdx_file.seek(SeekFrom::End(0))?;
+        self.hdx_file.write_all(&buffer2)?;
+        self.scratch_buffer.set(buffer);
 
         Ok(())
     }
@@ -498,23 +496,21 @@ where
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     fn save_to_bucket(&mut self, key: &K, hash: u64, pos_size: (u64, u32)) -> DBResult<()> {
         let bucket = self.get_bucket(hash);
-        let mut buffer = self.buffer.take();
+        let mut buffer = self.scratch_buffer.take();
         let bucket_pos: u64 =
             (HdxHeader::SIZE + (bucket as usize * self.hdx_header.bucket_size() as usize)) as u64;
         {
-            let mut hdx_file = self.hdx_file.borrow_mut();
-            hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+            self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             buffer.resize(self.hdx_header.bucket_size() as usize, 0);
-            hdx_file.read_exact(&mut buffer)?;
+            self.hdx_file.read_exact(&mut buffer)?;
         }
 
         let res = self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer);
         if res.is_ok() {
-            let mut hdx_file = self.hdx_file.borrow_mut();
-            hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-            hdx_file.write_all(&buffer)?;
+            self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+            self.hdx_file.write_all(&buffer)?;
         }
-        self.buffer.set(buffer);
+        self.scratch_buffer.set(buffer);
         res
     }
 
@@ -568,7 +564,6 @@ where
         }
         // XXXSLS- should check if buffer has room.
         // Overflow, save bucket as an overflow record and add to the fresh bucket.
-        let (_file, data_file_end) = &*self.data_file.borrow();
         // Need this allow, clippy can not tell the difference in 0_u16 and 0_u32 apparently.
         #[allow(clippy::if_same_then_else)]
         if K::is_variable_key_size() {
@@ -578,7 +573,7 @@ where
             // Write a 0 value size to indicate this is an overflow bucket not a data record.
             self.write_buffer.write_all(&0_u32.to_ne_bytes())?;
         }
-        let overflow_pos = *data_file_end + self.write_buffer.len() as u64;
+        let overflow_pos = self.data_file_end + self.write_buffer.len() as u64;
         // Write the old buffer into the data file as an overflow record.
         self.write_buffer.write_all(buffer)?;
         // clear buffer and reset to 0.
@@ -642,9 +637,9 @@ where
     /// Will produce an error for IO or if the record at position is actually an overflow bucket not
     /// a data record.
     fn read_record(&mut self, position: u64, size: usize) -> DBResult<(K, V)> {
-        let mut buffer = self.buffer.take();
+        let mut buffer = self.scratch_buffer.take();
         let result = self.read_record_raw(position, size, &mut buffer);
-        self.buffer.set(buffer);
+        self.scratch_buffer.set(buffer);
         result
     }
 
@@ -652,7 +647,7 @@ where
     /// The position needs to be valid, attempting to read an overflow bucket or other invalid area will
     /// produce an error or invalid key.
     fn read_key(&mut self, position: u64) -> DBResult<K> {
-        let mut buffer = self.buffer.take();
+        let mut buffer = self.scratch_buffer.take();
 
         self.seek(SeekFrom::Start(position))?;
         let key_size = if K::is_variable_key_size() {
@@ -668,20 +663,18 @@ where
         // Skip the value size and read the key.
         let key = K::deserialize(&buffer[4..])?;
 
-        self.buffer.set(buffer);
+        self.scratch_buffer.set(buffer);
         Ok(key)
     }
 
     fn bucket_iter(&mut self, bucket: usize) -> DBResult<BucketIter<DbInner<K, V, KSIZE, S>>> {
         let mut buffer = Vec::with_capacity(self.hdx_header.bucket_size() as usize);
         {
-            let mut hdx_file = self.hdx_file.borrow_mut();
-
             let bucket_size = self.hdx_header.bucket_size() as usize;
             let bucket_pos: u64 = (HdxHeader::SIZE + (bucket * bucket_size)) as u64;
-            hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+            self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             buffer.resize(bucket_size, 0);
-            hdx_file.read_exact(&mut buffer)?;
+            self.hdx_file.read_exact(&mut buffer)?;
         }
         BucketIter::new(self, buffer, self.hdx_header.bucket_elements())
     }
@@ -702,13 +695,7 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     pub fn raw_iter(&self) -> DBResult<DbRawIter<K, V, KSIZE, S>> {
-        /*{
-            let (file, data_file_end) = &mut *self.data_file.borrow_mut();
-            file.write_all(&self.write_buffer)?;
-            *data_file_end += self.write_buffer.len() as u64;
-            self.write_buffer.clear();
-        }*/
-        let dat_file = { self.data_file.borrow().0.try_clone()? };
+        let dat_file = { self.data_file.try_clone()? };
         DbRawIter::new(dat_file)
     }
 }
@@ -720,9 +707,8 @@ where
     S: BuildHasher + Default,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let (file, data_file_end) = &mut *self.data_file.borrow_mut();
-        if self.seek_pos >= *data_file_end {
-            let write_pos = (self.seek_pos - *data_file_end) as usize;
+        if self.seek_pos >= self.data_file_end {
+            let write_pos = (self.seek_pos - self.data_file_end) as usize;
             if write_pos < self.write_buffer.len() {
                 let mut size = buf.len();
                 if write_pos + size > self.write_buffer.len() {
@@ -737,8 +723,8 @@ where
         } else {
             // Move the read cursor to position.  Note the data file is opened in append mode so write
             // cursor is always EOF.
-            file.seek(SeekFrom::Start(self.seek_pos))?;
-            let size = file.read(buf)?;
+            self.data_file.seek(SeekFrom::Start(self.seek_pos))?;
+            let size = self.data_file.read(buf)?;
             self.seek_pos += size as u64;
             Ok(size)
         }
@@ -755,7 +741,7 @@ where
         match pos {
             SeekFrom::Start(pos) => self.seek_pos = pos,
             SeekFrom::End(pos) => {
-                let end = (self.data_file.borrow().1 + self.write_buffer.len() as u64) as i64 + pos;
+                let end = (self.data_file_end + self.write_buffer.len() as u64) as i64 + pos;
                 if end >= 0 {
                     self.seek_pos = end as u64;
                 } else {
@@ -895,7 +881,7 @@ mod tests {
     #[test]
     fn test_one() {
         {
-            let mut db = TestDb::open(".", "xxx1").unwrap();
+            let db = TestDb::open(".", "xxx1").unwrap();
             let key = Key([1_u8; 32]);
             db.insert(key, &"Value One".to_string()).unwrap();
             let key = Key([2_u8; 32]);
@@ -937,7 +923,7 @@ mod tests {
             assert!(iter.next().is_none());
             assert_eq!(db.len(), 5);
         }
-        let mut db = TestDb::open(".", "xxx1").unwrap();
+        let db = TestDb::open(".", "xxx1").unwrap();
         let key = Key([6_u8; 32]);
         db.insert(key, &"Value One2".to_string()).unwrap();
         let key = Key([7_u8; 32]);
@@ -1007,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_50k() {
-        let mut db = Db::<u64, String, 8>::open(".", "xxx50k").unwrap();
+        let db = Db::<u64, String, 8>::open(".", "xxx50k").unwrap();
         assert!(!db.contains_key(&0).unwrap());
         assert!(!db.contains_key(&10).unwrap());
         assert!(!db.contains_key(&35_000).unwrap());
@@ -1046,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_x50k_str() {
-        let mut db = Db::<String, String, 0>::open(".", "xxx50k_str").unwrap();
+        let db = Db::<String, String, 0>::open(".", "xxx50k_str").unwrap();
         for i in 0..50_000 {
             db.insert(format!("key {i}"), &format!("Value {}", i))
                 .unwrap();
