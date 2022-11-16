@@ -2,6 +2,7 @@
 
 use crate::db::byte_trans::ByteTrans;
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
+use crate::db_config::DbConfig;
 use crate::error::{DBError, DBResult};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -57,13 +58,15 @@ impl Default for HdxHeader {
 impl HdxHeader {
     /// Return a default HdxHeader with any values from data_header overridden.
     /// This includes the version, uid, appnum, bucket_size and bucket_elements.
-    pub fn from_data_header(data_header: &DataHeader) -> Self {
+    pub fn from_data_header(data_header: &DataHeader, config: &DbConfig) -> Self {
         Self {
             version: data_header.version(),
             uid: data_header.uid(),
             appnum: data_header.appnum(),
             bucket_elements: data_header.bucket_elements(),
             bucket_size: data_header.bucket_size(),
+            buckets: config.initial_buckets,
+            load_factor: (u16::MAX as f32 * config.load_factor) as u16,
             ..Default::default()
         }
     }

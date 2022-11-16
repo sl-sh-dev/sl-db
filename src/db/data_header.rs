@@ -1,6 +1,7 @@
 //! Define and manage a data file header.
 
 use crate::db::byte_trans::ByteTrans;
+use crate::db_config::DbConfig;
 use crate::error::{DBError, DBResult};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -47,6 +48,14 @@ impl Default for DataHeader {
 }
 
 impl DataHeader {
+    pub fn new(config: &DbConfig) -> Self {
+        Self {
+            bucket_elements: config.bucket_elements,
+            appnum: config.appnum,
+            ..Default::default()
+        }
+    }
+
     /// Load a DataHeader from source.
     pub fn load_header<R: Read + Seek>(source: &mut R) -> DBResult<Self> {
         let source = source;

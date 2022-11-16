@@ -3,6 +3,7 @@
 use crate::db::byte_trans::ByteTrans;
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
 use crate::db::hdx_header::HdxHeader;
+use crate::db_config::DbConfig;
 use crate::db_raw_iter::DbRawIter;
 use crate::error::DBError;
 use crate::error::DBResult;
@@ -73,8 +74,8 @@ where
     S: BuildHasher + Default,
 {
     /// Open a new or reopen an existing database.
-    pub fn open<P: AsRef<Path>>(dir: P, base_name: P) -> DBResult<Self> {
-        let inner = DbInner::open(dir, base_name)?;
+    pub fn open(config: DbConfig) -> DBResult<Self> {
+        let inner = DbInner::open(config)?;
         Ok(Self {
             inner: RefCell::new(inner),
         })
@@ -153,7 +154,7 @@ where
     load_factor: f32,
     capacity: u64,
     seek_pos: u64,
-    allow_bucket_expansion: bool, // don't allow more buckets- for testing lots of overflows...
+    config: DbConfig,
     _key: PhantomData<K>,
     _value: PhantomData<V>,
 }
@@ -176,13 +177,13 @@ where
     S: BuildHasher + Default,
 {
     /// Open a new or reopen an existing database.
-    pub fn open<P: AsRef<Path>>(dir: P, base_name: P) -> DBResult<Self> {
-        let data_name = dir.as_ref().join(base_name.as_ref()).with_extension("dat");
-        let hdx_name = dir.as_ref().join(base_name.as_ref()).with_extension("hdx");
-        let (mut data_file, header) = Self::open_data_file(&data_name)?;
+    pub fn open(config: DbConfig) -> DBResult<Self> {
+        let data_name = config.dir.join(&config.base_name).with_extension("dat");
+        let hdx_name = config.dir.join(&config.base_name).with_extension("hdx");
+        let (mut data_file, header) = Self::open_data_file(&data_name, &config)?;
         data_file.seek(SeekFrom::End(0))?;
         let data_file_end = data_file.seek(SeekFrom::Current(0))?;
-        let (hdx_file, hdx_header) = Self::open_hdx_file(&hdx_name, &header)?;
+        let (hdx_file, hdx_header) = Self::open_hdx_file(&hdx_name, &header, &config)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
         // Make a 16mb write buffer.
@@ -204,7 +205,7 @@ where
             bucket_elements_cache: Vec::with_capacity(header.bucket_elements() as usize),
             index_cache, //: FxHashMap::with_capacity(1000),//default(),
             seek_pos: 0,
-            allow_bucket_expansion: true,
+            config,
             _key: PhantomData,
             _value: PhantomData,
         })
@@ -268,7 +269,7 @@ where
     ///   - value data
     pub fn insert(&mut self, key: K, value: &V) -> DBResult<()> {
         // XXXSLS- checking keys is expensive.
-        if self.contains_key(&key)? {
+        if !self.config.allow_duplicate_inserts && self.contains_key(&key)? {
             return Err(DBError::DuplicateInsert);
         }
         {
@@ -301,9 +302,6 @@ where
                 .copy_from_slice(&(buffer.len() as u32).to_ne_bytes());
             self.write_buffer.write_all(&buffer)?;
 
-            // Write the buffer to the actual file (avoid excess IO syscalls).
-            //file.write_all(&self.write_buffer)?;
-            //*data_file_end += self.write_buffer.len() as u64;
             // An early return on error could cause a new buffer to be created, should not be a big deal.
             self.scratch_buffer.set(buffer);
             self.index_cache.insert(
@@ -314,11 +312,14 @@ where
                     (self.write_buffer.len() - start_write_buffer_len) as u32,
                 ),
             );
+            if self.config.cache_writes {
+                if self.index_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE {
+                    self.flush()?;
+                }
+            } else {
+                self.flush()?;
+            }
             self.hdx_header.inc_values();
-        }
-        if self.index_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE {
-            //if self.write_buffer.len() >= INSERT_BUFFER_SIZE {
-            self.flush()?;
         }
         Ok(())
     }
@@ -365,10 +366,10 @@ where
         Ok(())
     }
 
-    fn open_data_file(data_name: &Path) -> DBResult<(File, DataHeader)> {
+    fn open_data_file(data_name: &Path, config: &DbConfig) -> DBResult<(File, DataHeader)> {
         let mut file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!config.read_only)
             .append(true)
             .create(true)
             .open(data_name)?;
@@ -376,7 +377,7 @@ where
         let file_end = file.seek(SeekFrom::Current(0))?;
 
         let header = if file_end == 0 {
-            let header = DataHeader::default();
+            let header = DataHeader::new(config);
             header.write_header(&mut file)?;
             header
         } else if file_end >= DataHeader::SIZE as u64 {
@@ -387,17 +388,21 @@ where
         Ok((file, header))
     }
 
-    fn open_hdx_file(data_name: &Path, data_header: &DataHeader) -> DBResult<(File, HdxHeader)> {
+    fn open_hdx_file(
+        data_name: &Path,
+        data_header: &DataHeader,
+        config: &DbConfig,
+    ) -> DBResult<(File, HdxHeader)> {
         let mut file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(!config.read_only)
             .create(true)
             .open(data_name)?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
 
         let header = if file_end == 0 {
-            let header = HdxHeader::from_data_header(data_header);
+            let header = HdxHeader::from_data_header(data_header, config);
             header.write_header(&mut file)?;
             let mut buffer: Vec<u8> = Vec::new();
             buffer.resize(header.buckets() as usize * header.bucket_size() as usize, 0);
@@ -480,12 +485,9 @@ where
 
     /// Add buckets to expand capacity.
     fn expand_buckets(&mut self) -> DBResult<()> {
-        if self.allow_bucket_expansion {
+        if self.config.allow_bucket_expansion {
             while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
-                // arbitrarily add 10 buckets when we need more capacity.
-                //for _ in 0..10 {
                 self.split_one_bucket()?;
-                //}
                 self.capacity =
                     self.hdx_header.buckets() as u64 * self.hdx_header.bucket_elements() as u64;
             }
@@ -881,7 +883,7 @@ mod tests {
     #[test]
     fn test_one() {
         {
-            let db = TestDb::open(".", "xxx1").unwrap();
+            let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
             let key = Key([1_u8; 32]);
             db.insert(key, &"Value One".to_string()).unwrap();
             let key = Key([2_u8; 32]);
@@ -923,7 +925,7 @@ mod tests {
             assert!(iter.next().is_none());
             assert_eq!(db.len(), 5);
         }
-        let db = TestDb::open(".", "xxx1").unwrap();
+        let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
         let key = Key([6_u8; 32]);
         db.insert(key, &"Value One2".to_string()).unwrap();
         let key = Key([7_u8; 32]);
@@ -941,7 +943,7 @@ mod tests {
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value Three2");
         drop(db);
-        let db = TestDb::open(".", "xxx1").unwrap();
+        let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
         let key = Key([6_u8; 32]);
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value One2");
@@ -953,7 +955,7 @@ mod tests {
         assert_eq!(v, "Value Three2");
         drop(db);
 
-        let mut iter = TestDbRawIter::open(".", "xxx1").unwrap();
+        let mut iter: TestDbRawIter = DbRawIter::open(".", "xxx1").unwrap();
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
         let key = Key([2_u8; 32]);
@@ -971,7 +973,7 @@ mod tests {
         let key = Key([8_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
 
-        let db = TestDb::open(".", "xxx1").unwrap();
+        let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
         let mut iter = db.raw_iter().unwrap();
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
@@ -993,7 +995,7 @@ mod tests {
 
     #[test]
     fn test_50k() {
-        let db = Db::<u64, String, 8>::open(".", "xxx50k").unwrap();
+        let db: Db<u64, String, 8> = DbConfig::new(".", "xxx50k", 1).build().unwrap();
         assert!(!db.contains_key(&0).unwrap());
         assert!(!db.contains_key(&10).unwrap());
         assert!(!db.contains_key(&35_000).unwrap());
@@ -1032,7 +1034,7 @@ mod tests {
 
     #[test]
     fn test_x50k_str() {
-        let db = Db::<String, String, 0>::open(".", "xxx50k_str").unwrap();
+        let db: Db<String, String, 0> = DbConfig::new(".", "xxx50k_str", 1).build().unwrap();
         for i in 0..50_000 {
             db.insert(format!("key {i}"), &format!("Value {}", i))
                 .unwrap();
