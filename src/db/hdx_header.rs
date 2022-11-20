@@ -86,7 +86,7 @@ impl HdxHeader {
         Ok(header)
     }
 
-    /// Write this header to sync.
+    /// Write this header to sync at current seek position.
     pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> DBResult<()> {
         sync.write_all(self.as_ref())?;
         Ok(())

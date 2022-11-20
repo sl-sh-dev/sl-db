@@ -268,13 +268,11 @@ where
     ///   - key data
     ///   - value data
     pub fn insert(&mut self, key: K, value: &V) -> DBResult<()> {
-        // XXXSLS- checking keys is expensive.
         if !self.config.allow_duplicate_inserts && self.contains_key(&key)? {
             return Err(DBError::DuplicateInsert);
         }
         {
             let mut buffer = self.scratch_buffer.take();
-            //self.write_buffer.clear();
             let start_write_buffer_len = self.write_buffer.len();
             let record_pos = self.data_file_end + self.write_buffer.len() as u64;
             let hash = self.hash(&key);
@@ -283,16 +281,21 @@ where
             if K::is_variable_key_size() {
                 // We have to write the key size when variable.
                 self.write_buffer
-                    .write_all(&(buffer.len() as u16).to_ne_bytes())?;
+                    .write_all(&(buffer.len() as u16).to_ne_bytes())
+                    .expect("write_all to Vec is infallible");
             } else if K::KEY_SIZE as usize != buffer.len() {
                 return Err(DBError::InvalidKeyLength);
             }
             // Space for the value length.
             let val_size_pos = self.write_buffer.len();
-            self.write_buffer.write_all(&[0_u8; 4])?;
+            self.write_buffer
+                .write_all(&[0_u8; 4])
+                .expect("write_all to Vec is infallible");
 
             // Write the key to the buffer.
-            self.write_buffer.write_all(&buffer)?;
+            self.write_buffer
+                .write_all(&buffer)
+                .expect("write_all to Vec is infallible");
 
             value.serialize(&mut buffer);
 
@@ -300,7 +303,9 @@ where
             // the value into the saved position.
             self.write_buffer[val_size_pos..val_size_pos + 4]
                 .copy_from_slice(&(buffer.len() as u32).to_ne_bytes());
-            self.write_buffer.write_all(&buffer)?;
+            self.write_buffer
+                .write_all(&buffer)
+                .expect("write_all to Vec is infallible");
 
             // An early return on error could cause a new buffer to be created, should not be a big deal.
             self.scratch_buffer.set(buffer);
@@ -336,6 +341,7 @@ where
 
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
+    /// Note this is a very expensive call (syncing to disk is not cheap).
     pub fn commit(&mut self) -> DBResult<()> {
         self.flush()?;
         self.data_file.sync_all()?;
@@ -352,17 +358,19 @@ where
             self.write_buffer.clear();
         }
         self.expand_buckets()?;
-        // Do this so we can call save_to_bucket while iterating the index_cache.
-        // This should be safe since save_to_bucket does not touch the index_cache.
-        // Maybe put index_cache in a Cell to avoid this unsafe?
-        let unsafe_db: &mut DbInner<K, V, KSIZE, S> =
-            unsafe { (self as *mut DbInner<K, V, KSIZE, S>).as_mut().unwrap() };
-        for (key, (hash, pos, size)) in &self.index_cache {
-            unsafe_db.save_to_bucket(key, *hash, (*pos, *size))?;
+        {
+            // Do this so we can call save_to_bucket while iterating the index_cache.
+            // This should be safe since save_to_bucket does not touch the index_cache.
+            // Maybe put index_cache in a Cell to avoid this unsafe?
+            let unsafe_db: &mut DbInner<K, V, KSIZE, S> =
+                unsafe { (self as *mut DbInner<K, V, KSIZE, S>).as_mut().unwrap() };
+            for (key, (hash, pos, size)) in &self.index_cache {
+                unsafe_db.save_to_bucket(key, *hash, (*pos, *size))?;
+            }
         }
         self.index_cache.clear();
         self.hdx_file.seek(SeekFrom::Start(0))?;
-        self.hdx_file.write_all(self.hdx_header.as_ref())?;
+        self.hdx_header.write_header(&mut self.hdx_file)?;
         Ok(())
     }
 
@@ -434,7 +442,7 @@ where
         }
     }
 
-    /// Add one new bucket hash index.
+    /// Add one new bucket to the hash index.
     fn split_one_bucket(&mut self) -> DBResult<()> {
         let old_modulus = self.modulus;
         let split_bucket = (self.hdx_header.buckets() - (old_modulus / 2)) as usize;
@@ -570,14 +578,20 @@ where
         #[allow(clippy::if_same_then_else)]
         if K::is_variable_key_size() {
             // Write a 0 key size to indicate this is an overflow bucket not a data record.
-            self.write_buffer.write_all(&0_u16.to_ne_bytes())?;
+            self.write_buffer
+                .write_all(&0_u16.to_ne_bytes())
+                .expect("write_all to Vec is infallible");
         } else {
             // Write a 0 value size to indicate this is an overflow bucket not a data record.
-            self.write_buffer.write_all(&0_u32.to_ne_bytes())?;
+            self.write_buffer
+                .write_all(&0_u32.to_ne_bytes())
+                .expect("write_all to Vec is infallible");
         }
         let overflow_pos = self.data_file_end + self.write_buffer.len() as u64;
         // Write the old buffer into the data file as an overflow record.
-        self.write_buffer.write_all(buffer)?;
+        self.write_buffer
+            .write_all(buffer)
+            .expect("write_all to Vec is infallible");
         // clear buffer and reset to 0.
         buffer.fill(0);
         // Copy the position of the overflow record into the first u64.
@@ -683,12 +697,16 @@ where
 
     /// Loads self.bucket_elements_cache with all the bucket elements for bucket.
     /// Using bucket_iter directly causes lots of borrowing issues since it needs a mutable lifetime.
+    /// Note this does not interact with the index cache, only the on-disk buckets.
     fn load_bucket_elements_cache(&mut self, bucket: usize) -> DBResult<()> {
         self.bucket_elements_cache.clear();
         // Break the db lifetime away so we can get the bucket iter and use it to extend the
-        // bucket_element_cache.  These two pieces do not interact and this saves unneeded collects.
-        let unsafe_db: &mut DbInner<K, V, KSIZE, S> =
-            unsafe { (self as *mut DbInner<K, V, KSIZE, S>).as_mut().unwrap() };
+        // bucket_element_cache.  These two parts do not interact and this saves unneeded collects.
+        let unsafe_db: &mut DbInner<K, V, KSIZE, S> = unsafe {
+            (self as *mut DbInner<K, V, KSIZE, S>)
+                .as_mut()
+                .expect("this can't be null")
+        };
         self.bucket_elements_cache
             .extend(unsafe_db.bucket_iter(bucket)?);
         Ok(())
@@ -696,6 +714,7 @@ where
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
+    /// This iterator will not see any data in the write cache.
     pub fn raw_iter(&self) -> DBResult<DbRawIter<K, V, KSIZE, S>> {
         let dat_file = { self.data_file.try_clone()? };
         DbRawIter::new(dat_file)
@@ -708,6 +727,10 @@ where
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
+    /// Read for the DbInner.  This allows other code to not worry about whether data is read from
+    /// the file or the write buffer.  The file and write buffer will not have overlapping records
+    /// so this will not read across them in one call.  This will not happen on a proper DB although
+    /// the Read contract should handle this fine.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.seek_pos >= self.data_file_end {
             let write_pos = (self.seek_pos - self.data_file_end) as usize;
@@ -723,9 +746,7 @@ where
                 Ok(0)
             }
         } else {
-            // Move the read cursor to position.  Note the data file is opened in append mode so write
-            // cursor is always EOF.
-            self.data_file.seek(SeekFrom::Start(self.seek_pos))?;
+            // Assume file is at the correct position.
             let size = self.data_file.read(buf)?;
             self.seek_pos += size as u64;
             Ok(size)
@@ -739,6 +760,7 @@ where
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
+    /// Seek on the DbInner treating the file and write cache as one byte array.
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
             SeekFrom::Start(pos) => self.seek_pos = pos,
@@ -758,6 +780,9 @@ where
                     self.seek_pos = 0;
                 }
             }
+        }
+        if self.seek_pos < self.data_file_end {
+            self.data_file.seek(SeekFrom::Start(self.seek_pos))?;
         }
         Ok(self.seek_pos)
     }
