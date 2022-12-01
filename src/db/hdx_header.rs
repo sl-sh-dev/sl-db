@@ -3,7 +3,8 @@
 use crate::db::byte_trans::ByteTrans;
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
 use crate::db_config::DbConfig;
-use crate::error::{DBError, DBResult};
+use crate::error::LoadHeaderError;
+use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Debug, Copy, Clone)]
@@ -71,9 +72,9 @@ impl HdxHeader {
         }
     }
 
-    /// Load a HdxHeader from a file.  This will seek to the beginning and leave she file
+    /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    pub fn load_header<R: Read + Seek>(source: &mut R) -> DBResult<Self> {
+    pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
         let mut header = HdxHeader::default();
         source.seek(SeekFrom::Start(0))?;
         unsafe {
@@ -81,13 +82,13 @@ impl HdxHeader {
         }
 
         if &header.type_id != b"sldb.hdx" {
-            return Err(DBError::InvalidIndexHeader);
+            return Err(LoadHeaderError::InvalidType);
         }
         Ok(header)
     }
 
     /// Write this header to sync at current seek position.
-    pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> DBResult<()> {
+    pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
         sync.write_all(self.as_ref())?;
         Ok(())
     }

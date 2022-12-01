@@ -2,7 +2,8 @@
 
 use crate::db::byte_trans::ByteTrans;
 use crate::db_config::DbConfig;
-use crate::error::{DBError, DBResult};
+use crate::error::LoadHeaderError;
+use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 // Each bucket element is a (u64, u64, u32)- (hash, record_pos, record_size).
@@ -57,7 +58,7 @@ impl DataHeader {
     }
 
     /// Load a DataHeader from source.
-    pub fn load_header<R: Read + Seek>(source: &mut R) -> DBResult<Self> {
+    pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
         let source = source;
         let mut header = Self::default();
         source.seek(SeekFrom::Start(0))?;
@@ -66,13 +67,13 @@ impl DataHeader {
         }
 
         if &header.type_id != b"sldb.dat" {
-            return Err(DBError::InvalidDataHeader);
+            return Err(LoadHeaderError::InvalidType);
         }
         Ok(header)
     }
 
     /// Write this header to sync at current seek position.
-    pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> DBResult<()> {
+    pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
         sync.write_all(self.as_ref())?;
         Ok(())
     }

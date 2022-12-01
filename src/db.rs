@@ -5,13 +5,19 @@ use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
 use crate::db::hdx_header::HdxHeader;
 use crate::db_config::DbConfig;
 use crate::db_raw_iter::DbRawIter;
-use crate::error::DBError;
-use crate::error::DBResult;
+use crate::error::flush::FlushError;
+use crate::error::insert::InsertError;
+use crate::error::serialize::SerializeError;
+use crate::error::ReadKeyError;
+use crate::error::{
+    deserialize::DeserializeError, CommitError, FetchError, LoadHeaderError, OpenError,
+};
 use crate::fxhasher::{FxHashMap, FxHasher};
 use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -50,10 +56,10 @@ pub trait DbBytes<T> {
     /// Implementations can make no assumptions about the state of the buffer passed in.
     /// Resizing the buffer is expected (why it is a Vec not a slice) and may already have sufficient
     /// capacity.
-    fn serialize(&self, buffer: &mut Vec<u8>);
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError>;
 
     /// Deserialize a byte slice back into the type or error out.
-    fn deserialize(buffer: &[u8]) -> DBResult<T>;
+    fn deserialize(buffer: &[u8]) -> Result<T, DeserializeError>;
 }
 
 /// An instance of a DB.
@@ -74,7 +80,7 @@ where
     S: BuildHasher + Default,
 {
     /// Open a new or reopen an existing database.
-    pub fn open(config: DbConfig) -> DBResult<Self> {
+    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         let inner = DbInner::open(config)?;
         Ok(Self {
             inner: RefCell::new(inner),
@@ -82,12 +88,12 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&self, key: &K) -> DBResult<V> {
+    pub fn fetch(&self, key: &K) -> Result<V, FetchError> {
         self.inner.borrow_mut().fetch(key)
     }
 
     /// True if the database contains key.
-    pub fn contains_key(&self, key: &K) -> DBResult<bool> {
+    pub fn contains_key(&self, key: &K) -> Result<bool, ReadKeyError> {
         self.inner.borrow_mut().contains_key(key)
     }
 
@@ -97,7 +103,7 @@ where
     ///   - value size (u32)
     ///   - key data
     ///   - value data
-    pub fn insert(&self, key: K, value: &V) -> DBResult<()> {
+    pub fn insert(&self, key: K, value: &V) -> Result<(), InsertError> {
         self.inner.borrow_mut().insert(key, value)
     }
 
@@ -113,19 +119,19 @@ where
 
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
-    pub fn commit(&self) -> DBResult<()> {
+    pub fn commit(&self) -> Result<(), CommitError> {
         self.inner.borrow_mut().commit()
     }
 
     /// Flush any in memory caches to file.
     /// Note this is only a flush not a commit, it does not do a sync on the files.
-    pub fn flush(&self) -> DBResult<()> {
+    pub fn flush(&self) -> Result<(), FlushError> {
         self.inner.borrow_mut().flush()
     }
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
-    pub fn raw_iter(&self) -> DBResult<DbRawIter<K, V, KSIZE, S>> {
+    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
         self.inner.borrow().raw_iter()
     }
 }
@@ -177,13 +183,17 @@ where
     S: BuildHasher + Default,
 {
     /// Open a new or reopen an existing database.
-    pub fn open(config: DbConfig) -> DBResult<Self> {
+    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         let data_name = config.dir.join(&config.base_name).with_extension("dat");
         let hdx_name = config.dir.join(&config.base_name).with_extension("hdx");
-        let (mut data_file, header) = Self::open_data_file(&data_name, &config)?;
-        data_file.seek(SeekFrom::End(0))?;
-        let data_file_end = data_file.seek(SeekFrom::Current(0))?;
-        let (hdx_file, hdx_header) = Self::open_hdx_file(&hdx_name, &header, &config)?;
+        let (mut data_file, header) =
+            Self::open_data_file(&data_name, &config).map_err(OpenError::DataFileOpen)?;
+        data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
+        let data_file_end = data_file
+            .seek(SeekFrom::Current(0))
+            .map_err(OpenError::Seek)?;
+        let (hdx_file, hdx_header) =
+            Self::open_hdx_file(&hdx_name, &header, &config).map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
         // Make a 16mb write buffer.
@@ -212,7 +222,7 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&mut self, key: &K) -> DBResult<V> {
+    pub fn fetch(&mut self, key: &K) -> Result<V, FetchError> {
         if let Some((_hash, rec_pos, rec_size)) = self.index_cache.get(key) {
             // Try the index cache.
             let (_, val) = self.read_record(*rec_pos, *rec_size as usize)?;
@@ -233,11 +243,11 @@ where
                 }
             }
         }
-        Err(DBError::NotFound)
+        Err(FetchError::NotFound)
     }
 
     /// True if the database contains key.
-    pub fn contains_key(&mut self, key: &K) -> DBResult<bool> {
+    pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
         if self.index_cache.contains_key(key) {
             // Try the index cache.
             return Ok(true);
@@ -267,16 +277,17 @@ where
     ///   - value size (u32)
     ///   - key data
     ///   - value data
-    pub fn insert(&mut self, key: K, value: &V) -> DBResult<()> {
+    pub fn insert(&mut self, key: K, value: &V) -> Result<(), InsertError> {
         if !self.config.allow_duplicate_inserts && self.contains_key(&key)? {
-            return Err(DBError::DuplicateInsert);
+            return Err(InsertError::DuplicateKey);
         }
         {
             let mut buffer = self.scratch_buffer.take();
             let start_write_buffer_len = self.write_buffer.len();
             let record_pos = self.data_file_end + self.write_buffer.len() as u64;
             let hash = self.hash(&key);
-            key.serialize(&mut buffer);
+            key.serialize(&mut buffer)
+                .map_err(InsertError::SerializeKey)?;
             // If we have a variable sized key write it's size otherwise no need.
             if K::is_variable_key_size() {
                 // We have to write the key size when variable.
@@ -284,7 +295,7 @@ where
                     .write_all(&(buffer.len() as u16).to_ne_bytes())
                     .expect("write_all to Vec is infallible");
             } else if K::KEY_SIZE as usize != buffer.len() {
-                return Err(DBError::InvalidKeyLength);
+                return Err(InsertError::InvalidKeyLength);
             }
             // Space for the value length.
             let val_size_pos = self.write_buffer.len();
@@ -297,7 +308,9 @@ where
                 .write_all(&buffer)
                 .expect("write_all to Vec is infallible");
 
-            value.serialize(&mut buffer);
+            value
+                .serialize(&mut buffer)
+                .map_err(InsertError::SerializeValue)?;
 
             // Save current pos, then jump back to the value size and write that then finally write
             // the value into the saved position.
@@ -342,22 +355,28 @@ where
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
-    pub fn commit(&mut self) -> DBResult<()> {
-        self.flush()?;
-        self.data_file.sync_all()?;
-        self.hdx_file.sync_all()?;
+    pub fn commit(&mut self) -> Result<(), CommitError> {
+        self.flush().map_err(CommitError::Flush)?;
+        self.data_file
+            .sync_all()
+            .map_err(CommitError::DataFileSync)?;
+        self.hdx_file
+            .sync_all()
+            .map_err(CommitError::IndexFileSync)?;
         Ok(())
     }
 
     /// Flush any in memory caches to file.
     /// Note this is only a flush not a commit, it does not do a sync on the files.
-    pub fn flush(&mut self) -> DBResult<()> {
+    pub fn flush(&mut self) -> Result<(), FlushError> {
         {
-            self.data_file.write_all(&self.write_buffer)?;
+            self.data_file
+                .write_all(&self.write_buffer)
+                .map_err(FlushError::WriteData)?;
             self.data_file_end += self.write_buffer.len() as u64;
             self.write_buffer.clear();
         }
-        self.expand_buckets()?;
+        self.expand_buckets().map_err(FlushError::ExpandBuckets)?;
         {
             // Do this so we can call save_to_bucket while iterating the index_cache.
             // This should be safe since save_to_bucket does not touch the index_cache.
@@ -365,16 +384,25 @@ where
             let unsafe_db: &mut DbInner<K, V, KSIZE, S> =
                 unsafe { (self as *mut DbInner<K, V, KSIZE, S>).as_mut().unwrap() };
             for (key, (hash, pos, size)) in &self.index_cache {
-                unsafe_db.save_to_bucket(key, *hash, (*pos, *size))?;
+                unsafe_db
+                    .save_to_bucket(key, *hash, (*pos, *size))
+                    .map_err(FlushError::SaveToBucket)?;
             }
         }
         self.index_cache.clear();
-        self.hdx_file.seek(SeekFrom::Start(0))?;
-        self.hdx_header.write_header(&mut self.hdx_file)?;
+        self.hdx_file
+            .seek(SeekFrom::Start(0))
+            .map_err(FlushError::IndexHeader)?;
+        self.hdx_header
+            .write_header(&mut self.hdx_file)
+            .map_err(FlushError::IndexHeader)?;
         Ok(())
     }
 
-    fn open_data_file(data_name: &Path, config: &DbConfig) -> DBResult<(File, DataHeader)> {
+    fn open_data_file(
+        data_name: &Path,
+        config: &DbConfig,
+    ) -> Result<(File, DataHeader), LoadHeaderError> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(!config.read_only)
@@ -388,10 +416,8 @@ where
             let header = DataHeader::new(config);
             header.write_header(&mut file)?;
             header
-        } else if file_end >= DataHeader::SIZE as u64 {
-            DataHeader::load_header(&mut file)?
         } else {
-            return Err(DBError::InvalidDataFile);
+            DataHeader::load_header(&mut file)?
         };
         Ok((file, header))
     }
@@ -400,7 +426,7 @@ where
         data_name: &Path,
         data_header: &DataHeader,
         config: &DbConfig,
-    ) -> DBResult<(File, HdxHeader)> {
+    ) -> Result<(File, HdxHeader), LoadHeaderError> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(!config.read_only)
@@ -416,10 +442,8 @@ where
             buffer.resize(header.buckets() as usize * header.bucket_size() as usize, 0);
             file.write_all(&buffer)?;
             header
-        } else if file_end >= HdxHeader::SIZE as u64 {
-            HdxHeader::load_header(&mut file)?
         } else {
-            return Err(DBError::InvalidIndexFile);
+            HdxHeader::load_header(&mut file)?
         };
         Ok((file, header))
     }
@@ -443,7 +467,7 @@ where
     }
 
     /// Add one new bucket to the hash index.
-    fn split_one_bucket(&mut self) -> DBResult<()> {
+    fn split_one_bucket(&mut self) -> Result<(), ReadKeyError> {
         let old_modulus = self.modulus;
         let split_bucket = (self.hdx_header.buckets() - (old_modulus / 2)) as usize;
         self.hdx_header.inc_buckets();
@@ -492,7 +516,7 @@ where
     }
 
     /// Add buckets to expand capacity.
-    fn expand_buckets(&mut self) -> DBResult<()> {
+    fn expand_buckets(&mut self) -> Result<(), ReadKeyError> {
         if self.config.allow_bucket_expansion {
             while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
                 self.split_one_bucket()?;
@@ -504,7 +528,12 @@ where
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket(&mut self, key: &K, hash: u64, pos_size: (u64, u32)) -> DBResult<()> {
+    fn save_to_bucket(
+        &mut self,
+        key: &K,
+        hash: u64,
+        pos_size: (u64, u32),
+    ) -> Result<(), ReadKeyError> {
         let bucket = self.get_bucket(hash);
         let mut buffer = self.scratch_buffer.take();
         let bucket_pos: u64 =
@@ -531,7 +560,7 @@ where
         hash: u64,
         pos_size: (u64, u32),
         buffer: &mut [u8],
-    ) -> DBResult<()> {
+    ) -> Result<(), ReadKeyError> {
         let (record_pos, record_size) = pos_size;
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.hdx_header.bucket_elements() as u64 {
@@ -612,7 +641,7 @@ where
         position: u64,
         size: usize,
         buffer: &mut Vec<u8>,
-    ) -> DBResult<(K, V)> {
+    ) -> Result<(K, V), FetchError> {
         buffer.resize(size, 0);
         // Move the rea cursor to position.  Note the data file is opened in append mode so write
         // cursor is always EOF.
@@ -626,7 +655,7 @@ where
             let key_size = u16::from_ne_bytes(key_size);
             if key_size == 0 {
                 // Overflow bucket, can not read as data so error.
-                return Err(DBError::UnexpectedOverflowBucket);
+                return Err(FetchError::UnexpectedOverflowBucket);
             }
             key_size
         } else {
@@ -639,11 +668,13 @@ where
         let val_size = u32::from_ne_bytes(val_size_buf) as usize;
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
-            return Err(DBError::UnexpectedOverflowBucket);
+            return Err(FetchError::UnexpectedOverflowBucket);
         }
-        let key = K::deserialize(&buffer[pos..pos + key_size])?;
+        let key =
+            K::deserialize(&buffer[pos..pos + key_size]).map_err(FetchError::DeserializeKey)?;
         pos += key_size;
-        let val = V::deserialize(&buffer[pos..pos + val_size])?;
+        let val =
+            V::deserialize(&buffer[pos..pos + val_size]).map_err(FetchError::DeserializeValue)?;
         // An early return on error could cause a new buffer to be created, should not be a big deal.
         Ok((key, val))
     }
@@ -652,7 +683,7 @@ where
     /// Returns the (key, value) tuple.
     /// Will produce an error for IO or if the record at position is actually an overflow bucket not
     /// a data record.
-    fn read_record(&mut self, position: u64, size: usize) -> DBResult<(K, V)> {
+    fn read_record(&mut self, position: u64, size: usize) -> Result<(K, V), FetchError> {
         let mut buffer = self.scratch_buffer.take();
         let result = self.read_record_raw(position, size, &mut buffer);
         self.scratch_buffer.set(buffer);
@@ -662,7 +693,7 @@ where
     /// Read the key for the record at position.
     /// The position needs to be valid, attempting to read an overflow bucket or other invalid area will
     /// produce an error or invalid key.
-    fn read_key(&mut self, position: u64) -> DBResult<K> {
+    fn read_key(&mut self, position: u64) -> Result<K, ReadKeyError> {
         let mut buffer = self.scratch_buffer.take();
 
         self.seek(SeekFrom::Start(position))?;
@@ -683,7 +714,10 @@ where
         Ok(key)
     }
 
-    fn bucket_iter(&mut self, bucket: usize) -> DBResult<BucketIter<DbInner<K, V, KSIZE, S>>> {
+    fn bucket_iter(
+        &mut self,
+        bucket: usize,
+    ) -> Result<BucketIter<DbInner<K, V, KSIZE, S>>, io::Error> {
         let mut buffer = Vec::with_capacity(self.hdx_header.bucket_size() as usize);
         {
             let bucket_size = self.hdx_header.bucket_size() as usize;
@@ -692,13 +726,17 @@ where
             buffer.resize(bucket_size, 0);
             self.hdx_file.read_exact(&mut buffer)?;
         }
-        BucketIter::new(self, buffer, self.hdx_header.bucket_elements())
+        Ok(BucketIter::new(
+            self,
+            buffer,
+            self.hdx_header.bucket_elements(),
+        ))
     }
 
     /// Loads self.bucket_elements_cache with all the bucket elements for bucket.
     /// Using bucket_iter directly causes lots of borrowing issues since it needs a mutable lifetime.
     /// Note this does not interact with the index cache, only the on-disk buckets.
-    fn load_bucket_elements_cache(&mut self, bucket: usize) -> DBResult<()> {
+    fn load_bucket_elements_cache(&mut self, bucket: usize) -> Result<(), io::Error> {
         self.bucket_elements_cache.clear();
         // Break the db lifetime away so we can get the bucket iter and use it to extend the
         // bucket_element_cache.  These two parts do not interact and this saves unneeded collects.
@@ -715,9 +753,9 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    pub fn raw_iter(&self) -> DBResult<DbRawIter<K, V, KSIZE, S>> {
+    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
         let dat_file = { self.data_file.try_clone()? };
-        DbRawIter::new(dat_file)
+        DbRawIter::with_file(dat_file)
     }
 }
 
@@ -798,17 +836,17 @@ struct BucketIter<'src, R: Read + Seek> {
 }
 
 impl<'src, R: Read + Seek> BucketIter<'src, R> {
-    fn new(dat_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> DBResult<Self> {
+    fn new(dat_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> Self {
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
         let overflow_pos = u64::from_ne_bytes(buf);
-        Ok(Self {
+        Self {
             dat_file,
             buffer,
             bucket_pos: 0,
             overflow_pos,
             elements,
-        })
+        }
     }
 }
 
@@ -856,6 +894,8 @@ impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::source::SourceError;
+    use std::io::ErrorKind;
     use std::time;
 
     #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
@@ -863,12 +903,13 @@ mod tests {
 
     impl DbKey<32> for Key {}
     impl DbBytes<Key> for Key {
-        fn serialize(&self, buffer: &mut Vec<u8>) {
+        fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
             buffer.resize(32, 0);
             buffer.copy_from_slice(&self.0);
+            Ok(())
         }
 
-        fn deserialize(buffer: &[u8]) -> DBResult<Key> {
+        fn deserialize(buffer: &[u8]) -> Result<Key, DeserializeError> {
             let mut key = [0_u8; 32];
             key.copy_from_slice(buffer);
             Ok(Key(key))
@@ -877,25 +918,27 @@ mod tests {
 
     impl DbKey<0> for String {}
     impl DbBytes<String> for String {
-        fn serialize(&self, buffer: &mut Vec<u8>) {
+        fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
             let bytes = self.as_bytes();
             buffer.resize(bytes.len(), 0);
             buffer.copy_from_slice(bytes);
+            Ok(())
         }
 
-        fn deserialize(buffer: &[u8]) -> DBResult<String> {
+        fn deserialize(buffer: &[u8]) -> Result<String, DeserializeError> {
             Ok(String::from_utf8_lossy(buffer).to_string())
         }
     }
 
     impl DbKey<8> for u64 {}
     impl DbBytes<u64> for u64 {
-        fn serialize(&self, buffer: &mut Vec<u8>) {
+        fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
             buffer.resize(8, 0);
             buffer.copy_from_slice(&self.to_ne_bytes());
+            Ok(())
         }
 
-        fn deserialize(buffer: &[u8]) -> DBResult<u64> {
+        fn deserialize(buffer: &[u8]) -> Result<u64, DeserializeError> {
             let mut buf = [0_u8; 8];
             buf.copy_from_slice(buffer);
             Ok(Self::from_ne_bytes(buf))
@@ -1020,6 +1063,13 @@ mod tests {
 
     #[test]
     fn test_50k() {
+        let e: Box<dyn std::error::Error> =
+            std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
+        let e: SourceError = e.into();
+        assert!(e.is::<std::io::Error>());
+        if let Some(e) = e.downcast_ref::<std::io::Error>() {
+            println!("XXXX {:?}", e);
+        }
         let db: Db<u64, String, 8> = DbConfig::new(".", "xxx50k", 1).build().unwrap();
         assert!(!db.contains_key(&0).unwrap());
         assert!(!db.contains_key(&10).unwrap());
