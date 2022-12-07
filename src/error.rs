@@ -8,9 +8,74 @@ pub mod source;
 
 use crate::error::deserialize::DeserializeError;
 use crate::error::flush::FlushError;
+use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt;
 use std::io;
+
+/// Build an ErrorInfo.  Needs to be a macro to capture the file and line/column information.
+#[macro_export]
+macro_rules! err_info {
+    () => {{
+        $crate::error::ErrorInfo::new(
+            file!(),
+            line!(),
+            column!(),
+            std::backtrace::Backtrace::capture(),
+        )
+    }};
+}
+
+/// Container for common error information.
+#[derive(Debug)]
+pub struct ErrorInfo {
+    file: &'static str,
+    line: u32,
+    column: u32,
+    backtrace: Backtrace,
+}
+
+impl ErrorInfo {
+    /// Construct a new ErrorInfo.
+    pub fn new(file: &'static str, line: u32, column: u32, backtrace: Backtrace) -> Self {
+        Self {
+            file,
+            line,
+            column,
+            backtrace,
+        }
+    }
+
+    /// Return the file name in which this error was generated.
+    pub fn file(&self) -> &str {
+        self.file
+    }
+
+    /// Line in file where the error was generated.
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// Column in file where the error was gererated.
+    pub fn column(&self) -> u32 {
+        self.column
+    }
+
+    /// If available (env variables set) contain the backtrace for the error.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for ErrorInfo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "[{}: line: {}, col: {}]",
+            self.file, self.line, self.column
+        )
+    }
+}
 
 /// Error from read_key().
 #[derive(Debug)]

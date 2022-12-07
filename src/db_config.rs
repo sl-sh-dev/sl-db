@@ -14,7 +14,9 @@ pub struct DbConfig {
     pub(crate) initial_buckets: u32,
     pub(crate) bucket_elements: u16,
     pub(crate) load_factor: f32,
-    pub(crate) read_only: bool,
+    pub(crate) write: bool,
+    pub(crate) create: bool,
+    pub(crate) truncate: bool,
     pub(crate) allow_bucket_expansion: bool, // don't allow more buckets- for testing lots of overflows...
     pub(crate) allow_duplicate_inserts: bool,
     pub(crate) cache_writes: bool,
@@ -30,7 +32,9 @@ impl DbConfig {
             initial_buckets: 1,
             bucket_elements: 255,
             load_factor: 0.5,
-            read_only: false,
+            write: true,
+            create: false,
+            truncate: false,
             allow_bucket_expansion: true,
             allow_duplicate_inserts: false,
             cache_writes: true,
@@ -46,6 +50,26 @@ impl DbConfig {
     /// Set the base name for the DB files in dir.
     pub fn set_base_name<P: Into<PathBuf>>(mut self, base_name: P) -> Self {
         self.base_name = base_name.into();
+        self
+    }
+
+    /// Open the database as read-only.
+    pub fn read_only(mut self) -> Self {
+        self.write = false;
+        self
+    }
+
+    /// If the database does not exist then create it, otherwise open existing.
+    /// File must be writable in order to create it if missing (option ignored if read-only).
+    pub fn create(mut self) -> Self {
+        self.create = true;
+        self
+    }
+
+    /// If the database exists then truncate it on open, requires write mode (option ignored if read-only).
+    /// This will rebuild the database with new parameters instead of using the old parameters.
+    pub fn truncate(mut self) -> Self {
+        self.truncate = true;
         self
     }
 

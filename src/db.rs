@@ -403,11 +403,18 @@ where
         data_name: &Path,
         config: &DbConfig,
     ) -> Result<(File, DataHeader), LoadHeaderError> {
+        if config.truncate && config.write {
+            // truncate is incompatible with append so truncate then open for append.
+            OpenOptions::new()
+                .write(true)
+                .create(config.create)
+                .truncate(true)
+                .open(data_name)?;
+        }
         let mut file = OpenOptions::new()
             .read(true)
-            .write(!config.read_only)
-            .append(true)
-            .create(true)
+            .append(config.write)
+            .create(config.create && config.write)
             .open(data_name)?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
@@ -429,8 +436,9 @@ where
     ) -> Result<(File, HdxHeader), LoadHeaderError> {
         let mut file = OpenOptions::new()
             .read(true)
-            .write(!config.read_only)
-            .create(true)
+            .write(config.write)
+            .create(config.create && config.write)
+            .truncate(config.truncate && config.write)
             .open(data_name)?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
@@ -894,6 +902,7 @@ impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::err_info;
     use crate::error::source::SourceError;
     use std::io::ErrorKind;
     use std::time;
@@ -951,7 +960,11 @@ mod tests {
     #[test]
     fn test_one() {
         {
-            let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
+            let db: TestDb = DbConfig::new(".", "xxx1", 2)
+                .create()
+                .truncate()
+                .build()
+                .unwrap();
             let key = Key([1_u8; 32]);
             db.insert(key, &"Value One".to_string()).unwrap();
             let key = Key([2_u8; 32]);
@@ -1070,7 +1083,12 @@ mod tests {
         if let Some(e) = e.downcast_ref::<std::io::Error>() {
             println!("XXXX {:?}", e);
         }
-        let db: Db<u64, String, 8> = DbConfig::new(".", "xxx50k", 1).build().unwrap();
+        println!("{}", err_info!());
+        let db: Db<u64, String, 8> = DbConfig::new(".", "xxx50k", 1)
+            .create()
+            .truncate()
+            .build()
+            .unwrap();
         assert!(!db.contains_key(&0).unwrap());
         assert!(!db.contains_key(&10).unwrap());
         assert!(!db.contains_key(&35_000).unwrap());
@@ -1109,7 +1127,11 @@ mod tests {
 
     #[test]
     fn test_x50k_str() {
-        let db: Db<String, String, 0> = DbConfig::new(".", "xxx50k_str", 1).build().unwrap();
+        let db: Db<String, String, 0> = DbConfig::new(".", "xxx50k_str", 1)
+            .create()
+            .truncate()
+            .build()
+            .unwrap();
         for i in 0..50_000 {
             db.insert(format!("key {i}"), &format!("Value {}", i))
                 .unwrap();
