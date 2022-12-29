@@ -118,6 +118,8 @@ pub enum CommitError {
     DataFileSync(io::Error),
     /// An io error occured syncing the index file.
     IndexFileSync(io::Error),
+    /// DB is opened read-only.
+    ReadOnly,
 }
 
 impl Error for CommitError {}
@@ -128,6 +130,7 @@ impl fmt::Display for CommitError {
             Self::Flush(e) => write!(f, "flush: {}", e),
             Self::DataFileSync(io_err) => write!(f, "data sync: {}", io_err),
             Self::IndexFileSync(io_err) => write!(f, "index sync: {}", io_err),
+            Self::ReadOnly => write!(f, "read only"),
         }
     }
 }

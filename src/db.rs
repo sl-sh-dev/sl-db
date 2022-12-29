@@ -13,7 +13,7 @@ use crate::error::{
     deserialize::DeserializeError, CommitError, FetchError, LoadHeaderError, OpenError,
 };
 use crate::fxhasher::{FxHashMap, FxHasher};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
@@ -21,8 +21,6 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
-use std::rc::Rc;
-use std::sync::Arc;
 
 pub mod byte_trans;
 pub mod data_header;
@@ -66,157 +64,7 @@ pub trait DbBytes<T> {
 
 /// An instance of a DB.
 /// Will consist of a data file and hash index with optional log for commit recovery.
-#[derive(Clone)]
-pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    inner: Rc<RefCell<DbInner<K, V, KSIZE, S>>>,
-}
-
-impl<K, V, const KSIZE: u16, S> Db<K, V, KSIZE, S>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    /// Open a new or reopen an existing database.
-    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        let inner = DbInner::open(config)?;
-        Ok(Self {
-            inner: Rc::new(RefCell::new(inner)),
-        })
-    }
-
-    /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&self, key: &K) -> Result<V, FetchError> {
-        self.inner.borrow_mut().fetch(key)
-    }
-
-    /// True if the database contains key.
-    pub fn contains_key(&self, key: &K) -> Result<bool, ReadKeyError> {
-        self.inner.borrow_mut().contains_key(key)
-    }
-
-    /// Insert a new key/value pair in Db.
-    /// For the data file this means inserting:
-    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
-    ///   - value size (u32)
-    ///   - key data
-    ///   - value data
-    pub fn insert(&self, key: K, value: &V) -> Result<(), InsertError> {
-        self.inner.borrow_mut().insert(key, value)
-    }
-
-    /// Return the number of records in Db.
-    pub fn len(&self) -> usize {
-        self.inner.borrow().len()
-    }
-
-    /// Is the DB empty?
-    pub fn is_empty(&self) -> bool {
-        self.inner.borrow().is_empty()
-    }
-
-    /// Flush any caches to disk and sync the data and index file.
-    /// All data should be safely on disk if this call succeeds.
-    pub fn commit(&self) -> Result<(), CommitError> {
-        self.inner.borrow_mut().commit()
-    }
-
-    /// Flush any in memory caches to file.
-    /// Note this is only a flush not a commit, it does not do a sync on the files.
-    pub fn flush(&self) -> Result<(), FlushError> {
-        self.inner.borrow_mut().flush()
-    }
-
-    /// Return an iterator over the key values in insertion order.
-    /// Note this iterator only uses the data file not the indexes.
-    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
-        self.inner.borrow().raw_iter()
-    }
-}
-
-/// An instance of a DB.
-/// Will consist of a data file and hash index with optional log for commit recovery.
-#[derive(Clone)]
-pub struct DbMt<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    inner: Arc<std::sync::Mutex<DbInner<K, V, KSIZE, S>>>,
-}
-
-impl<K, V, const KSIZE: u16, S> DbMt<K, V, KSIZE, S>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    /// Open a new or reopen an existing database.
-    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        let inner = DbInner::open(config)?;
-        Ok(Self {
-            inner: Arc::new(std::sync::Mutex::new(inner)),
-        })
-    }
-
-    /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&self, key: &K) -> Result<V, FetchError> {
-        self.inner.lock().unwrap().fetch(key)
-    }
-
-    /// True if the database contains key.
-    pub fn contains_key(&self, key: &K) -> Result<bool, ReadKeyError> {
-        self.inner.lock().unwrap().contains_key(key)
-    }
-
-    /// Insert a new key/value pair in Db.
-    /// For the data file this means inserting:
-    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
-    ///   - value size (u32)
-    ///   - key data
-    ///   - value data
-    pub fn insert(&self, key: K, value: &V) -> Result<(), InsertError> {
-        self.inner.lock().unwrap().insert(key, value)
-    }
-
-    /// Return the number of records in Db.
-    pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
-    }
-
-    /// Is the DB empty?
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
-    }
-
-    /// Flush any caches to disk and sync the data and index file.
-    /// All data should be safely on disk if this call succeeds.
-    pub fn commit(&self) -> Result<(), CommitError> {
-        self.inner.lock().unwrap().commit()
-    }
-
-    /// Flush any in memory caches to file.
-    /// Note this is only a flush not a commit, it does not do a sync on the files.
-    pub fn flush(&self) -> Result<(), FlushError> {
-        self.inner.lock().unwrap().flush()
-    }
-
-    /// Return an iterator over the key values in insertion order.
-    /// Note this iterator only uses the data file not the indexes.
-    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
-        self.inner.lock().unwrap().raw_iter()
-    }
-}
-
-/// An instance of a DB.
-/// Will consist of a data file and hash index with optional log for commit recovery.
-pub struct DbInner<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+pub struct DbCore<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -243,18 +91,20 @@ where
     _value: PhantomData<V>,
 }
 
-impl<K, V, const KSIZE: u16, S> Drop for DbInner<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Drop for DbCore<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
     fn drop(&mut self) {
-        let _ = self.commit();
+        if self.config.write {
+            let _ = self.commit();
+        }
     }
 }
 
-impl<K, V, const KSIZE: u16, S> DbInner<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> DbCore<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -372,6 +222,9 @@ where
     ///   - key data
     ///   - value data
     pub fn insert(&mut self, key: K, value: &V) -> Result<(), InsertError> {
+        if !self.config.write {
+            return Err(InsertError::ReadOnly);
+        }
         if !self.config.allow_duplicate_inserts && self.contains_key(&key)? {
             return Err(InsertError::DuplicateKey);
         }
@@ -463,6 +316,9 @@ where
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
     pub fn commit(&mut self) -> Result<(), CommitError> {
+        if !self.config.write {
+            return Err(CommitError::ReadOnly);
+        }
         self.flush().map_err(CommitError::Flush)?;
         self.data_file
             .sync_all()
@@ -475,7 +331,7 @@ where
 
     /// Flush any in memory caches to file.
     /// Note this is only a flush not a commit, it does not do a sync on the files.
-    pub fn flush(&mut self) -> Result<(), FlushError> {
+    fn flush(&mut self) -> Result<(), FlushError> {
         {
             self.data_file
                 .write_all(&self.write_buffer)
@@ -488,8 +344,8 @@ where
             // Do this so we can call save_to_bucket while iterating the index_cache.
             // This should be safe since save_to_bucket does not touch the index_cache.
             // Maybe put index_cache in a Cell to avoid this unsafe?
-            let unsafe_db: &mut DbInner<K, V, KSIZE, S> =
-                unsafe { (self as *mut DbInner<K, V, KSIZE, S>).as_mut().unwrap() };
+            let unsafe_db: &mut DbCore<K, V, KSIZE, S> =
+                unsafe { (self as *mut DbCore<K, V, KSIZE, S>).as_mut().unwrap() };
             for (key, (hash, pos, size)) in &self.index_cache {
                 unsafe_db
                     .save_to_bucket(key, *hash, (*pos, *size))
@@ -832,7 +688,7 @@ where
     fn bucket_iter(
         &mut self,
         bucket: usize,
-    ) -> Result<BucketIter<DbInner<K, V, KSIZE, S>>, io::Error> {
+    ) -> Result<BucketIter<DbCore<K, V, KSIZE, S>>, io::Error> {
         let mut buffer = Vec::with_capacity(self.hdx_header.bucket_size() as usize);
         {
             let bucket_size = self.hdx_header.bucket_size() as usize;
@@ -855,8 +711,8 @@ where
         self.bucket_elements_cache.clear();
         // Break the db lifetime away so we can get the bucket iter and use it to extend the
         // bucket_element_cache.  These two parts do not interact and this saves unneeded collects.
-        let unsafe_db: &mut DbInner<K, V, KSIZE, S> = unsafe {
-            (self as *mut DbInner<K, V, KSIZE, S>)
+        let unsafe_db: &mut DbCore<K, V, KSIZE, S> = unsafe {
+            (self as *mut DbCore<K, V, KSIZE, S>)
                 .as_mut()
                 .expect("this can't be null")
         };
@@ -874,7 +730,7 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> Read for DbInner<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Read for DbCore<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -912,7 +768,7 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> Seek for DbInner<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Seek for DbCore<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -1071,13 +927,13 @@ mod tests {
         }
     }
 
-    type TestDb = Db<Key, String, 32>;
+    type TestDb = DbCore<Key, String, 32>;
     type TestDbRawIter = DbRawIter<Key, String, 32>;
 
     #[test]
     fn test_one() {
         {
-            let db: TestDb = DbConfig::new(".", "xxx1", 2)
+            let mut db: TestDb = DbConfig::new(".", "xxx1", 2)
                 .create()
                 .truncate()
                 .build()
@@ -1123,7 +979,7 @@ mod tests {
             assert!(iter.next().is_none());
             assert_eq!(db.len(), 5);
         }
-        let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
+        let mut db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
         let key = Key([6_u8; 32]);
         db.insert(key, &"Value One2".to_string()).unwrap();
         let key = Key([7_u8; 32]);
@@ -1141,7 +997,7 @@ mod tests {
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value Three2");
         drop(db);
-        let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
+        let mut db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
         let key = Key([6_u8; 32]);
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value One2");
@@ -1201,7 +1057,7 @@ mod tests {
             println!("XXXX {:?}", e);
         }
         println!("{}", err_info!());
-        let db: Db<u64, String, 8> = DbConfig::new(".", "xxx50k", 1)
+        let mut db: DbCore<u64, String, 8> = DbConfig::new(".", "xxx50k", 1)
             .create()
             .truncate()
             .build()
@@ -1246,59 +1102,8 @@ mod tests {
     }
 
     #[test]
-    fn test_x50k_mt() {
-        let e: Box<dyn std::error::Error + Send + Sync> =
-            std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
-        let e: SourceError = e.into();
-        assert!(e.is::<std::io::Error>());
-        if let Some(e) = e.downcast_ref::<std::io::Error>() {
-            println!("XXXX {:?}", e);
-        }
-        println!("{}", err_info!());
-        let db: DbMt<u64, String, 8> = DbConfig::new(".", "xxx50k_mt", 1)
-            .create()
-            .truncate()
-            .build_mt()
-            .unwrap();
-        assert!(!db.contains_key(&0).unwrap());
-        assert!(!db.contains_key(&10).unwrap());
-        assert!(!db.contains_key(&35_000).unwrap());
-        assert!(!db.contains_key(&49_000).unwrap());
-        assert!(!db.contains_key(&50_000).unwrap());
-        let start = time::Instant::now();
-        for i in 0_u64..50_000 {
-            db.insert(i, &format!("Value {}", i)).unwrap();
-        }
-        println!("XXXX MT insert time {}", start.elapsed().as_secs_f64());
-        assert_eq!(db.len(), 50_000);
-        assert!(db.contains_key(&0).unwrap());
-        assert!(db.contains_key(&10).unwrap());
-        assert!(db.contains_key(&35_000).unwrap());
-        assert!(db.contains_key(&49_000).unwrap());
-        assert!(!db.contains_key(&50_000).unwrap());
-        let start = time::Instant::now();
-        db.flush().unwrap();
-        println!("XXXX MT flush time {}", start.elapsed().as_secs_f64());
-        let start = time::Instant::now();
-        let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
-        assert_eq!(vals.len(), 50_000);
-        for (i, v) in vals.iter().enumerate() {
-            assert_eq!(v, &format!("Value {}", i));
-        }
-        println!("XXXX MT iter time {}", start.elapsed().as_secs_f64());
-        let start = time::Instant::now();
-        assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
-        for i in 0..50_000 {
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}", i);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
-        }
-        println!("XXXX MT fetch time {}", start.elapsed().as_secs_f64());
-    }
-
-    #[test]
     fn test_x50k_str() {
-        let db: Db<String, String, 0> = DbConfig::new(".", "xxx50k_str", 1)
+        let mut db: DbCore<String, String, 0> = DbConfig::new(".", "xxx50k_str", 1)
             .create()
             .truncate()
             .build()

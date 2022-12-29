@@ -21,6 +21,8 @@ pub enum InsertError {
     Flush(FlushError),
     /// Error accessing key.
     KeyError(ReadKeyError),
+    /// Database opened read-only.
+    ReadOnly,
 }
 
 impl Error for InsertError {}
@@ -34,6 +36,7 @@ impl fmt::Display for InsertError {
             Self::InvalidKeyLength => write!(f, "invalid key length"),
             Self::Flush(e) => write!(f, "flush: {}", e),
             Self::KeyError(e) => write!(f, "key access: {}", e),
+            Self::ReadOnly => write!(f, "read only"),
         }
     }
 }

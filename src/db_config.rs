@@ -1,6 +1,6 @@
 //! Define the configuration used to create a SLDB.
 
-use crate::db::{Db, DbBytes, DbKey, DbMt};
+use crate::db::{DbBytes, DbCore, DbKey};
 use crate::error::OpenError;
 use std::fmt::Debug;
 use std::hash::BuildHasher;
@@ -90,22 +90,12 @@ impl DbConfig {
     }
 
     /// Consumes the config and builds a Db.
-    pub fn build<K, V, const KSIZE: u16, S>(self) -> Result<Db<K, V, KSIZE, S>, OpenError>
+    pub fn build<K, V, const KSIZE: u16, S>(self) -> Result<DbCore<K, V, KSIZE, S>, OpenError>
     where
         K: DbKey<KSIZE> + DbBytes<K>,
         V: Debug + DbBytes<V>,
         S: BuildHasher + Default,
     {
-        Db::open(self)
-    }
-
-    /// Consumes the config and builds a Db.
-    pub fn build_mt<K, V, const KSIZE: u16, S>(self) -> Result<DbMt<K, V, KSIZE, S>, OpenError>
-    where
-        K: DbKey<KSIZE> + DbBytes<K>,
-        V: Debug + DbBytes<V>,
-        S: BuildHasher + Default,
-    {
-        DbMt::open(self)
+        DbCore::open(self)
     }
 }
