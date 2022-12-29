@@ -1,16 +1,16 @@
-use std::error::Error;
 use dashmap::DashMap;
 use sldb_core::db::{DbBytes, DbCore, DbKey};
 use sldb_core::db_config::DbConfig;
 use sldb_core::db_raw_iter::DbRawIter;
-use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError};
-use sldb_core::fxhasher::FxHasher;
-use std::fmt::Debug;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash};
-use std::{fmt, io};
-use std::sync::Arc;
 use sldb_core::error::flush::FlushError;
 use sldb_core::error::insert::InsertError;
+use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError};
+use sldb_core::fxhasher::FxHasher;
+use std::error::Error;
+use std::fmt::Debug;
+use std::hash::{BuildHasher, BuildHasherDefault, Hash};
+use std::sync::Arc;
+use std::{fmt, io};
 use tokio::sync::*;
 
 pub struct AsyncDb<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
@@ -117,7 +117,7 @@ where
         if self.insert_tx.send(InsertCommand::Commit(tx)).await.is_ok() {
             match rx.await {
                 Ok(r) => r,
-                Err(_err) => Err(CommitError::ReceiveFailed)
+                Err(_err) => Err(CommitError::ReceiveFailed),
             }
         } else {
             // An error here means the receiver in the insert thread was dropped/closed.
@@ -167,15 +167,15 @@ where
                                 for key in inserts.drain(..) {
                                     write_cache.remove(&key);
                                 }
-                            },
+                            }
                             Err(err) => {
                                 let _ = tx.send(Err(err.into()));
-                            },
+                            }
                         }
                     }
                 }
                 Some(InsertCommand::Done) => done = true,
-                None => done = true,  // The sender has been closed or dropped so nothing left to do.
+                None => done = true, // The sender has been closed or dropped so nothing left to do.
             }
         }
         println!("XXXX Ending db thread");
@@ -228,7 +228,6 @@ impl From<sldb_core::error::CommitError> for CommitError {
     }
 }
 
-
 enum InsertCommand<K, const KSIZE: u16>
 where
     K: Send + Sync + Eq + Hash + DbKey<KSIZE> + DbBytes<K> + Clone + 'static,
@@ -258,10 +257,9 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0_u64..50_000 {
-            db.insert(i, format!("Value {}", i)).await; //.unwrap();
-                                                        //if i % 500 == 0 {
+            db.insert(i, format!("Value {}", i)).await;
             //if i % 11000 == 0 {
-                //db.commit().await.unwrap();
+            //    db.commit().await.unwrap();
             //}
         }
         println!("XXXX insert time {}", start.elapsed().as_secs_f64());
