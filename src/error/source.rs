@@ -6,7 +6,7 @@ use std::fmt;
 /// Can be None or a Boxed dynamic Error.
 /// Implements Error so it can be used as a source for other errors.
 #[derive(Debug)]
-pub struct SourceError(Option<Box<dyn Error>>);
+pub struct SourceError(Option<Box<dyn Error + Send + Sync>>);
 impl Error for SourceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.0 {
@@ -30,12 +30,12 @@ impl SourceError {
     }
 
     /// Create a new GenericOptError that contains err.
-    pub fn new_error(err: Box<dyn Error>) -> Self {
+    pub fn new_error(err: Box<dyn Error + Send + Sync>) -> Self {
         Self(Some(err))
     }
 
     /// Create a new GenericOptError that contains err.
-    pub fn new_opt_error(err: Option<Box<dyn Error>>) -> Self {
+    pub fn new_opt_error(err: Option<Box<dyn Error + Send + Sync>>) -> Self {
         match err {
             None => Self(None),
             Some(err) => Self::new_error(err),
@@ -43,7 +43,7 @@ impl SourceError {
     }
 
     /// Return an Optional reference to the wrapped Error.
-    pub fn error(&self) -> Option<&dyn Error> {
+    pub fn error(&self) -> Option<&(dyn Error + Send + Sync)> {
         self.0.as_ref().map(|e| e.as_ref())
     }
 
@@ -73,18 +73,18 @@ impl SourceError {
             .unwrap_or(None)
     }
 }
-impl<'a> From<&'a SourceError> for Option<&'a Box<dyn Error>> {
-    fn from(err: &SourceError) -> Option<&Box<dyn Error>> {
+impl<'a> From<&'a SourceError> for Option<&'a Box<dyn Error + Send + Sync>> {
+    fn from(err: &SourceError) -> Option<&Box<dyn Error + Send + Sync>> {
         err.0.as_ref()
     }
 }
-impl From<SourceError> for Option<Box<dyn Error>> {
-    fn from(err: SourceError) -> Option<Box<dyn Error>> {
+impl From<SourceError> for Option<Box<dyn Error + Send + Sync>> {
+    fn from(err: SourceError) -> Option<Box<dyn Error + Send + Sync>> {
         err.0
     }
 }
-impl From<Box<dyn Error>> for SourceError {
-    fn from(err: Box<dyn Error>) -> Self {
+impl From<Box<dyn Error + Send + Sync>> for SourceError {
+    fn from(err: Box<dyn Error + Send + Sync>) -> Self {
         Self::new_error(err)
     }
 }

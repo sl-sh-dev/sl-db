@@ -21,6 +21,8 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
 
 pub mod byte_trans;
 pub mod data_header;
@@ -64,13 +66,14 @@ pub trait DbBytes<T> {
 
 /// An instance of a DB.
 /// Will consist of a data file and hash index with optional log for commit recovery.
+#[derive(Clone)]
 pub struct Db<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
-    inner: RefCell<DbInner<K, V, KSIZE, S>>,
+    inner: Rc<RefCell<DbInner<K, V, KSIZE, S>>>,
 }
 
 impl<K, V, const KSIZE: u16, S> Db<K, V, KSIZE, S>
@@ -83,7 +86,7 @@ where
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         let inner = DbInner::open(config)?;
         Ok(Self {
-            inner: RefCell::new(inner),
+            inner: Rc::new(RefCell::new(inner)),
         })
     }
 
@@ -109,12 +112,12 @@ where
 
     /// Return the number of records in Db.
     pub fn len(&self) -> usize {
-        self.inner.borrow_mut().len()
+        self.inner.borrow().len()
     }
 
     /// Is the DB empty?
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow_mut().is_empty()
+        self.inner.borrow().is_empty()
     }
 
     /// Flush any caches to disk and sync the data and index file.
@@ -138,7 +141,82 @@ where
 
 /// An instance of a DB.
 /// Will consist of a data file and hash index with optional log for commit recovery.
-struct DbInner<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+#[derive(Clone)]
+pub struct DbMt<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
+    inner: Arc<std::sync::Mutex<DbInner<K, V, KSIZE, S>>>,
+}
+
+impl<K, V, const KSIZE: u16, S> DbMt<K, V, KSIZE, S>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
+    /// Open a new or reopen an existing database.
+    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+        let inner = DbInner::open(config)?;
+        Ok(Self {
+            inner: Arc::new(std::sync::Mutex::new(inner)),
+        })
+    }
+
+    /// Fetch the value stored at key.  Will return an error if not found.
+    pub fn fetch(&self, key: &K) -> Result<V, FetchError> {
+        self.inner.lock().unwrap().fetch(key)
+    }
+
+    /// True if the database contains key.
+    pub fn contains_key(&self, key: &K) -> Result<bool, ReadKeyError> {
+        self.inner.lock().unwrap().contains_key(key)
+    }
+
+    /// Insert a new key/value pair in Db.
+    /// For the data file this means inserting:
+    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
+    ///   - value size (u32)
+    ///   - key data
+    ///   - value data
+    pub fn insert(&self, key: K, value: &V) -> Result<(), InsertError> {
+        self.inner.lock().unwrap().insert(key, value)
+    }
+
+    /// Return the number of records in Db.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// Is the DB empty?
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
+
+    /// Flush any caches to disk and sync the data and index file.
+    /// All data should be safely on disk if this call succeeds.
+    pub fn commit(&self) -> Result<(), CommitError> {
+        self.inner.lock().unwrap().commit()
+    }
+
+    /// Flush any in memory caches to file.
+    /// Note this is only a flush not a commit, it does not do a sync on the files.
+    pub fn flush(&self) -> Result<(), FlushError> {
+        self.inner.lock().unwrap().flush()
+    }
+
+    /// Return an iterator over the key values in insertion order.
+    /// Note this iterator only uses the data file not the indexes.
+    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
+        self.inner.lock().unwrap().raw_iter()
+    }
+}
+
+/// An instance of a DB.
+/// Will consist of a data file and hash index with optional log for commit recovery.
+pub struct DbInner<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -196,10 +274,14 @@ where
             Self::open_hdx_file(&hdx_name, &header, &config).map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
-        // Make a 16mb write buffer.
-        let write_buffer = Vec::with_capacity(1024); //INSERT_BUFFER_SIZE + 1024);
-        let mut index_cache = FxHashMap::default();
-        index_cache.reserve(50000);
+        let (write_buffer, index_cache) = if config.write {
+            let mut index_cache = FxHashMap::default();
+            index_cache.reserve(50000);
+            (Vec::with_capacity(INSERT_BUFFER_SIZE + 1024), index_cache)
+        } else {
+            // If opening read only wont need capacity.
+            (Vec::new(), FxHashMap::default())
+        };
         Ok(Self {
             _header: header,
             data_file,
@@ -213,7 +295,7 @@ where
             scratch_buffer: Cell::new(Vec::new()),
             write_buffer,
             bucket_elements_cache: Vec::with_capacity(header.bucket_elements() as usize),
-            index_cache, //: FxHashMap::with_capacity(1000),//default(),
+            index_cache,
             seek_pos: 0,
             config,
             _key: PhantomData,
@@ -269,6 +351,18 @@ where
             }
         }
         Ok(false)
+    }
+
+    /// If in read-only mode refresh the index header data from on-disk.
+    /// Useful if the DB is also opened for writing.
+    pub fn refresh_index(&mut self) {
+        if !self.config.write {
+            if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file) {
+                self.hdx_header = header;
+                // Don't want buckets and modulus to be the same, so +1
+                self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
+            }
+        }
     }
 
     /// Insert a new key/value pair in Db.
@@ -330,12 +424,25 @@ where
                     (self.write_buffer.len() - start_write_buffer_len) as u32,
                 ),
             );
-            if self.config.cache_writes {
-                if self.index_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE {
+            if self.config.auto_flush {
+                if self.config.cache_writes {
+                    if self.index_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE
+                    {
+                        self.flush()?;
+                    }
+                } else {
                     self.flush()?;
                 }
             } else {
-                self.flush()?;
+                // Even with no auto flush we will flush the data file now and then (but not the index).
+                // Since the data file is append only this should be safe and can keep memory usage down.
+                if self.write_buffer.len() >= INSERT_BUFFER_SIZE {
+                    self.data_file
+                        .write_all(&self.write_buffer)
+                        .map_err(FlushError::WriteData)?;
+                    self.data_file_end += self.write_buffer.len() as u64;
+                    self.write_buffer.clear();
+                }
             }
             self.hdx_header.inc_values();
         }
@@ -778,7 +885,12 @@ where
     /// so this will not read across them in one call.  This will not happen on a proper DB although
     /// the Read contract should handle this fine.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.seek_pos >= self.data_file_end {
+        if !self.config.write {
+            // Assume file is at the correct position.
+            let size = self.data_file.read(buf)?;
+            self.seek_pos += size as u64;
+            Ok(size)
+        } else if self.seek_pos >= self.data_file_end {
             let write_pos = (self.seek_pos - self.data_file_end) as usize;
             if write_pos < self.write_buffer.len() {
                 let mut size = buf.len();
@@ -808,29 +920,34 @@ where
 {
     /// Seek on the DbInner treating the file and write cache as one byte array.
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match pos {
-            SeekFrom::Start(pos) => self.seek_pos = pos,
-            SeekFrom::End(pos) => {
-                let end = (self.data_file_end + self.write_buffer.len() as u64) as i64 + pos;
-                if end >= 0 {
-                    self.seek_pos = end as u64;
-                } else {
-                    self.seek_pos = 0;
+        if !self.config.write {
+            self.seek_pos = self.data_file.seek(pos)?; //SeekFrom::Start(self.seek_pos))?;
+            Ok(self.seek_pos)
+        } else {
+            match pos {
+                SeekFrom::Start(pos) => self.seek_pos = pos,
+                SeekFrom::End(pos) => {
+                    let end = (self.data_file_end + self.write_buffer.len() as u64) as i64 + pos;
+                    if end >= 0 {
+                        self.seek_pos = end as u64;
+                    } else {
+                        self.seek_pos = 0;
+                    }
+                }
+                SeekFrom::Current(pos) => {
+                    let end = self.seek_pos as i64 + pos;
+                    if end >= 0 {
+                        self.seek_pos = end as u64;
+                    } else {
+                        self.seek_pos = 0;
+                    }
                 }
             }
-            SeekFrom::Current(pos) => {
-                let end = self.seek_pos as i64 + pos;
-                if end >= 0 {
-                    self.seek_pos = end as u64;
-                } else {
-                    self.seek_pos = 0;
-                }
+            if self.seek_pos < self.data_file_end || !self.config.write {
+                self.data_file.seek(SeekFrom::Start(self.seek_pos))?;
             }
+            Ok(self.seek_pos)
         }
-        if self.seek_pos < self.data_file_end {
-            self.data_file.seek(SeekFrom::Start(self.seek_pos))?;
-        }
-        Ok(self.seek_pos)
     }
 }
 
@@ -899,6 +1016,35 @@ impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
     }
 }
 
+impl DbKey<0> for String {}
+impl DbBytes<String> for String {
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
+        let bytes = self.as_bytes();
+        buffer.resize(bytes.len(), 0);
+        buffer.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<String, DeserializeError> {
+        Ok(String::from_utf8_lossy(buffer).to_string())
+    }
+}
+
+impl DbKey<8> for u64 {}
+impl DbBytes<u64> for u64 {
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
+        buffer.resize(8, 0);
+        buffer.copy_from_slice(&self.to_ne_bytes());
+        Ok(())
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<u64, DeserializeError> {
+        let mut buf = [0_u8; 8];
+        buf.copy_from_slice(buffer);
+        Ok(Self::from_ne_bytes(buf))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,35 +1068,6 @@ mod tests {
             let mut key = [0_u8; 32];
             key.copy_from_slice(buffer);
             Ok(Key(key))
-        }
-    }
-
-    impl DbKey<0> for String {}
-    impl DbBytes<String> for String {
-        fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
-            let bytes = self.as_bytes();
-            buffer.resize(bytes.len(), 0);
-            buffer.copy_from_slice(bytes);
-            Ok(())
-        }
-
-        fn deserialize(buffer: &[u8]) -> Result<String, DeserializeError> {
-            Ok(String::from_utf8_lossy(buffer).to_string())
-        }
-    }
-
-    impl DbKey<8> for u64 {}
-    impl DbBytes<u64> for u64 {
-        fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
-            buffer.resize(8, 0);
-            buffer.copy_from_slice(&self.to_ne_bytes());
-            Ok(())
-        }
-
-        fn deserialize(buffer: &[u8]) -> Result<u64, DeserializeError> {
-            let mut buf = [0_u8; 8];
-            buf.copy_from_slice(buffer);
-            Ok(Self::from_ne_bytes(buf))
         }
     }
 
@@ -1076,7 +1193,7 @@ mod tests {
 
     #[test]
     fn test_50k() {
-        let e: Box<dyn std::error::Error> =
+        let e: Box<dyn std::error::Error + Send + Sync> =
             std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
         let e: SourceError = e.into();
         assert!(e.is::<std::io::Error>());
@@ -1097,6 +1214,9 @@ mod tests {
         let start = time::Instant::now();
         for i in 0_u64..50_000 {
             db.insert(i, &format!("Value {}", i)).unwrap();
+            //if i % 500 == 0 {
+            //    db.commit().unwrap();
+            //}
         }
         println!("XXXX insert time {}", start.elapsed().as_secs_f64());
         assert_eq!(db.len(), 50_000);
@@ -1123,6 +1243,57 @@ mod tests {
             assert_eq!(&item.unwrap(), &format!("Value {}", i));
         }
         println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
+    }
+
+    #[test]
+    fn test_x50k_mt() {
+        let e: Box<dyn std::error::Error + Send + Sync> =
+            std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
+        let e: SourceError = e.into();
+        assert!(e.is::<std::io::Error>());
+        if let Some(e) = e.downcast_ref::<std::io::Error>() {
+            println!("XXXX {:?}", e);
+        }
+        println!("{}", err_info!());
+        let db: DbMt<u64, String, 8> = DbConfig::new(".", "xxx50k_mt", 1)
+            .create()
+            .truncate()
+            .build_mt()
+            .unwrap();
+        assert!(!db.contains_key(&0).unwrap());
+        assert!(!db.contains_key(&10).unwrap());
+        assert!(!db.contains_key(&35_000).unwrap());
+        assert!(!db.contains_key(&49_000).unwrap());
+        assert!(!db.contains_key(&50_000).unwrap());
+        let start = time::Instant::now();
+        for i in 0_u64..50_000 {
+            db.insert(i, &format!("Value {}", i)).unwrap();
+        }
+        println!("XXXX MT insert time {}", start.elapsed().as_secs_f64());
+        assert_eq!(db.len(), 50_000);
+        assert!(db.contains_key(&0).unwrap());
+        assert!(db.contains_key(&10).unwrap());
+        assert!(db.contains_key(&35_000).unwrap());
+        assert!(db.contains_key(&49_000).unwrap());
+        assert!(!db.contains_key(&50_000).unwrap());
+        let start = time::Instant::now();
+        db.flush().unwrap();
+        println!("XXXX MT flush time {}", start.elapsed().as_secs_f64());
+        let start = time::Instant::now();
+        let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
+        assert_eq!(vals.len(), 50_000);
+        for (i, v) in vals.iter().enumerate() {
+            assert_eq!(v, &format!("Value {}", i));
+        }
+        println!("XXXX MT iter time {}", start.elapsed().as_secs_f64());
+        let start = time::Instant::now();
+        assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
+        for i in 0..50_000 {
+            let item = db.fetch(&(i as u64));
+            assert!(item.is_ok(), "Failed on item {}", i);
+            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+        }
+        println!("XXXX MT fetch time {}", start.elapsed().as_secs_f64());
     }
 
     #[test]

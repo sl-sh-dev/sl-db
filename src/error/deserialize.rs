@@ -27,7 +27,7 @@ impl fmt::Display for DeserializeError {
 }
 impl DeserializeError {
     /// Create a new DeserializeError with a message and optional source error.
-    pub fn new(message: String, source: Option<Box<dyn Error>>) -> Self {
+    pub fn new(message: String, source: Option<Box<dyn Error + Send + Sync>>) -> Self {
         Self {
             message,
             source: SourceError::new_opt_error(source),

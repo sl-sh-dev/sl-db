@@ -1,12 +1,13 @@
 //! Define the configuration used to create a SLDB.
 
-use crate::db::{Db, DbBytes, DbKey};
+use crate::db::{Db, DbBytes, DbKey, DbMt};
 use crate::error::OpenError;
 use std::fmt::Debug;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
 
 /// Configuration for a database.
+#[derive(Clone)]
 pub struct DbConfig {
     pub(crate) dir: PathBuf,
     pub(crate) base_name: PathBuf,
@@ -20,6 +21,7 @@ pub struct DbConfig {
     pub(crate) allow_bucket_expansion: bool, // don't allow more buckets- for testing lots of overflows...
     pub(crate) allow_duplicate_inserts: bool,
     pub(crate) cache_writes: bool,
+    pub(crate) auto_flush: bool,
 }
 
 impl DbConfig {
@@ -38,6 +40,7 @@ impl DbConfig {
             allow_bucket_expansion: true,
             allow_duplicate_inserts: false,
             cache_writes: true,
+            auto_flush: true,
         }
     }
 
@@ -66,6 +69,19 @@ impl DbConfig {
         self
     }
 
+    /// Do NOT cache writes.
+    pub fn no_write_cache(mut self) -> Self {
+        self.cache_writes = false;
+        self
+    }
+
+    /// Do NOT auto flush records.
+    /// Note that disabling auto flush will use the write cache even if no_write_cache() is called.
+    pub fn no_auto_flush(mut self) -> Self {
+        self.auto_flush = false;
+        self
+    }
+
     /// If the database exists then truncate it on open, requires write mode (option ignored if read-only).
     /// This will rebuild the database with new parameters instead of using the old parameters.
     pub fn truncate(mut self) -> Self {
@@ -81,5 +97,15 @@ impl DbConfig {
         S: BuildHasher + Default,
     {
         Db::open(self)
+    }
+
+    /// Consumes the config and builds a Db.
+    pub fn build_mt<K, V, const KSIZE: u16, S>(self) -> Result<DbMt<K, V, KSIZE, S>, OpenError>
+    where
+        K: DbKey<KSIZE> + DbBytes<K>,
+        V: Debug + DbBytes<V>,
+        S: BuildHasher + Default,
+    {
+        DbMt::open(self)
     }
 }
