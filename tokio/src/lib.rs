@@ -19,7 +19,7 @@ where
     V: Send + Sync + Debug + DbBytes<V> + Clone + 'static,
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
-    db_read: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>, //DbMt<K, V, KSIZE, S>,
+    db_read: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
     write_cache: Arc<DashMap<K, V>>,
     insert_tx: mpsc::Sender<InsertCommand<K, KSIZE>>,
     insert_thread: Option<std::thread::JoinHandle<()>>,
@@ -47,7 +47,7 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        let (insert_tx, insert_rx) = mpsc::channel(10_000);
+        let (insert_tx, insert_rx) = mpsc::channel(20_000);
         // Open the write db (passed to the insert thread).
         let db = DbCore::open(config.clone())?;
         // Open a read only DB for fetching, reduces locks.
@@ -125,6 +125,12 @@ where
         }
     }
 
+    /// Schedule a commit but don't wait for it to complete.
+    pub async fn commit_bg(&self) {
+        // An error here menas the receiver in the insert thread was closed/dropped.
+        let _ = self.insert_tx.send(InsertCommand::CommitBG).await;
+    }
+
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     pub async fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
@@ -149,8 +155,8 @@ where
                             Err(err) => last_insert_error = Some(err),
                             Ok(_) => {}
                         }
+                        inserts.push(key);
                     }
-                    inserts.push(key);
                 }
                 Some(InsertCommand::Commit(tx)) => {
                     if let Some(err) = last_insert_error {
@@ -158,9 +164,11 @@ where
                         last_insert_error = None;
                     } else {
                         let mut db_read = db_read.blocking_lock();
-                        let res = db.commit();
+                        //let res = db.commit();
+                        let _ = db.flush();
                         db_read.refresh_index();
                         drop(db_read);
+                        let res = db.commit();
                         match res {
                             Ok(()) => {
                                 let _ = tx.send(Ok(()));
@@ -172,6 +180,22 @@ where
                                 let _ = tx.send(Err(err.into()));
                             }
                         }
+                    }
+                }
+                Some(InsertCommand::CommitBG) => {
+                    let mut db_read = db_read.blocking_lock();
+                    let _ = db.flush();
+                    //let res = db.commit();
+                    db_read.refresh_index();
+                    drop(db_read);
+                    let res = db.commit();
+                    match res {
+                        Ok(()) => {
+                            for key in inserts.drain(..) {
+                                write_cache.remove(&key);
+                            }
+                        }
+                        Err(_err) => {}
                     }
                 }
                 Some(InsertCommand::Done) => done = true,
@@ -234,6 +258,7 @@ where
 {
     Insert(K),
     Commit(tokio::sync::oneshot::Sender<Result<(), CommitError>>),
+    CommitBG,
     Done,
 }
 
@@ -247,6 +272,7 @@ mod tests {
         let config = DbConfig::new(".", "xxx50k", 1)
             .no_auto_flush()
             .create()
+            .allow_duplicate_inserts()
             .truncate(); //.no_write_cache();
         let db: AsyncDb<u64, String, 8> = AsyncDb::open(config).unwrap();
         assert!(!db.contains_key(0).await.unwrap());
@@ -258,9 +284,10 @@ mod tests {
         let start = time::Instant::now();
         for i in 0_u64..50_000 {
             db.insert(i, format!("Value {}", i)).await;
-            //if i % 11000 == 0 {
-            //    db.commit().await.unwrap();
-            //}
+            if i % 10000 == 0 {
+                db.commit_bg().await; //.unwrap();
+                                      //db.commit().await.unwrap();
+            }
         }
         println!("XXXX insert time {}", start.elapsed().as_secs_f64());
         //assert_eq!(db.len(), 50_000);
@@ -269,6 +296,19 @@ mod tests {
         assert!(db.contains_key(35_000).await.unwrap());
         assert!(db.contains_key(49_000).await.unwrap());
         assert!(!db.contains_key(50_000).await.unwrap());
+
+        let start = time::Instant::now();
+        assert_eq!(&db.fetch(35_000).await.unwrap(), "Value 35000");
+        for i in 0..50_000 {
+            let item = db.fetch(i as u64).await;
+            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+        }
+        println!(
+            "XXXX fetch (pre commit) time {}",
+            start.elapsed().as_secs_f64()
+        );
+
         let start = time::Instant::now();
         db.commit().await.unwrap();
         println!("XXXX commit time {}", start.elapsed().as_secs_f64());

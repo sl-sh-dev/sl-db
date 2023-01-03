@@ -1,7 +1,7 @@
 //! Contains the Hash Index (HDX) structure and code.
 
 use crate::db::byte_trans::ByteTrans;
-use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
+use crate::db::data_header::DataHeader;
 use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
 use std::io;
@@ -30,37 +30,12 @@ impl AsRef<[u8]> for HdxHeader {
     }
 }
 
-impl Default for HdxHeader {
-    fn default() -> Self {
-        let buckets = 1; //128;
-        let elements = 255; //5;
-                            // Each bucket is:
-                            // u64 (pos of overflow record)
-                            // elements[] each one is:
-                            //     (u64 (hash), u64 (record pos), u32 (record size)).
-        let bucket_size: u16 = 8 + (BUCKET_ELEMENT_SIZE as u16 * elements);
-        Self {
-            type_id: *b"sldb.hdx",
-            version: 0,
-            uid: 0,
-            appnum: 0,
-            buckets,
-            bucket_elements: elements,
-            bucket_size,
-            salt: 0,
-            pepper: 0,
-            load_factor: u16::MAX / 2, // .5
-            values: 0,
-            reserved: [0; 64],
-        }
-    }
-}
-
 impl HdxHeader {
     /// Return a default HdxHeader with any values from data_header overridden.
     /// This includes the version, uid, appnum, bucket_size and bucket_elements.
     pub fn from_data_header(data_header: &DataHeader, config: &DbConfig) -> Self {
         Self {
+            type_id: *b"sldb.hdx",
             version: data_header.version(),
             uid: data_header.uid(),
             appnum: data_header.appnum(),
@@ -68,15 +43,32 @@ impl HdxHeader {
             bucket_size: data_header.bucket_size(),
             buckets: config.initial_buckets,
             load_factor: (u16::MAX as f32 * config.load_factor) as u16,
-            ..Default::default()
+            salt: 0,
+            pepper: 0,
+            values: 0,
+            reserved: [0; 64],
         }
     }
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
     pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
-        let mut header = HdxHeader::default();
+        let mut header = Self {
+            type_id: *b"sldb.hdx",
+            version: 0,
+            uid: 0,
+            appnum: 0,
+            buckets: 0,
+            bucket_elements: 0,
+            bucket_size: 0,
+            salt: 0,
+            pepper: 0,
+            load_factor: u16::MAX / 2, // .5
+            values: 0,
+            reserved: [0; 64],
+        };
         source.seek(SeekFrom::Start(0))?;
+        // TODO- load this in pieces to avoid the unsafe as well handle byte ordering.
         unsafe {
             source.read_exact(HdxHeader::as_bytes_mut(&mut header))?;
         }

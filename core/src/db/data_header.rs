@@ -28,40 +28,34 @@ impl AsRef<[u8]> for DataHeader {
     }
 }
 
-impl Default for DataHeader {
-    fn default() -> Self {
-        let bucket_elements = 255; //5;
-                                   // Each bucket is:
-                                   // u64 (pos of overflow record)
-                                   // elements[] each one is:
-                                   //     (u64 (hash), u64 (record pos), u32 (record size)).
-        let bucket_size: u16 = 8 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
+impl DataHeader {
+    pub fn new(config: &DbConfig) -> Self {
+        let bucket_size: u16 = config.bucket_size; //8 + (BUCKET_ELEMENT_SIZE as u16 * config.bucket_elements);
         Self {
             type_id: *b"sldb.dat",
             version: 0,
             uid: 0,
-            appnum: 0,
-            bucket_elements,
+            appnum: config.appnum,
+            bucket_elements: config.bucket_elements,
             bucket_size,
             reserved: [0; 64],
-        }
-    }
-}
-
-impl DataHeader {
-    pub fn new(config: &DbConfig) -> Self {
-        Self {
-            bucket_elements: config.bucket_elements,
-            appnum: config.appnum,
-            ..Default::default()
         }
     }
 
     /// Load a DataHeader from source.
     pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
         let source = source;
-        let mut header = Self::default();
+        let mut header = Self {
+            type_id: *b"sldb.dat",
+            version: 0,
+            uid: 0,
+            appnum: 0,
+            bucket_elements: 0,
+            bucket_size: 0,
+            reserved: [0; 64],
+        };
         source.seek(SeekFrom::Start(0))?;
+        // TODO- load this in pieces to avoid the unsafe as well handle byte ordering.
         unsafe {
             source.read_exact(DataHeader::as_bytes_mut(&mut header))?;
         }

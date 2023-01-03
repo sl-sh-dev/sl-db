@@ -16,6 +16,8 @@ pub enum FlushError {
     SaveToBucket(ReadKeyError),
     /// Error writing the index header back to the index file.
     IndexHeader(io::Error),
+    /// Error writing bucket(s) to the index file.
+    WriteIndexData(io::Error),
 }
 
 impl Error for FlushError {}
@@ -27,6 +29,7 @@ impl fmt::Display for FlushError {
             Self::ExpandBuckets(e) => write!(f, "expand buckets: {}", e),
             Self::SaveToBucket(e) => write!(f, "save bucket: {}", e),
             Self::IndexHeader(e) => write!(f, "write index header: {}", e),
+            Self::WriteIndexData(e) => write!(f, "write index data: {}", e),
         }
     }
 }
