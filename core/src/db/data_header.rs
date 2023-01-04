@@ -1,6 +1,5 @@
 //! Define and manage a data file header.
 
-use crate::db::byte_trans::ByteTrans;
 use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
 use std::io;
@@ -8,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 // Each bucket element is a (u64, u64, u32)- (hash, record_pos, record_size).
 pub(crate) const BUCKET_ELEMENT_SIZE: usize = 20;
+const HEADER_BYTES: usize = 94;
 
 /// Struct that contains the header for a sldb data file.
 #[derive(Debug, Copy, Clone)]
@@ -20,12 +20,6 @@ pub(crate) struct DataHeader {
     bucket_size: u16,     // Size of a bucket, record this here in case index is lost.
     bucket_elements: u16, // Elements in each bucket, record this here in case index is lost.
     reserved: [u8; 64],   // Zeroes
-}
-
-impl AsRef<[u8]> for DataHeader {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { Self::as_bytes(self) }
-    }
 }
 
 impl DataHeader {
@@ -44,31 +38,67 @@ impl DataHeader {
 
     /// Load a DataHeader from source.
     pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
-        let source = source;
-        let mut header = Self {
-            type_id: *b"sldb.dat",
-            version: 0,
-            uid: 0,
-            appnum: 0,
-            bucket_elements: 0,
-            bucket_size: 0,
-            reserved: [0; 64],
-        };
         source.seek(SeekFrom::Start(0))?;
-        // TODO- load this in pieces to avoid the unsafe as well handle byte ordering.
-        unsafe {
-            source.read_exact(DataHeader::as_bytes_mut(&mut header))?;
-        }
-
-        if &header.type_id != b"sldb.dat" {
+        let mut buffer = [0_u8; HEADER_BYTES];
+        let mut buf16 = [0_u8; 2];
+        let mut buf64 = [0_u8; 8];
+        let mut pos = 0;
+        source.read_exact(&mut buffer[..])?;
+        let mut type_id = [0_u8; 8];
+        type_id.copy_from_slice(&buffer[0..8]);
+        pos += 8;
+        if &type_id != b"sldb.dat" {
             return Err(LoadHeaderError::InvalidType);
         }
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let version = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let uid = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let appnum = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let bucket_size = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let bucket_elements = u16::from_le_bytes(buf16);
+        pos += 2;
+        let mut reserved = [0_u8; 64];
+        reserved.copy_from_slice(&buffer[pos..(pos + 64)]);
+        let header = Self {
+            type_id,
+            version,
+            uid,
+            appnum,
+            bucket_elements,
+            bucket_size,
+            reserved,
+        };
         Ok(header)
     }
 
     /// Write this header to sync at current seek position.
     pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
-        sync.write_all(self.as_ref())?;
+        let mut buffer = [0_u8; HEADER_BYTES];
+        let mut pos = 0;
+        buffer[pos..8].copy_from_slice(&self.type_id);
+        pos += 8;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.version.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_size.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_elements.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 64)].copy_from_slice(&self.reserved);
+        pos += 64;
+        assert_eq!(pos, HEADER_BYTES);
+        sync.write_all(&buffer)?;
         Ok(())
     }
 

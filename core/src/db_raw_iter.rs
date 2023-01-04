@@ -76,7 +76,7 @@ where
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
             file.read_exact(&mut key_size)?;
-            let key_size = u16::from_ne_bytes(key_size);
+            let key_size = u16::from_le_bytes(key_size);
             if key_size == 0 {
                 // Overflow bucket, can not read as data so error.
                 return Err(FetchError::UnexpectedOverflowBucket);
@@ -88,7 +88,7 @@ where
 
         let mut val_size_buf = [0_u8; 4];
         file.read_exact(&mut val_size_buf)?;
-        let val_size = u32::from_ne_bytes(val_size_buf);
+        let val_size = u32::from_le_bytes(val_size_buf);
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
             return Err(FetchError::UnexpectedOverflowBucket);

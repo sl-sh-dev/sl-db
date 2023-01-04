@@ -1,8 +1,7 @@
 //! Main module for the SLDB core.  This implements the core sync single threaded access to the DB.
 
-use crate::db::byte_trans::ByteTrans;
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
-use crate::db::hdx_header::HdxHeader;
+use crate::db::hdx_header::{HdxHeader, HDX_HEADER_SIZE};
 use crate::db_config::DbConfig;
 use crate::db_raw_iter::DbRawIter;
 use crate::error::flush::FlushError;
@@ -22,7 +21,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 
-pub mod byte_trans;
 pub mod data_header;
 pub mod hdx_header;
 
@@ -105,7 +103,7 @@ macro_rules! bucket_iter {
         };
         let mut buffer = vec![0; $db.hdx_header.bucket_size() as usize];
         let bucket_size = $db.hdx_header.bucket_size() as usize;
-        let bucket_pos: u64 = (HdxHeader::SIZE + ($bucket * bucket_size)) as u64;
+        let bucket_pos: u64 = (HDX_HEADER_SIZE + ($bucket * bucket_size)) as u64;
         if let Ok(_) = $db.hdx_file.seek(SeekFrom::Start(bucket_pos)) {
             let _ = $db.hdx_file.read_exact(&mut buffer);
         }
@@ -256,7 +254,7 @@ where
             if K::is_variable_key_size() {
                 // We have to write the key size when variable.
                 self.write_buffer
-                    .write_all(&(buffer.len() as u16).to_ne_bytes())
+                    .write_all(&(buffer.len() as u16).to_le_bytes())
                     .expect("write_all to Vec is infallible");
             } else if K::KEY_SIZE as usize != buffer.len() {
                 return Err(InsertError::InvalidKeyLength);
@@ -279,7 +277,7 @@ where
             // Save current pos, then jump back to the value size and write that then finally write
             // the value into the saved position.
             self.write_buffer[val_size_pos..val_size_pos + 4]
-                .copy_from_slice(&(buffer.len() as u32).to_ne_bytes());
+                .copy_from_slice(&(buffer.len() as u32).to_le_bytes());
             self.write_buffer
                 .write_all(&buffer)
                 .expect("write_all to Vec is infallible");
@@ -491,7 +489,7 @@ where
         }
 
         // Overwrite the existing bucket with a new blank bucket and add a new empty bucket to the end.
-        let bucket_pos: u64 = (HdxHeader::SIZE
+        let bucket_pos: u64 = (HDX_HEADER_SIZE
             + (split_bucket as usize * self.hdx_header.bucket_size() as usize))
             as u64;
         self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
@@ -528,7 +526,7 @@ where
             buf
         } else {
             let mut buffer = vec![0; self.hdx_header.bucket_size() as usize];
-            let bucket_pos: u64 = (HdxHeader::SIZE
+            let bucket_pos: u64 = (HDX_HEADER_SIZE
                 + (bucket as usize * self.hdx_header.bucket_size() as usize))
                 as u64;
             {
@@ -546,7 +544,7 @@ where
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     fn save_bucket_cache(&mut self, cache: &mut FxHashMap<u64, Vec<u8>>) -> Result<(), io::Error> {
         for (bucket, buffer) in cache.drain() {
-            let bucket_pos: u64 = (HdxHeader::SIZE
+            let bucket_pos: u64 = (HDX_HEADER_SIZE
                 + (bucket as usize * self.hdx_header.bucket_size() as usize))
                 as u64;
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
@@ -568,10 +566,10 @@ where
         for i in 0..self.hdx_header.bucket_elements() as u64 {
             let mut buf64 = [0_u8; 8];
             buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_hash = u64::from_ne_bytes(buf64);
+            let rec_hash = u64::from_le_bytes(buf64);
             pos += 8;
             buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_pos = u64::from_ne_bytes(buf64);
+            let rec_pos = u64::from_le_bytes(buf64);
             // Skip over size
             pos += 12;
             // Test rec_pos == 0 to handle degenerate case of a hash of 0.
@@ -579,11 +577,11 @@ where
             if rec_hash == 0 && rec_pos == 0 {
                 // Seek to the element we found that was empty and write the hash and position into it.
                 let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                buffer[pos..pos + 8].copy_from_slice(&hash.to_ne_bytes());
+                buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
                 pos += 8;
-                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_ne_bytes());
+                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
                 pos += 8;
-                buffer[pos..pos + 4].copy_from_slice(&record_size.to_ne_bytes());
+                buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
                 return;
             }
             if rec_hash == hash {
@@ -593,11 +591,11 @@ where
                             // Overwrite the old element with the new in the index. This will leave
                             // garbage in the data file but lookups will work and be consistent.
                             let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                            buffer[pos..pos + 8].copy_from_slice(&hash.to_ne_bytes());
+                            buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
                             pos += 8;
-                            buffer[pos..pos + 8].copy_from_slice(&record_pos.to_ne_bytes());
+                            buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
                             pos += 8;
-                            buffer[pos..pos + 4].copy_from_slice(&record_size.to_ne_bytes());
+                            buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
                             return;
                         }
                     }
@@ -611,12 +609,12 @@ where
         if K::is_variable_key_size() {
             // Write a 0 key size to indicate this is an overflow bucket not a data record.
             self.write_buffer
-                .write_all(&0_u16.to_ne_bytes())
+                .write_all(&0_u16.to_le_bytes())
                 .expect("write_all to Vec is infallible");
         } else {
             // Write a 0 value size to indicate this is an overflow bucket not a data record.
             self.write_buffer
-                .write_all(&0_u32.to_ne_bytes())
+                .write_all(&0_u32.to_le_bytes())
                 .expect("write_all to Vec is infallible");
         }
         let overflow_pos = self.data_file_end + self.write_buffer.len() as u64;
@@ -627,11 +625,11 @@ where
         // clear buffer and reset to 0.
         buffer.fill(0);
         // Copy the position of the overflow record into the first u64.
-        buffer[0..8].copy_from_slice(&overflow_pos.to_ne_bytes());
+        buffer[0..8].copy_from_slice(&overflow_pos.to_le_bytes());
         // First element will be the hash and position being saved (rest of new bucket is empty).
-        buffer[8..16].copy_from_slice(&hash.to_ne_bytes());
-        buffer[16..24].copy_from_slice(&record_pos.to_ne_bytes());
-        buffer[24..28].copy_from_slice(&record_size.to_ne_bytes());
+        buffer[8..16].copy_from_slice(&hash.to_le_bytes());
+        buffer[16..24].copy_from_slice(&record_pos.to_le_bytes());
+        buffer[24..28].copy_from_slice(&record_size.to_le_bytes());
     }
 
     /// Read the record at position.
@@ -654,7 +652,7 @@ where
             let mut key_size = [0_u8; 2];
             key_size.copy_from_slice(&buffer[0..2]);
             pos += 2;
-            let key_size = u16::from_ne_bytes(key_size);
+            let key_size = u16::from_le_bytes(key_size);
             if key_size == 0 {
                 // Overflow bucket, can not read as data so error.
                 return Err(FetchError::UnexpectedOverflowBucket);
@@ -667,7 +665,7 @@ where
         let mut val_size_buf = [0_u8; 4];
         val_size_buf.copy_from_slice(&buffer[pos..pos + 4]);
         pos += 4;
-        let val_size = u32::from_ne_bytes(val_size_buf) as usize;
+        let val_size = u32::from_le_bytes(val_size_buf) as usize;
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
             return Err(FetchError::UnexpectedOverflowBucket);
@@ -701,7 +699,7 @@ where
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
             self.read_exact(&mut key_size)?;
-            let key_size = u16::from_ne_bytes(key_size);
+            let key_size = u16::from_le_bytes(key_size);
             key_size as usize
         } else {
             K::KEY_SIZE as usize
@@ -814,7 +812,7 @@ impl<'src, R: Read + Seek> BucketIter<'src, R> {
     fn new(dat_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> Self {
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
-        let overflow_pos = u64::from_ne_bytes(buf);
+        let overflow_pos = u64::from_le_bytes(buf);
         Self {
             dat_file,
             buffer,
@@ -837,13 +835,13 @@ impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
             if self.bucket_pos < self.elements as usize {
                 let mut pos = 8 + (self.bucket_pos * BUCKET_ELEMENT_SIZE);
                 buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
-                let hash = u64::from_ne_bytes(buf64);
+                let hash = u64::from_le_bytes(buf64);
                 pos += 8;
                 buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
-                let rec_pos = u64::from_ne_bytes(buf64);
+                let rec_pos = u64::from_le_bytes(buf64);
                 pos += 8;
                 buf32.copy_from_slice(&self.buffer[pos..(pos + 4)]);
-                let rec_size = u32::from_ne_bytes(buf32);
+                let rec_size = u32::from_le_bytes(buf32);
                 if hash == 0 && rec_pos == 0 {
                     self.bucket_pos += 1;
                 } else {
@@ -858,7 +856,7 @@ impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
                 self.dat_file.read_exact(&mut self.buffer[..]).ok()?;
                 self.bucket_pos = 0;
                 buf64.copy_from_slice(&self.buffer[0..8]);
-                self.overflow_pos = u64::from_ne_bytes(buf64);
+                self.overflow_pos = u64::from_le_bytes(buf64);
             } else {
                 return None;
             }
@@ -884,14 +882,14 @@ impl DbKey<8> for u64 {}
 impl DbBytes<u64> for u64 {
     fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
         buffer.resize(8, 0);
-        buffer.copy_from_slice(&self.to_ne_bytes());
+        buffer.copy_from_slice(&self.to_le_bytes());
         Ok(())
     }
 
     fn deserialize(buffer: &[u8]) -> Result<u64, DeserializeError> {
         let mut buf = [0_u8; 8];
         buf.copy_from_slice(buffer);
-        Ok(Self::from_ne_bytes(buf))
+        Ok(Self::from_le_bytes(buf))
     }
 }
 

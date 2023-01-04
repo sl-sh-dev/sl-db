@@ -1,11 +1,14 @@
 //! Contains the Hash Index (HDX) structure and code.
 
-use crate::db::byte_trans::ByteTrans;
 use crate::db::data_header::DataHeader;
 use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Size of an index header.
+pub const HDX_HEADER_SIZE: usize = 124;
+const RESERVED_BYTES: usize = 64;
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
@@ -21,13 +24,7 @@ pub(crate) struct HdxHeader {
     pepper: u64,
     load_factor: u16,
     values: u64,
-    reserved: [u8; 64], // Zeroes
-}
-
-impl AsRef<[u8]> for HdxHeader {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { Self::as_bytes(self) }
-    }
+    reserved: [u8; RESERVED_BYTES], // Zeroes
 }
 
 impl HdxHeader {
@@ -46,42 +43,105 @@ impl HdxHeader {
             salt: 0,
             pepper: 0,
             values: 0,
-            reserved: [0; 64],
+            reserved: [0; RESERVED_BYTES],
         }
     }
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
     pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
-        let mut header = Self {
-            type_id: *b"sldb.hdx",
-            version: 0,
-            uid: 0,
-            appnum: 0,
-            buckets: 0,
-            bucket_elements: 0,
-            bucket_size: 0,
-            salt: 0,
-            pepper: 0,
-            load_factor: u16::MAX / 2, // .5
-            values: 0,
-            reserved: [0; 64],
-        };
         source.seek(SeekFrom::Start(0))?;
-        // TODO- load this in pieces to avoid the unsafe as well handle byte ordering.
-        unsafe {
-            source.read_exact(HdxHeader::as_bytes_mut(&mut header))?;
-        }
-
-        if &header.type_id != b"sldb.hdx" {
+        let mut buffer = [0_u8; HDX_HEADER_SIZE];
+        let mut buf16 = [0_u8; 2];
+        let mut buf32 = [0_u8; 4];
+        let mut buf64 = [0_u8; 8];
+        let mut pos = 0;
+        source.read_exact(&mut buffer[..])?;
+        let mut type_id = [0_u8; 8];
+        type_id.copy_from_slice(&buffer[0..8]);
+        pos += 8;
+        if &type_id != b"sldb.hdx" {
             return Err(LoadHeaderError::InvalidType);
         }
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let version = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let uid = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let appnum = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let buckets = u32::from_le_bytes(buf32);
+        pos += 4;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let bucket_elements = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let bucket_size = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let salt = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let pepper = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let load_factor = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let values = u64::from_le_bytes(buf64);
+        pos += 8;
+        let mut reserved = [0_u8; RESERVED_BYTES];
+        reserved.copy_from_slice(&buffer[pos..(pos + RESERVED_BYTES)]);
+        let header = Self {
+            type_id,
+            version,
+            uid,
+            appnum,
+            buckets,
+            bucket_elements,
+            bucket_size,
+            salt,
+            pepper,
+            load_factor,
+            values,
+            reserved,
+        };
         Ok(header)
     }
 
     /// Write this header to sync at current seek position.
     pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
-        sync.write_all(self.as_ref())?;
+        let mut buffer = [0_u8; HDX_HEADER_SIZE];
+        let mut pos = 0;
+        buffer[pos..8].copy_from_slice(&self.type_id);
+        pos += 8;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.version.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.buckets.to_le_bytes());
+        pos += 4;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_elements.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_size.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.salt.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.pepper.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.load_factor.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.values.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + RESERVED_BYTES)].copy_from_slice(&self.reserved);
+        pos += RESERVED_BYTES;
+        assert_eq!(pos, HDX_HEADER_SIZE);
+        sync.write_all(&buffer)?;
         Ok(())
     }
 
