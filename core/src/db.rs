@@ -77,7 +77,7 @@ where
     // It is a Cell for interior mutability so we can use avoid borrow errors.
     scratch_buffer: Cell<Vec<u8>>,
     write_buffer: Vec<u8>,
-    index_cache: FxHashMap<K, (u64, u64, u32)>,
+    bucket_cache: FxHashMap<u64, Vec<u8>>,
     hdx_header: HdxHeader,
     modulus: u32,
     load_factor: f32,
@@ -102,10 +102,14 @@ macro_rules! bucket_iter {
                 .expect("this can't be null")
         };
         let mut buffer = vec![0; $db.hdx_header.bucket_size() as usize];
-        let bucket_size = $db.hdx_header.bucket_size() as usize;
-        let bucket_pos: u64 = (HDX_HEADER_SIZE + ($bucket * bucket_size)) as u64;
-        if let Ok(_) = $db.hdx_file.seek(SeekFrom::Start(bucket_pos)) {
-            let _ = $db.hdx_file.read_exact(&mut buffer);
+        if let Some(bucket) = $db.bucket_cache.get(&$bucket) {
+            buffer.copy_from_slice(&bucket);
+        } else {
+            let bucket_size = $db.hdx_header.bucket_size() as usize;
+            let bucket_pos: u64 = (HDX_HEADER_SIZE + ($bucket as usize * bucket_size)) as u64;
+            if let Ok(_) = $db.hdx_file.seek(SeekFrom::Start(bucket_pos)) {
+                let _ = $db.hdx_file.read_exact(&mut buffer);
+            }
         }
         BucketIter::new(unsafe_db, buffer, $db.hdx_header.bucket_elements())
     }};
@@ -144,10 +148,10 @@ where
             Self::open_hdx_file(&hdx_name, &header, &config).map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
-        let (write_buffer, index_cache) = if config.write {
-            let mut index_cache = FxHashMap::default();
-            index_cache.reserve(50000);
-            (Vec::with_capacity(INSERT_BUFFER_SIZE + 1024), index_cache)
+        let (write_buffer, bucket_cache) = if config.write {
+            let mut bucket_cache = FxHashMap::default();
+            bucket_cache.reserve(500);
+            (Vec::with_capacity(INSERT_BUFFER_SIZE + 1024), bucket_cache)
         } else {
             // If opening read only wont need capacity.
             (Vec::new(), FxHashMap::default())
@@ -164,7 +168,7 @@ where
             capacity: hdx_header.buckets() as u64 * hdx_header.bucket_elements() as u64,
             scratch_buffer: Cell::new(Vec::new()),
             write_buffer,
-            index_cache,
+            bucket_cache,
             seek_pos: 0,
             config,
             _key: PhantomData,
@@ -174,22 +178,15 @@ where
 
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, key: &K) -> Result<V, FetchError> {
-        if let Some((_hash, rec_pos, rec_size)) = self.index_cache.get(key) {
-            // Try the index cache.
-            let (_, val) = self.read_record(*rec_pos, *rec_size as usize)?;
-            return Ok(val);
-        } else {
-            // Then check the on disk index.
-            let hash = self.hash(key);
-            let bucket = self.get_bucket(hash) as usize;
+        let hash = self.hash(key);
+        let bucket = self.get_bucket(hash);
 
-            for (rec_hash, rec_pos, rec_size) in bucket_iter!(self, bucket) {
-                // rec_pos > 0 handles degenerate case of a 0 hash.
-                if hash == rec_hash && rec_pos > 0 {
-                    let (rkey, val) = self.read_record(rec_pos, rec_size as usize)?;
-                    if &rkey == key {
-                        return Ok(val);
-                    }
+        for (rec_hash, rec_pos, rec_size) in bucket_iter!(self, bucket) {
+            // rec_pos > 0 handles degenerate case of a 0 hash.
+            if hash == rec_hash && rec_pos > 0 {
+                let (rkey, val) = self.read_record(rec_pos, rec_size as usize)?;
+                if &rkey == key {
+                    return Ok(val);
                 }
             }
         }
@@ -198,20 +195,14 @@ where
 
     /// True if the database contains key.
     pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
-        if self.index_cache.contains_key(key) {
-            // Try the index cache.
-            return Ok(true);
-        } else {
-            // Then check the on disk index.
-            let hash = self.hash(key);
-            let bucket = self.get_bucket(hash) as usize;
-            for (rec_hash, rec_pos, _rec_size) in bucket_iter!(self, bucket) {
-                // rec_pos > 0 handles degenerate case of a 0 hash.
-                if hash == rec_hash && rec_pos > 0 {
-                    let rkey = self.read_key(rec_pos)?;
-                    if &rkey == key {
-                        return Ok(true);
-                    }
+        let hash = self.hash(key);
+        let bucket = self.get_bucket(hash);
+        for (rec_hash, rec_pos, _rec_size) in bucket_iter!(self, bucket) {
+            // rec_pos > 0 handles degenerate case of a 0 hash.
+            if hash == rec_hash && rec_pos > 0 {
+                let rkey = self.read_key(rec_pos)?;
+                if &rkey == key {
+                    return Ok(true);
                 }
             }
         }
@@ -284,17 +275,20 @@ where
 
             // An early return on error could cause a new buffer to be created, should not be a big deal.
             self.scratch_buffer.set(buffer);
-            self.index_cache.insert(
-                key,
+            self.expand_buckets();
+            self.save_to_bucket(
+                &key,
+                hash,
                 (
-                    hash,
                     record_pos,
                     (self.write_buffer.len() - start_write_buffer_len) as u32,
                 ),
-            );
+            )
+            .map_err(InsertError::KeyError)?;
             if self.config.auto_flush {
                 if self.config.cache_writes {
-                    if self.index_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE
+                    if self.bucket_cache.len() > 200
+                        || self.write_buffer.len() >= INSERT_BUFFER_SIZE
                     {
                         self.flush()?;
                     }
@@ -354,23 +348,8 @@ where
             self.data_file_end += self.write_buffer.len() as u64;
             self.write_buffer.clear();
         }
-        self.expand_buckets().map_err(FlushError::ExpandBuckets)?;
-        {
-            // Do this so we can call save_to_bucket while iterating the index_cache.
-            // This should be safe since save_to_bucket does not touch the index_cache.
-            // Maybe put index_cache in a Cell to avoid this unsafe?
-            let unsafe_db: &mut DbCore<K, V, KSIZE, S> =
-                unsafe { (self as *mut DbCore<K, V, KSIZE, S>).as_mut().unwrap() };
-            let mut bucket_cache: FxHashMap<u64, Vec<u8>> = FxHashMap::default();
-            for (key, (hash, pos, size)) in &self.index_cache {
-                unsafe_db
-                    .save_to_bucket(key, *hash, (*pos, *size), &mut bucket_cache)
-                    .map_err(FlushError::SaveToBucket)?;
-            }
-            self.save_bucket_cache(&mut bucket_cache)
-                .map_err(FlushError::WriteIndexData)?;
-        }
-        self.index_cache.clear();
+        self.save_bucket_cache()
+            .map_err(FlushError::WriteIndexData)?;
         self.hdx_file
             .seek(SeekFrom::Start(0))
             .map_err(FlushError::IndexHeader)?;
@@ -456,22 +435,21 @@ where
     }
 
     /// Add one new bucket to the hash index.
-    fn split_one_bucket(&mut self) -> Result<(), ReadKeyError> {
+    fn split_one_bucket(&mut self) {
+        //-> Result<(), ReadKeyError> {
         let old_modulus = self.modulus;
-        let split_bucket = (self.hdx_header.buckets() - (old_modulus / 2)) as usize;
+        let split_bucket = (self.hdx_header.buckets() - (old_modulus / 2)) as u64;
         self.hdx_header.inc_buckets();
         // Don't want buckets and modulus to be the same, so +1
         self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
 
-        let mut buffer = self.scratch_buffer.take();
-        buffer.clear();
-        buffer.resize(self.hdx_header.bucket_size() as usize, 0);
+        let mut buffer = vec![0; self.hdx_header.bucket_size() as usize];
         let mut buffer2 = vec![0; self.hdx_header.bucket_size() as usize];
 
         for (rec_hash, rec_pos, rec_size) in bucket_iter!(self, split_bucket) {
             if rec_pos > 0 {
                 let bucket = self.get_bucket(rec_hash);
-                if bucket != split_bucket as u64 && bucket != self.hdx_header.buckets() as u64 - 1 {
+                if bucket != split_bucket && bucket != self.hdx_header.buckets() as u64 - 1 {
                     panic!(
                         "got bucket {}, expected {} or {}, mod {}",
                         bucket,
@@ -480,37 +458,27 @@ where
                         self.modulus
                     );
                 }
-                if bucket as usize == split_bucket {
+                if bucket == split_bucket {
                     self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer);
                 } else {
                     self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer2);
                 }
             }
         }
-
-        // Overwrite the existing bucket with a new blank bucket and add a new empty bucket to the end.
-        let bucket_pos: u64 = (HDX_HEADER_SIZE
-            + (split_bucket as usize * self.hdx_header.bucket_size() as usize))
-            as u64;
-        self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-        self.hdx_file.write_all(&buffer)?;
-        self.hdx_file.seek(SeekFrom::End(0))?;
-        self.hdx_file.write_all(&buffer2)?;
-        self.scratch_buffer.set(buffer);
-
-        Ok(())
+        self.bucket_cache.insert(split_bucket, buffer);
+        self.bucket_cache
+            .insert(self.hdx_header.buckets() as u64 - 1, buffer2);
     }
 
     /// Add buckets to expand capacity.
-    fn expand_buckets(&mut self) -> Result<(), ReadKeyError> {
+    fn expand_buckets(&mut self) {
         if self.config.allow_bucket_expansion {
             while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
-                self.split_one_bucket()?;
+                self.split_one_bucket();
                 self.capacity =
                     self.hdx_header.buckets() as u64 * self.hdx_header.bucket_elements() as u64;
             }
         }
-        Ok(())
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
@@ -519,10 +487,9 @@ where
         key: &K,
         hash: u64,
         pos_size: (u64, u32),
-        cache: &mut FxHashMap<u64, Vec<u8>>,
     ) -> Result<(), ReadKeyError> {
         let bucket = self.get_bucket(hash);
-        let mut buffer = if let Some(buf) = cache.remove(&bucket) {
+        let mut buffer = if let Some(buf) = self.bucket_cache.remove(&bucket) {
             buf
         } else {
             let mut buffer = vec![0; self.hdx_header.bucket_size() as usize];
@@ -537,16 +504,17 @@ where
         };
 
         self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer);
-        cache.insert(bucket, buffer);
+        self.bucket_cache.insert(bucket, buffer);
         Ok(())
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_bucket_cache(&mut self, cache: &mut FxHashMap<u64, Vec<u8>>) -> Result<(), io::Error> {
-        for (bucket, buffer) in cache.drain() {
+    fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
+        for (bucket, buffer) in self.bucket_cache.drain() {
             let bucket_pos: u64 = (HDX_HEADER_SIZE
                 + (bucket as usize * self.hdx_header.bucket_size() as usize))
                 as u64;
+            // Seeking and writing past the file end seems to extend the file correctly.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer)?;
         }
