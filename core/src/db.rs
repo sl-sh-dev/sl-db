@@ -864,9 +864,9 @@ impl DbBytes<u64> for u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::err_info;
-    use crate::error::source::SourceError;
-    use std::io::ErrorKind;
+    //use crate::err_info;
+    //use crate::error::source::SourceError;
+    //use std::io::ErrorKind;
     use std::time;
 
     #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
@@ -1009,19 +1009,21 @@ mod tests {
 
     #[test]
     fn test_50k() {
-        let e: Box<dyn std::error::Error + Send + Sync> =
+        /*let e: Box<dyn std::error::Error + Send + Sync> =
             std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
         let e: SourceError = e.into();
         assert!(e.is::<std::io::Error>());
         if let Some(e) = e.downcast_ref::<std::io::Error>() {
             println!("XXXX {:?}", e);
         }
-        println!("{}", err_info!());
+        println!("{}", err_info!());*/
         let mut db: DbCore<u64, String, 8> = DbConfig::new(".", "xxx50k", 1)
             .create()
             .truncate()
             .allow_duplicate_inserts()
             .no_auto_flush()
+            //.set_bucket_elements(8)
+            //.set_load_factor(0.5)
             .build()
             .unwrap();
         assert!(!db.contains_key(&0).unwrap());
@@ -1029,24 +1031,24 @@ mod tests {
         assert!(!db.contains_key(&35_000).unwrap());
         assert!(!db.contains_key(&49_000).unwrap());
         assert!(!db.contains_key(&50_000).unwrap());
+        let max = 1_000_000;
         let start = time::Instant::now();
-        for i in 0_u64..50_000 {
+        for i in 0_u64..max {
             db.insert(i, &format!("Value {}", i)).unwrap();
-            if i % 10000 == 0 {
+            if i % 100_000 == 0 {
                 db.commit().unwrap();
             }
         }
         println!("XXXX insert time {}", start.elapsed().as_secs_f64());
-        assert_eq!(db.len(), 50_000);
+        assert_eq!(db.len(), max as usize);
         assert!(db.contains_key(&0).unwrap());
         assert!(db.contains_key(&10).unwrap());
         assert!(db.contains_key(&35_000).unwrap());
         assert!(db.contains_key(&49_000).unwrap());
-        assert!(!db.contains_key(&50_000).unwrap());
+        assert!(!db.contains_key(&max).unwrap());
 
         let start = time::Instant::now();
-        assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
-        for i in 0..50_000 {
+        for i in 0..max {
             let item = db.fetch(&(i as u64));
             assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
             assert_eq!(&item.unwrap(), &format!("Value {}", i));
@@ -1061,14 +1063,14 @@ mod tests {
         println!("XXXX commit time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
         let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
-        assert_eq!(vals.len(), 50_000);
+        assert_eq!(vals.len(), max as usize);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
         }
         println!("XXXX iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
         assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
-        for i in 0..50_000 {
+        for i in 0..max {
             let item = db.fetch(&(i as u64));
             assert!(item.is_ok(), "Failed on item {}", i);
             assert_eq!(&item.unwrap(), &format!("Value {}", i));

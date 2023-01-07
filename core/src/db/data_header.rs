@@ -14,7 +14,7 @@ const HEADER_BYTES: usize = 94;
 #[repr(C)]
 pub(crate) struct DataHeader {
     type_id: [u8; 8],     // The characters "sldb.dat"
-    version: u16,         //Holds the version number
+    version: u16,         // Holds the version number
     uid: u64,             // Unique ID generated on creation
     appnum: u64,          // Application defined constant
     bucket_size: u16,     // Size of a bucket, record this here in case index is lost.

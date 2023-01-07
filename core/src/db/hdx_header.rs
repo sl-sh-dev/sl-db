@@ -14,7 +14,7 @@ const RESERVED_BYTES: usize = 64;
 #[repr(C)]
 pub(crate) struct HdxHeader {
     type_id: [u8; 8], // The characters "sldb.hdx"
-    version: u16,     //Holds the version number
+    version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
     appnum: u64,      // Application defined constant
     buckets: u32,

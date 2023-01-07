@@ -47,7 +47,7 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        let (insert_tx, insert_rx) = mpsc::channel(20_000);
+        let (insert_tx, insert_rx) = mpsc::channel(100_000);
         // Open the write db (passed to the insert thread).
         let db = DbCore::open(config.clone())?;
         // Open a read only DB for fetching, reduces locks.
@@ -273,6 +273,8 @@ mod tests {
             .no_auto_flush()
             .create()
             .allow_duplicate_inserts()
+            //.set_bucket_elements(8)
+            //.set_load_factor(0.5)
             .truncate(); //.no_write_cache();
         let db: AsyncDb<u64, String, 8> = AsyncDb::open(config).unwrap();
         assert!(!db.contains_key(0).await.unwrap());
@@ -280,52 +282,61 @@ mod tests {
         assert!(!db.contains_key(35_000).await.unwrap());
         assert!(!db.contains_key(49_000).await.unwrap());
         assert!(!db.contains_key(50_000).await.unwrap());
+        let max = 1_000_000;
 
         let start = time::Instant::now();
-        for i in 0_u64..50_000 {
+        for i in 0_u64..max {
             db.insert(i, format!("Value {}", i)).await;
-            if i % 10000 == 0 {
+            if i % 100_000 == 0 {
                 db.commit_bg().await; //.unwrap();
                                       //db.commit().await.unwrap();
             }
         }
-        println!("XXXX insert time {}", start.elapsed().as_secs_f64());
+        println!(
+            "XXXX TOK insert({}) time {}",
+            max,
+            start.elapsed().as_secs_f64()
+        );
         //assert_eq!(db.len(), 50_000);
         assert!(db.contains_key(0).await.unwrap());
         assert!(db.contains_key(10).await.unwrap());
         assert!(db.contains_key(35_000).await.unwrap());
         assert!(db.contains_key(49_000).await.unwrap());
-        assert!(!db.contains_key(50_000).await.unwrap());
+        assert!(!db.contains_key(max).await.unwrap());
 
         let start = time::Instant::now();
         assert_eq!(&db.fetch(35_000).await.unwrap(), "Value 35000");
-        for i in 0..50_000 {
+        for i in 0..max {
             let item = db.fetch(i as u64).await;
             assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
             assert_eq!(&item.unwrap(), &format!("Value {}", i));
         }
         println!(
-            "XXXX fetch (pre commit) time {}",
+            "XXXX TOK fetch ({}) (pre commit) time {}",
+            max,
             start.elapsed().as_secs_f64()
         );
 
         let start = time::Instant::now();
         db.commit().await.unwrap();
-        println!("XXXX commit time {}", start.elapsed().as_secs_f64());
+        println!("XXXX TOK commit time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
         let vals: Vec<String> = db.raw_iter().await.unwrap().map(|(_k, v)| v).collect();
-        assert_eq!(vals.len(), 50_000);
+        assert_eq!(vals.len(), max as usize);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
         }
-        println!("XXXX iter time {}", start.elapsed().as_secs_f64());
+        println!("XXXX TOK iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
-        assert_eq!(&db.fetch(35_000).await.unwrap(), "Value 35000");
-        for i in 0..50_000 {
+        for i in 0..max {
             let item = db.fetch(i as u64).await;
             assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
             assert_eq!(&item.unwrap(), &format!("Value {}", i));
         }
-        println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
+        println!(
+            "XXXX TOK fetch ({}) time {}",
+            max,
+            start.elapsed().as_secs_f64()
+        );
     }
 }

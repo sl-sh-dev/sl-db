@@ -131,6 +131,12 @@ impl DbConfig {
         self
     }
 
+    /// Set the load factor, this will determine the extra bucket capacity to maintain.
+    pub fn set_load_factor(mut self, load_factor: f32) -> Self {
+        self.load_factor = load_factor;
+        self
+    }
+
     /// Consumes the config and builds a Db.
     pub fn build<K, V, const KSIZE: u16, S>(self) -> Result<DbCore<K, V, KSIZE, S>, OpenError>
     where
