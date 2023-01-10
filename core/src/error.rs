@@ -142,6 +142,8 @@ pub enum LoadHeaderError {
     InvalidType,
     /// An underlying IO error while loading the header
     IO(io::Error),
+    /// CRC failed on header data.
+    CrcFailed,
 }
 
 impl Error for LoadHeaderError {}
@@ -151,6 +153,7 @@ impl fmt::Display for LoadHeaderError {
         match &self {
             Self::InvalidType => write!(f, "invalid type id"),
             Self::IO(e) => write!(f, "io: {}", e),
+            Self::CrcFailed => write!(f, "invalid crc32 checksum"),
         }
     }
 }

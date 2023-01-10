@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 // Each bucket element is a (u64, u64, u32)- (hash, record_pos, record_size).
 pub(crate) const BUCKET_ELEMENT_SIZE: usize = 20;
-const HEADER_BYTES: usize = 94;
+const HEADER_BYTES: usize = 34;
 
 /// Struct that contains the header for a sldb data file.
 #[derive(Debug, Copy, Clone)]
@@ -19,12 +19,11 @@ pub(crate) struct DataHeader {
     appnum: u64,          // Application defined constant
     bucket_size: u16,     // Size of a bucket, record this here in case index is lost.
     bucket_elements: u16, // Elements in each bucket, record this here in case index is lost.
-    reserved: [u8; 64],   // Zeroes
 }
 
 impl DataHeader {
     pub fn new(config: &DbConfig) -> Self {
-        let bucket_size: u16 = config.bucket_size; //8 + (BUCKET_ELEMENT_SIZE as u16 * config.bucket_elements);
+        let bucket_size: u16 = config.bucket_size;
         Self {
             type_id: *b"sldb.dat",
             version: 0,
@@ -32,7 +31,6 @@ impl DataHeader {
             appnum: config.appnum,
             bucket_elements: config.bucket_elements,
             bucket_size,
-            reserved: [0; 64],
         }
     }
 
@@ -41,9 +39,18 @@ impl DataHeader {
         source.seek(SeekFrom::Start(0))?;
         let mut buffer = [0_u8; HEADER_BYTES];
         let mut buf16 = [0_u8; 2];
+        let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
         source.read_exact(&mut buffer[..])?;
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&buffer[..(HEADER_BYTES - 4)]);
+        let calc_crc32 = crc32_hasher.finalize();
+        buf32.copy_from_slice(&buffer[(HEADER_BYTES - 4)..]);
+        let read_crc32 = u32::from_le_bytes(buf32);
+        if calc_crc32 != read_crc32 {
+            return Err(LoadHeaderError::CrcFailed);
+        }
         let mut type_id = [0_u8; 8];
         type_id.copy_from_slice(&buffer[0..8]);
         pos += 8;
@@ -64,9 +71,6 @@ impl DataHeader {
         pos += 2;
         buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
         let bucket_elements = u16::from_le_bytes(buf16);
-        pos += 2;
-        let mut reserved = [0_u8; 64];
-        reserved.copy_from_slice(&buffer[pos..(pos + 64)]);
         let header = Self {
             type_id,
             version,
@@ -74,7 +78,6 @@ impl DataHeader {
             appnum,
             bucket_elements,
             bucket_size,
-            reserved,
         };
         Ok(header)
     }
@@ -95,8 +98,11 @@ impl DataHeader {
         pos += 2;
         buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_elements.to_le_bytes());
         pos += 2;
-        buffer[pos..(pos + 64)].copy_from_slice(&self.reserved);
-        pos += 64;
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&buffer[..pos]);
+        let crc32 = crc32_hasher.finalize();
+        buffer[pos..(pos + 4)].copy_from_slice(&crc32.to_le_bytes());
+        pos += 4;
         assert_eq!(pos, HEADER_BYTES);
         sync.write_all(&buffer)?;
         Ok(())

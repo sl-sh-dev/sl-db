@@ -7,8 +7,7 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Size of an index header.
-pub const HDX_HEADER_SIZE: usize = 124;
-const RESERVED_BYTES: usize = 64;
+pub const HDX_HEADER_SIZE: usize = 64;
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
@@ -24,7 +23,6 @@ pub(crate) struct HdxHeader {
     pepper: u64,
     load_factor: u16,
     values: u64,
-    reserved: [u8; RESERVED_BYTES], // Zeroes
 }
 
 impl HdxHeader {
@@ -43,7 +41,6 @@ impl HdxHeader {
             salt: 0,
             pepper: 0,
             values: 0,
-            reserved: [0; RESERVED_BYTES],
         }
     }
 
@@ -57,6 +54,14 @@ impl HdxHeader {
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
         source.read_exact(&mut buffer[..])?;
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&buffer[..(HDX_HEADER_SIZE - 4)]);
+        let calc_crc32 = crc32_hasher.finalize();
+        buf32.copy_from_slice(&buffer[(HDX_HEADER_SIZE - 4)..]);
+        let read_crc32 = u32::from_le_bytes(buf32);
+        if calc_crc32 != read_crc32 {
+            return Err(LoadHeaderError::CrcFailed);
+        }
         let mut type_id = [0_u8; 8];
         type_id.copy_from_slice(&buffer[0..8]);
         pos += 8;
@@ -92,9 +97,6 @@ impl HdxHeader {
         pos += 2;
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let values = u64::from_le_bytes(buf64);
-        pos += 8;
-        let mut reserved = [0_u8; RESERVED_BYTES];
-        reserved.copy_from_slice(&buffer[pos..(pos + RESERVED_BYTES)]);
         let header = Self {
             type_id,
             version,
@@ -107,7 +109,6 @@ impl HdxHeader {
             pepper,
             load_factor,
             values,
-            reserved,
         };
         Ok(header)
     }
@@ -138,8 +139,11 @@ impl HdxHeader {
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.values.to_le_bytes());
         pos += 8;
-        buffer[pos..(pos + RESERVED_BYTES)].copy_from_slice(&self.reserved);
-        pos += RESERVED_BYTES;
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&buffer[..pos]);
+        let crc32 = crc32_hasher.finalize();
+        buffer[pos..(pos + 4)].copy_from_slice(&crc32.to_le_bytes());
+        pos += 4;
         assert_eq!(pos, HDX_HEADER_SIZE);
         sync.write_all(&buffer)?;
         Ok(())
