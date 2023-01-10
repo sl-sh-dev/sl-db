@@ -73,9 +73,11 @@ where
         file: &mut R,
         buffer: &mut Vec<u8>,
     ) -> Result<(K, V), FetchError> {
+        let mut crc32_hasher = crc32fast::Hasher::new();
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
             file.read_exact(&mut key_size)?;
+            crc32_hasher.update(&key_size);
             let key_size = u16::from_le_bytes(key_size);
             if key_size == 0 {
                 // Overflow bucket, can not read as data so error.
@@ -88,6 +90,7 @@ where
 
         let mut val_size_buf = [0_u8; 4];
         file.read_exact(&mut val_size_buf)?;
+        crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
@@ -95,10 +98,19 @@ where
         }
         buffer.resize(key_size as usize, 0);
         file.read_exact(buffer)?;
+        crc32_hasher.update(buffer);
         let key = K::deserialize(&buffer[..]).map_err(FetchError::DeserializeKey)?;
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
+        crc32_hasher.update(buffer);
+        let calc_crc32 = crc32_hasher.finalize();
         let val = V::deserialize(&buffer[..]).map_err(FetchError::DeserializeValue)?;
+        let mut buf_u32 = [0_u8; 4];
+        file.read_exact(&mut buf_u32)?;
+        let read_crc32 = u32::from_le_bytes(buf_u32);
+        if calc_crc32 != read_crc32 {
+            return Err(FetchError::CrcFailed);
+        }
         Ok((key, val))
     }
 }

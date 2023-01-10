@@ -272,19 +272,19 @@ where
             self.write_buffer
                 .write_all(&buffer)
                 .expect("write_all to Vec is infallible");
+            let mut crc32_hasher = crc32fast::Hasher::new();
+            crc32_hasher.update(&self.write_buffer[start_write_buffer_len..]);
+            let crc32 = crc32_hasher.finalize();
+            self.write_buffer
+                .write_all(&crc32.to_le_bytes())
+                .expect("write_all to Vec is infallible");
+            let record_size = (self.write_buffer.len() - start_write_buffer_len) as u32;
 
             // An early return on error could cause a new buffer to be created, should not be a big deal.
             self.scratch_buffer.set(buffer);
             self.expand_buckets();
-            self.save_to_bucket(
-                &key,
-                hash,
-                (
-                    record_pos,
-                    (self.write_buffer.len() - start_write_buffer_len) as u32,
-                ),
-            )
-            .map_err(InsertError::KeyError)?;
+            self.save_to_bucket(&key, hash, (record_pos, record_size))
+                .map_err(InsertError::KeyError)?;
             if self.config.auto_flush {
                 if self.config.cache_writes {
                     if self.bucket_cache.len() > 200
@@ -610,11 +610,20 @@ where
         size: usize,
         buffer: &mut Vec<u8>,
     ) -> Result<(K, V), FetchError> {
+        let mut crc32_hasher = crc32fast::Hasher::new();
         buffer.resize(size, 0);
         // Move the read cursor to position.  Note the data file is opened in append mode so write
         // cursor is always EOF.
         self.seek(SeekFrom::Start(position))?;
         self.read_exact(&mut buffer[..])?;
+        crc32_hasher.update(&buffer[..(size - 4)]);
+        let calc_crc32 = crc32_hasher.finalize();
+        let mut buf_32 = [0_u8; 4];
+        buf_32.copy_from_slice(&buffer[(size - 4)..]);
+        let read_crc32 = u32::from_le_bytes(buf_32);
+        if calc_crc32 != read_crc32 {
+            return Err(FetchError::CrcFailed);
+        }
         let mut pos = 0;
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
@@ -630,10 +639,9 @@ where
             K::KEY_SIZE
         } as usize;
 
-        let mut val_size_buf = [0_u8; 4];
-        val_size_buf.copy_from_slice(&buffer[pos..pos + 4]);
+        buf_32.copy_from_slice(&buffer[pos..pos + 4]);
         pos += 4;
-        let val_size = u32::from_le_bytes(val_size_buf) as usize;
+        let val_size = u32::from_le_bytes(buf_32) as usize;
         if K::is_fixed_key_size() && val_size == 0 {
             // No key size so overflow indicated by a 0 value size.
             return Err(FetchError::UnexpectedOverflowBucket);
@@ -1099,7 +1107,8 @@ mod tests {
         assert_eq!(&db.fetch(&"key 35000".to_string()).unwrap(), "Value 35000");
         for i in 0..50_000 {
             assert_eq!(
-                &db.fetch(&format!("key {i}")).unwrap(),
+                &db.fetch(&format!("key {i}"))
+                    .unwrap_or_else(|_| panic!("Failed to read item {}", i)),
                 &format!("Value {}", i)
             );
         }
