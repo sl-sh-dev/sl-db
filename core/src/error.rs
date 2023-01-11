@@ -193,8 +193,6 @@ impl fmt::Display for OpenError {
 /// Error on reading a DB record.
 #[derive(Debug)]
 pub enum FetchError {
-    /// Found an overflow bucket instead of a record in the data file.
-    UnexpectedOverflowBucket,
     /// Failed to deserialize the key.
     DeserializeKey(DeserializeError),
     /// Failed to deserialize the value.
@@ -212,7 +210,6 @@ impl Error for FetchError {}
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::UnexpectedOverflowBucket => write!(f, "unexpected overflow bucket"),
             Self::DeserializeKey(e) => write!(f, "deserialize key: {}", e),
             Self::DeserializeValue(e) => write!(f, "deserialize value: {}", e),
             Self::IO(e) => write!(f, "io: {}", e),

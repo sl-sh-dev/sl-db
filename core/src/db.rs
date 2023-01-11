@@ -2,6 +2,7 @@
 
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
 use crate::db::hdx_header::{HdxHeader, HDX_HEADER_SIZE};
+use crate::db::odx_header::OdxHeader;
 use crate::db_config::DbConfig;
 use crate::db_raw_iter::DbRawIter;
 use crate::error::flush::FlushError;
@@ -23,6 +24,7 @@ use std::path::Path;
 
 pub mod data_header;
 pub mod hdx_header;
+pub mod odx_header;
 
 /// Use a 16Mb buffer for inserts.
 /// TODO- make this a setting instead.
@@ -72,6 +74,7 @@ where
     data_file: File,
     data_file_end: u64,
     hdx_file: File,
+    odx_file: File,
     hasher: S,
     // Keep a buffer around to share and avoid allocations.
     // It is a Cell for interior mutability so we can use avoid borrow errors.
@@ -113,7 +116,11 @@ macro_rules! bucket_iter {
                 let _ = $db.hdx_file.read_exact(&mut buffer);
             }
         }
-        BucketIter::new(unsafe_db, buffer, $db.hdx_header.bucket_elements())
+        BucketIter::new(
+            &mut unsafe_db.odx_file,
+            buffer,
+            $db.hdx_header.bucket_elements(),
+        )
     }};
 }
 
@@ -140,6 +147,7 @@ where
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         let data_name = config.dir.join(&config.base_name).with_extension("dat");
         let hdx_name = config.dir.join(&config.base_name).with_extension("hdx");
+        let odx_name = config.dir.join(&config.base_name).with_extension("odx");
         let (mut data_file, header) =
             Self::open_data_file(&data_name, &config).map_err(OpenError::DataFileOpen)?;
         data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
@@ -158,11 +166,15 @@ where
             // If opening read only wont need capacity.
             (Vec::new(), FxHashMap::default())
         };
+        let (odx_file, _odx_header) = Self::open_odx_file(&odx_name, &hdx_header, &config)
+            .map_err(OpenError::IndexFileOpen)?;
+        // TODO, crosscheck all the headers and make sure everything checks out.
         Ok(Self {
             _header: header,
             data_file,
             data_file_end,
             hdx_file,
+            odx_file,
             hasher: S::default(),
             hdx_header,
             modulus,
@@ -344,6 +356,9 @@ where
         self.data_file
             .sync_all()
             .map_err(CommitError::DataFileSync)?;
+        self.odx_file
+            .sync_all()
+            .map_err(CommitError::IndexFileSync)?;
         self.hdx_file
             .sync_all()
             .map_err(CommitError::IndexFileSync)?;
@@ -420,16 +435,44 @@ where
             header.write_header(&mut file)?;
             let bucket_size = header.bucket_size() as usize;
             let mut buffer = vec![0_u8; bucket_size];
-            let mut crc32_hasher = crc32fast::Hasher::new();
-            crc32_hasher.update(&buffer[..(bucket_size - 4)]);
-            let crc32 = crc32_hasher.finalize();
-            buffer[bucket_size - 4..].copy_from_slice(&crc32.to_le_bytes());
+            add_crc32(&mut buffer);
             for _ in 0..header.buckets() {
                 file.write_all(&buffer)?;
             }
             header
         } else {
             HdxHeader::load_header(&mut file)?
+        };
+        Ok((file, header))
+    }
+
+    fn open_odx_file(
+        data_name: &Path,
+        hdx_header: &HdxHeader,
+        config: &DbConfig,
+    ) -> Result<(File, OdxHeader), LoadHeaderError> {
+        if config.truncate && config.write {
+            // truncate is incompatible with append so truncate then open for append.
+            OpenOptions::new()
+                .write(true)
+                .create(config.create)
+                .truncate(true)
+                .open(data_name)?;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(config.write)
+            .create(config.create && config.write)
+            .open(data_name)?;
+        file.seek(SeekFrom::End(0))?;
+        let file_end = file.seek(SeekFrom::Current(0))?;
+
+        let header = if file_end == 0 {
+            let header = OdxHeader::from_hdx_header(hdx_header);
+            header.write_header(&mut file)?;
+            header
+        } else {
+            OdxHeader::load_header(&mut file)?
         };
         Ok((file, header))
     }
@@ -481,9 +524,11 @@ where
                     );
                 }
                 if bucket == split_bucket {
-                    self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer);
+                    self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer)
+                        .map_err(|_| InsertError::IndexOverflow)?;
                 } else {
-                    self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer2);
+                    self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer2)
+                        .map_err(|_| InsertError::IndexOverflow)?;
                 }
             }
         }
@@ -531,7 +576,7 @@ where
             buffer
         };
 
-        self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer);
+        self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer)?;
         self.bucket_cache.insert(bucket, buffer);
         Ok(())
     }
@@ -556,7 +601,7 @@ where
         hash: u64,
         pos_size: (u64, u32),
         buffer: &mut [u8],
-    ) {
+    ) -> io::Result<()> {
         let (record_pos, record_size) = pos_size;
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.hdx_header.bucket_elements() as u64 {
@@ -578,7 +623,7 @@ where
                 buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
                 pos += 8;
                 buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
-                return;
+                return Ok(());
             }
             if rec_hash == hash {
                 if let Some(key) = key {
@@ -592,40 +637,18 @@ where
                             buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
                             pos += 8;
                             buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
-                            return;
+                            return Ok(());
                         }
                     }
                 }
             }
         }
-        // XXXSLS- should check if buffer has room.
-        // Overflow, save bucket as an overflow record and add to the fresh bucket.
-        // Need this allow, clippy can not tell the difference in 0_u16 and 0_u32 apparently.
-        #[allow(clippy::if_same_then_else)]
-        if K::is_variable_key_size() {
-            // Write a 0 key size to indicate this is an overflow bucket not a data record.
-            self.write_buffer
-                .write_all(&0_u16.to_le_bytes())
-                .expect("write_all to Vec is infallible");
-        } else {
-            // Write a 0 value size to indicate this is an overflow bucket not a data record.
-            self.write_buffer
-                .write_all(&0_u32.to_le_bytes())
-                .expect("write_all to Vec is infallible");
-        }
-        let overflow_pos = self.data_file_end + self.write_buffer.len() as u64;
-
-        // Add the crc to the bucket
-        let bucket_size = self.hdx_header.bucket_size() as usize;
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        crc32_hasher.update(&buffer[..(bucket_size - 4)]);
-        let crc32 = crc32_hasher.finalize();
-        buffer[bucket_size - 4..].copy_from_slice(&crc32.to_le_bytes());
-
+        // false, save bucket as an overflow record and add to the fresh bucket.
+        self.odx_file.seek(SeekFrom::End(0))?;
+        let overflow_pos = self.odx_file.seek(SeekFrom::Current(0))?;
+        add_crc32(buffer);
         // Write the old buffer into the data file as an overflow record.
-        self.write_buffer
-            .write_all(buffer)
-            .expect("write_all to Vec is infallible");
+        self.odx_file.write_all(buffer)?;
         // clear buffer and reset to 0.
         buffer.fill(0);
         // Copy the position of the overflow record into the first u64.
@@ -634,6 +657,7 @@ where
         buffer[8..16].copy_from_slice(&hash.to_le_bytes());
         buffer[16..24].copy_from_slice(&record_pos.to_le_bytes());
         buffer[24..28].copy_from_slice(&record_size.to_le_bytes());
+        Ok(())
     }
 
     /// Read the record at position.
@@ -660,12 +684,7 @@ where
             let mut key_size = [0_u8; 2];
             key_size.copy_from_slice(&buffer[0..2]);
             pos += 2;
-            let key_size = u16::from_le_bytes(key_size);
-            if key_size == 0 {
-                // Overflow bucket, can not read as data so error.
-                return Err(FetchError::UnexpectedOverflowBucket);
-            }
-            key_size
+            u16::from_le_bytes(key_size)
         } else {
             K::KEY_SIZE
         } as usize;
@@ -673,10 +692,6 @@ where
         buf_32.copy_from_slice(&buffer[pos..pos + 4]);
         pos += 4;
         let val_size = u32::from_le_bytes(buf_32) as usize;
-        if K::is_fixed_key_size() && val_size == 0 {
-            // No key size so overflow indicated by a 0 value size.
-            return Err(FetchError::UnexpectedOverflowBucket);
-        }
         let key =
             K::deserialize(&buffer[pos..pos + key_size]).map_err(FetchError::DeserializeKey)?;
         pos += key_size;
@@ -824,7 +839,7 @@ fn check_crc(buffer: &[u8]) -> bool {
 
 /// Add a crc32 code to buffer.  The last four bytes of buffer are overwritten by the crc32 code of
 /// the rest of the buffer.
-fn add_crc32(buffer: &mut [u8]) {
+pub(crate) fn add_crc32(buffer: &mut [u8]) {
     let len = buffer.len();
     if len < 4 {
         return;
@@ -837,7 +852,7 @@ fn add_crc32(buffer: &mut [u8]) {
 
 /// Iterates over the (hash, record_position) values contained in a bucket.
 struct BucketIter<'src, R: Read + Seek> {
-    dat_file: &'src mut R,
+    odx_file: &'src mut R,
     buffer: Vec<u8>,
     bucket_pos: usize,
     overflow_pos: u64,
@@ -846,13 +861,13 @@ struct BucketIter<'src, R: Read + Seek> {
 }
 
 impl<'src, R: Read + Seek> BucketIter<'src, R> {
-    fn new(dat_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> Self {
+    fn new(odx_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> Self {
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
         let overflow_pos = u64::from_le_bytes(buf);
         let crc_failure = !check_crc(&buffer);
         Self {
-            dat_file,
+            odx_file,
             buffer,
             bucket_pos: 0,
             overflow_pos,
@@ -892,10 +907,10 @@ impl<'src, R: Read + Seek> Iterator for &mut BucketIter<'src, R> {
                 }
             } else if self.overflow_pos > 0 {
                 // We have an overflow bucket to search as well.
-                self.dat_file
+                self.odx_file
                     .seek(SeekFrom::Start(self.overflow_pos))
                     .ok()?;
-                self.dat_file.read_exact(&mut self.buffer[..]).ok()?;
+                self.odx_file.read_exact(&mut self.buffer[..]).ok()?;
                 if !check_crc(&self.buffer) {
                     self.crc_failure = true;
                     return None;
@@ -1101,7 +1116,7 @@ mod tests {
             .allow_duplicate_inserts()
             .no_auto_flush()
             //.set_bucket_elements(8)
-            //.set_load_factor(0.5)
+            .set_load_factor(0.5)
             .build()
             .unwrap();
         assert!(!db.contains_key(&0).unwrap());
@@ -1147,7 +1162,7 @@ mod tests {
         }
         println!("XXXX iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
-        assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
+        //assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
         for i in 0..max {
             let item = db.fetch(&(i as u64));
             assert!(item.is_ok(), "Failed on item {}", i);

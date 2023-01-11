@@ -25,6 +25,8 @@ pub enum InsertError {
     ReadOnly,
     /// Crc32 check failed on an index access.
     IndexCrcError,
+    /// Error writing an index overflow bucket.
+    IndexOverflow,
 }
 
 impl Error for InsertError {}
@@ -40,6 +42,7 @@ impl fmt::Display for InsertError {
             Self::KeyError(e) => write!(f, "key access: {}", e),
             Self::ReadOnly => write!(f, "read only"),
             Self::IndexCrcError => write!(f, "index crc32 failed"),
+            Self::IndexOverflow => write!(f, "index overflow failed"),
         }
     }
 }

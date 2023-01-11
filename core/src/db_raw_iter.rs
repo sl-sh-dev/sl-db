@@ -9,7 +9,7 @@ use crate::fxhasher::FxHasher;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek};
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -22,7 +22,6 @@ where
     S: BuildHasher + Default,
 {
     _db: PhantomData<(K, V, S)>,
-    bucket_size: u16,
     file: BufReader<File>,
     buffer: Vec<u8>,
 }
@@ -44,11 +43,10 @@ where
             .create(false)
             .open(data_name)?;
 
-        let header = DataHeader::load_header(&mut data_file)?;
+        let _header = DataHeader::load_header(&mut data_file)?;
         let file = BufReader::new(data_file);
         Ok(Self {
             _db: PhantomData,
-            bucket_size: header.bucket_size(),
             file,
             buffer: Vec::new(),
         })
@@ -57,11 +55,10 @@ where
     /// Same as open but created from an existing File.
     pub fn with_file(dat_file: File) -> Result<Self, LoadHeaderError> {
         let mut dat_file = dat_file;
-        let header = DataHeader::load_header(&mut dat_file)?;
+        let _header = DataHeader::load_header(&mut dat_file)?;
         let file = BufReader::new(dat_file);
         Ok(Self {
             _db: PhantomData,
-            bucket_size: header.bucket_size(),
             file,
             buffer: Vec::new(),
         })
@@ -78,12 +75,7 @@ where
             let mut key_size = [0_u8; 2];
             file.read_exact(&mut key_size)?;
             crc32_hasher.update(&key_size);
-            let key_size = u16::from_le_bytes(key_size);
-            if key_size == 0 {
-                // Overflow bucket, can not read as data so error.
-                return Err(FetchError::UnexpectedOverflowBucket);
-            }
-            key_size
+            u16::from_le_bytes(key_size)
         } else {
             K::KEY_SIZE
         } as usize;
@@ -92,10 +84,6 @@ where
         file.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
-        if K::is_fixed_key_size() && val_size == 0 {
-            // No key size so overflow indicated by a 0 value size.
-            return Err(FetchError::UnexpectedOverflowBucket);
-        }
         buffer.resize(key_size as usize, 0);
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
@@ -124,19 +112,7 @@ where
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut rec = Self::read_record_file(&mut self.file, &mut self.buffer);
-        while let Err(err) = &rec {
-            if let FetchError::UnexpectedOverflowBucket = err {
-                // The key or value size has already been read in this case.
-                self.file
-                    .seek(SeekFrom::Current(self.bucket_size as i64))
-                    .ok()?;
-                rec = Self::read_record_file(&mut self.file, &mut self.buffer);
-            } else {
-                break;
-            }
-        }
-        if let Ok(ret) = rec {
+        if let Ok(ret) = Self::read_record_file(&mut self.file, &mut self.buffer) {
             Some(ret)
         } else {
             None

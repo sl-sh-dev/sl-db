@@ -9,6 +9,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 /// Size of an index header.
 pub const HDX_HEADER_SIZE: usize = 64;
 
+/// Header for an hdx (index) file.  This contains the hash buckets for lookups.
+/// This file is not a log file and the header and buckets will change in place over time.
+/// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub(crate) struct HdxHeader {
@@ -34,8 +37,8 @@ impl HdxHeader {
             version: data_header.version(),
             uid: data_header.uid(),
             appnum: data_header.appnum(),
-            bucket_elements: data_header.bucket_elements(),
-            bucket_size: data_header.bucket_size(),
+            bucket_elements: config.bucket_elements,
+            bucket_size: config.bucket_size,
             buckets: config.initial_buckets,
             load_factor: (u16::MAX as f32 * config.load_factor) as u16,
             salt: 0,
@@ -182,5 +185,20 @@ impl HdxHeader {
     /// Increment the values by 1.
     pub fn inc_values(&mut self) {
         self.values += 1;
+    }
+
+    /// File version number.
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Unique ID generated on creation
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Application defined constant
+    pub fn appnum(&self) -> u64 {
+        self.appnum
     }
 }
