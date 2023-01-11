@@ -29,9 +29,9 @@ pub struct DbConfig {
 impl DbConfig {
     /// Create a new config.
     pub fn new<P: Into<PathBuf>>(dir: P, base_name: P, appnum: u64) -> Self {
-        let bucket_size = 512;
         let initial_buckets = 128;
-        let bucket_elements = (bucket_size - 8) / BUCKET_ELEMENT_SIZE as u16;
+        let bucket_elements = 25; //(bucket_size - 8) / BUCKET_ELEMENT_SIZE as u16;
+        let bucket_size = 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
         Self {
             dir: dir.into(),
             base_name: base_name.into(),
@@ -105,14 +105,14 @@ impl DbConfig {
     /// Calling this will overwrite values set by set_bucket_elements, and vice-versa.
     /// Panics if size is less than 8 + BUCKET_ELEMENT_SIZE.
     pub fn set_bucket_size(mut self, size: u16) -> Self {
-        if size < 8 + BUCKET_ELEMENT_SIZE as u16 {
+        if size < 12 + BUCKET_ELEMENT_SIZE as u16 {
             panic!(
                 "Invalid bucket size, must be at least {}",
-                8 + BUCKET_ELEMENT_SIZE
+                12 + BUCKET_ELEMENT_SIZE
             );
         }
         self.bucket_size = size;
-        self.bucket_elements = (size - 8) / BUCKET_ELEMENT_SIZE as u16;
+        self.bucket_elements = (size - 12) / BUCKET_ELEMENT_SIZE as u16;
         self
     }
 
@@ -121,7 +121,7 @@ impl DbConfig {
     /// Calling this will overwrite values set by set_bucket_size, and vice-versa.
     pub fn set_bucket_elements(mut self, bucket_elements: u16) -> Self {
         self.bucket_elements = bucket_elements;
-        self.bucket_size = 8 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
+        self.bucket_size = 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
         self
     }
 

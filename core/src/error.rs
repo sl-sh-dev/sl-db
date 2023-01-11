@@ -84,6 +84,8 @@ pub enum ReadKeyError {
     IO(io::Error),
     /// Error deserializing the key's data from the data file.
     DeserializeKey(DeserializeError),
+    /// CRC32 Error reading data.
+    CrcFailed,
 }
 
 impl Error for ReadKeyError {}
@@ -93,6 +95,7 @@ impl fmt::Display for ReadKeyError {
         match &self {
             Self::IO(io_err) => write!(f, "io: {}", io_err),
             Self::DeserializeKey(msg) => write!(f, "deserialize key: {}", msg),
+            Self::CrcFailed => write!(f, "invalid crc32 checksum"),
         }
     }
 }

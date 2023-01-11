@@ -23,6 +23,8 @@ pub enum InsertError {
     KeyError(ReadKeyError),
     /// Database opened read-only.
     ReadOnly,
+    /// Crc32 check failed on an index access.
+    IndexCrcError,
 }
 
 impl Error for InsertError {}
@@ -37,6 +39,7 @@ impl fmt::Display for InsertError {
             Self::Flush(e) => write!(f, "flush: {}", e),
             Self::KeyError(e) => write!(f, "key access: {}", e),
             Self::ReadOnly => write!(f, "read only"),
+            Self::IndexCrcError => write!(f, "index crc32 failed"),
         }
     }
 }

@@ -104,6 +104,8 @@ macro_rules! bucket_iter {
         let mut buffer = vec![0; $db.hdx_header.bucket_size() as usize];
         if let Some(bucket) = $db.bucket_cache.get(&$bucket) {
             buffer.copy_from_slice(&bucket);
+            // These cached buffers may be missing their crc32 so add it now.
+            add_crc32(&mut buffer);
         } else {
             let bucket_size = $db.hdx_header.bucket_size() as usize;
             let bucket_pos: u64 = (HDX_HEADER_SIZE + ($bucket as usize * bucket_size)) as u64;
@@ -181,7 +183,8 @@ where
         let hash = self.hash(key);
         let bucket = self.get_bucket(hash);
 
-        for (rec_hash, rec_pos, rec_size) in bucket_iter!(self, bucket) {
+        let mut iter = bucket_iter!(self, bucket);
+        for (rec_hash, rec_pos, rec_size) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
                 let (rkey, val) = self.read_record(rec_pos, rec_size as usize)?;
@@ -190,14 +193,19 @@ where
                 }
             }
         }
-        Err(FetchError::NotFound)
+        if iter.crc_failure {
+            Err(FetchError::CrcFailed)
+        } else {
+            Err(FetchError::NotFound)
+        }
     }
 
     /// True if the database contains key.
     pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
         let hash = self.hash(key);
         let bucket = self.get_bucket(hash);
-        for (rec_hash, rec_pos, _rec_size) in bucket_iter!(self, bucket) {
+        let mut iter = bucket_iter!(self, bucket);
+        for (rec_hash, rec_pos, _rec_size) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
                 let rkey = self.read_key(rec_pos)?;
@@ -206,7 +214,11 @@ where
                 }
             }
         }
-        Ok(false)
+        if iter.crc_failure {
+            Err(ReadKeyError::CrcFailed)
+        } else {
+            Ok(false)
+        }
     }
 
     /// If in read-only mode refresh the index header data from on-disk.
@@ -282,7 +294,7 @@ where
 
             // An early return on error could cause a new buffer to be created, should not be a big deal.
             self.scratch_buffer.set(buffer);
-            self.expand_buckets();
+            self.expand_buckets()?;
             self.save_to_bucket(&key, hash, (record_pos, record_size))
                 .map_err(InsertError::KeyError)?;
             if self.config.auto_flush {
@@ -406,9 +418,15 @@ where
         let header = if file_end == 0 {
             let header = HdxHeader::from_data_header(data_header, config);
             header.write_header(&mut file)?;
-            let mut buffer: Vec<u8> = Vec::new();
-            buffer.resize(header.buckets() as usize * header.bucket_size() as usize, 0);
-            file.write_all(&buffer)?;
+            let bucket_size = header.bucket_size() as usize;
+            let mut buffer = vec![0_u8; bucket_size];
+            let mut crc32_hasher = crc32fast::Hasher::new();
+            crc32_hasher.update(&buffer[..(bucket_size - 4)]);
+            let crc32 = crc32_hasher.finalize();
+            buffer[bucket_size - 4..].copy_from_slice(&crc32.to_le_bytes());
+            for _ in 0..header.buckets() {
+                file.write_all(&buffer)?;
+            }
             header
         } else {
             HdxHeader::load_header(&mut file)?
@@ -435,21 +453,25 @@ where
     }
 
     /// Add one new bucket to the hash index.
-    fn split_one_bucket(&mut self) {
-        //-> Result<(), ReadKeyError> {
+    fn split_one_bucket(&mut self) -> Result<(), InsertError> {
         let old_modulus = self.modulus;
+        // This is the bucket that is being split.
         let split_bucket = (self.hdx_header.buckets() - (old_modulus / 2)) as u64;
         self.hdx_header.inc_buckets();
+        // This is the newly created bucket that the items in split_bucket will possibly be moved into.
+        let new_bucket = self.hdx_header.buckets() as u64 - 1;
         // Don't want buckets and modulus to be the same, so +1
         self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
 
-        let mut buffer = vec![0; self.hdx_header.bucket_size() as usize];
-        let mut buffer2 = vec![0; self.hdx_header.bucket_size() as usize];
+        let bucket_size = self.hdx_header.bucket_size() as usize;
+        let mut buffer = vec![0; bucket_size];
+        let mut buffer2 = vec![0; bucket_size];
 
-        for (rec_hash, rec_pos, rec_size) in bucket_iter!(self, split_bucket) {
+        let mut iter = bucket_iter!(self, split_bucket);
+        for (rec_hash, rec_pos, rec_size) in &mut iter {
             if rec_pos > 0 {
                 let bucket = self.get_bucket(rec_hash);
-                if bucket != split_bucket && bucket != self.hdx_header.buckets() as u64 - 1 {
+                if bucket != split_bucket && bucket != new_bucket {
                     panic!(
                         "got bucket {}, expected {} or {}, mod {}",
                         bucket,
@@ -465,20 +487,24 @@ where
                 }
             }
         }
+        if iter.crc_failure {
+            return Err(InsertError::IndexCrcError);
+        }
         self.bucket_cache.insert(split_bucket, buffer);
-        self.bucket_cache
-            .insert(self.hdx_header.buckets() as u64 - 1, buffer2);
+        self.bucket_cache.insert(new_bucket, buffer2);
+        Ok(())
     }
 
     /// Add buckets to expand capacity.
-    fn expand_buckets(&mut self) {
+    fn expand_buckets(&mut self) -> Result<(), InsertError> {
         if self.config.allow_bucket_expansion {
             while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
-                self.split_one_bucket();
+                self.split_one_bucket()?;
                 self.capacity =
                     self.hdx_header.buckets() as u64 * self.hdx_header.bucket_elements() as u64;
             }
         }
+        Ok(())
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
@@ -492,13 +518,15 @@ where
         let mut buffer = if let Some(buf) = self.bucket_cache.remove(&bucket) {
             buf
         } else {
-            let mut buffer = vec![0; self.hdx_header.bucket_size() as usize];
-            let bucket_pos: u64 = (HDX_HEADER_SIZE
-                + (bucket as usize * self.hdx_header.bucket_size() as usize))
-                as u64;
+            let bucket_size = self.hdx_header.bucket_size() as usize;
+            let mut buffer = vec![0; bucket_size];
+            let bucket_pos: u64 = (HDX_HEADER_SIZE + (bucket as usize * bucket_size)) as u64;
             {
                 self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
                 self.hdx_file.read_exact(&mut buffer)?;
+                if !check_crc(&buffer) {
+                    return Err(ReadKeyError::CrcFailed);
+                }
             }
             buffer
         };
@@ -508,12 +536,12 @@ where
         Ok(())
     }
 
-    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
+    /// Flush (save) the hash bucket cache to disk.
     fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
-        for (bucket, buffer) in self.bucket_cache.drain() {
-            let bucket_pos: u64 = (HDX_HEADER_SIZE
-                + (bucket as usize * self.hdx_header.bucket_size() as usize))
-                as u64;
+        let bucket_size = self.hdx_header.bucket_size() as usize;
+        for (bucket, mut buffer) in self.bucket_cache.drain() {
+            let bucket_pos: u64 = (HDX_HEADER_SIZE + (bucket as usize * bucket_size)) as u64;
+            add_crc32(&mut buffer);
             // Seeking and writing past the file end seems to extend the file correctly.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer)?;
@@ -586,6 +614,14 @@ where
                 .expect("write_all to Vec is infallible");
         }
         let overflow_pos = self.data_file_end + self.write_buffer.len() as u64;
+
+        // Add the crc to the bucket
+        let bucket_size = self.hdx_header.bucket_size() as usize;
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&buffer[..(bucket_size - 4)]);
+        let crc32 = crc32_hasher.finalize();
+        buffer[bucket_size - 4..].copy_from_slice(&crc32.to_le_bytes());
+
         // Write the old buffer into the data file as an overflow record.
         self.write_buffer
             .write_all(buffer)
@@ -610,18 +646,13 @@ where
         size: usize,
         buffer: &mut Vec<u8>,
     ) -> Result<(K, V), FetchError> {
-        let mut crc32_hasher = crc32fast::Hasher::new();
         buffer.resize(size, 0);
         // Move the read cursor to position.  Note the data file is opened in append mode so write
         // cursor is always EOF.
         self.seek(SeekFrom::Start(position))?;
         self.read_exact(&mut buffer[..])?;
-        crc32_hasher.update(&buffer[..(size - 4)]);
-        let calc_crc32 = crc32_hasher.finalize();
         let mut buf_32 = [0_u8; 4];
-        buf_32.copy_from_slice(&buffer[(size - 4)..]);
-        let read_crc32 = u32::from_le_bytes(buf_32);
-        if calc_crc32 != read_crc32 {
+        if !check_crc(buffer) {
             return Err(FetchError::CrcFailed);
         }
         let mut pos = 0;
@@ -775,6 +806,35 @@ where
     }
 }
 
+/// Check buffers crc32.  The last 4 bytes of the buffer are the CRC32 code and rest of the buffer
+/// is checked against that.
+fn check_crc(buffer: &[u8]) -> bool {
+    let len = buffer.len();
+    if len < 5 {
+        return false;
+    }
+    let mut crc32_hasher = crc32fast::Hasher::new();
+    crc32_hasher.update(&buffer[..(len - 4)]);
+    let calc_crc32 = crc32_hasher.finalize();
+    let mut buf32 = [0_u8; 4];
+    buf32.copy_from_slice(&buffer[(len - 4)..]);
+    let read_crc32 = u32::from_le_bytes(buf32);
+    calc_crc32 == read_crc32
+}
+
+/// Add a crc32 code to buffer.  The last four bytes of buffer are overwritten by the crc32 code of
+/// the rest of the buffer.
+fn add_crc32(buffer: &mut [u8]) {
+    let len = buffer.len();
+    if len < 4 {
+        return;
+    }
+    let mut crc32_hasher = crc32fast::Hasher::new();
+    crc32_hasher.update(&buffer[..(len - 4)]);
+    let crc32 = crc32_hasher.finalize();
+    buffer[len - 4..].copy_from_slice(&crc32.to_le_bytes());
+}
+
 /// Iterates over the (hash, record_position) values contained in a bucket.
 struct BucketIter<'src, R: Read + Seek> {
     dat_file: &'src mut R,
@@ -782,6 +842,7 @@ struct BucketIter<'src, R: Read + Seek> {
     bucket_pos: usize,
     overflow_pos: u64,
     elements: u16,
+    crc_failure: bool,
 }
 
 impl<'src, R: Read + Seek> BucketIter<'src, R> {
@@ -789,20 +850,25 @@ impl<'src, R: Read + Seek> BucketIter<'src, R> {
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
         let overflow_pos = u64::from_le_bytes(buf);
+        let crc_failure = !check_crc(&buffer);
         Self {
             dat_file,
             buffer,
             bucket_pos: 0,
             overflow_pos,
             elements,
+            crc_failure,
         }
     }
 }
 
-impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
+impl<'src, R: Read + Seek> Iterator for &mut BucketIter<'src, R> {
     type Item = (u64, u64, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.crc_failure {
+            return None;
+        }
         // For reading u64 values, needs an array.
         let mut buf64 = [0_u8; 8];
         // For reading u32 values, needs an array.
@@ -830,6 +896,10 @@ impl<'src, R: Read + Seek> Iterator for BucketIter<'src, R> {
                     .seek(SeekFrom::Start(self.overflow_pos))
                     .ok()?;
                 self.dat_file.read_exact(&mut self.buffer[..]).ok()?;
+                if !check_crc(&self.buffer) {
+                    self.crc_failure = true;
+                    return None;
+                }
                 self.bucket_pos = 0;
                 buf64.copy_from_slice(&self.buffer[0..8]);
                 self.overflow_pos = u64::from_le_bytes(buf64);
