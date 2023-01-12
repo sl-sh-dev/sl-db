@@ -255,85 +255,90 @@ where
         if !self.config.write {
             return Err(InsertError::ReadOnly);
         }
+        let mut buffer = self.scratch_buffer.take();
+        let start_write_buffer_len = self.write_buffer.len();
+        let record_pos = self.data_file_end + self.write_buffer.len() as u64;
+        let hash = self.hash(&key);
+        key.serialize(&mut buffer)
+            .map_err(InsertError::SerializeKey)?;
+        // If we have a variable sized key write it's size otherwise no need.
+        if K::is_variable_key_size() {
+            // We have to write the key size when variable.
+            self.write_buffer
+                .write_all(&(buffer.len() as u16).to_le_bytes())
+                .expect("write_all to Vec is infallible");
+        } else if K::KEY_SIZE as usize != buffer.len() {
+            return Err(InsertError::InvalidKeyLength);
+        }
+        // Once we have written to write_buffer, it needs to be rolled back before returning an error.
+        // Space for the value length.
+        let val_size_pos = self.write_buffer.len();
+        self.write_buffer
+            .write_all(&[0_u8; 4])
+            .expect("write_all to Vec is infallible");
+
+        // Write the key to the buffer.
+        self.write_buffer
+            .write_all(&buffer)
+            .expect("write_all to Vec is infallible");
+
+        if let Err(err) = value
+            .serialize(&mut buffer)
+            .map_err(InsertError::SerializeValue)
         {
-            let mut buffer = self.scratch_buffer.take();
-            let start_write_buffer_len = self.write_buffer.len();
-            let record_pos = self.data_file_end + self.write_buffer.len() as u64;
-            let hash = self.hash(&key);
-            key.serialize(&mut buffer)
-                .map_err(InsertError::SerializeKey)?;
-            // If we have a variable sized key write it's size otherwise no need.
-            if K::is_variable_key_size() {
-                // We have to write the key size when variable.
-                self.write_buffer
-                    .write_all(&(buffer.len() as u16).to_le_bytes())
-                    .expect("write_all to Vec is infallible");
-            } else if K::KEY_SIZE as usize != buffer.len() {
-                return Err(InsertError::InvalidKeyLength);
-            }
-            // Space for the value length.
-            let val_size_pos = self.write_buffer.len();
-            self.write_buffer
-                .write_all(&[0_u8; 4])
-                .expect("write_all to Vec is infallible");
+            // Rollback the write.
+            self.write_buffer.resize(start_write_buffer_len, 0);
+            return Err(err);
+        }
 
-            // Write the key to the buffer.
-            self.write_buffer
-                .write_all(&buffer)
-                .expect("write_all to Vec is infallible");
+        // Save current pos, then jump back to the value size and write that then finally write
+        // the value into the saved position.
+        self.write_buffer[val_size_pos..val_size_pos + 4]
+            .copy_from_slice(&(buffer.len() as u32).to_le_bytes());
+        self.write_buffer
+            .write_all(&buffer)
+            .expect("write_all to Vec is infallible");
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&self.write_buffer[start_write_buffer_len..]);
+        let crc32 = crc32_hasher.finalize();
+        self.write_buffer
+            .write_all(&crc32.to_le_bytes())
+            .expect("write_all to Vec is infallible");
+        let record_size = (self.write_buffer.len() - start_write_buffer_len) as u32;
 
-            value
-                .serialize(&mut buffer)
-                .map_err(InsertError::SerializeValue)?;
-
-            // Save current pos, then jump back to the value size and write that then finally write
-            // the value into the saved position.
-            self.write_buffer[val_size_pos..val_size_pos + 4]
-                .copy_from_slice(&(buffer.len() as u32).to_le_bytes());
-            self.write_buffer
-                .write_all(&buffer)
-                .expect("write_all to Vec is infallible");
-            let mut crc32_hasher = crc32fast::Hasher::new();
-            crc32_hasher.update(&self.write_buffer[start_write_buffer_len..]);
-            let crc32 = crc32_hasher.finalize();
-            self.write_buffer
-                .write_all(&crc32.to_le_bytes())
-                .expect("write_all to Vec is infallible");
-            let record_size = (self.write_buffer.len() - start_write_buffer_len) as u32;
-
-            // An early return on error could cause a new buffer to be created, should not be a big deal.
-            self.scratch_buffer.set(buffer);
-            self.expand_buckets()?;
-            if let Err(err) = self.save_to_bucket(&key, hash, (record_pos, record_size)) {
-                if let InsertError::DuplicateKey = err {
-                    // Truncate the write buffer to roll back the current insert.
-                    self.write_buffer.resize(start_write_buffer_len, 0);
-                }
-                return Err(err);
-            }
-            if self.config.auto_flush {
-                if self.config.cache_writes {
-                    if self.bucket_cache.len() > 200
-                        || self.write_buffer.len() >= INSERT_BUFFER_SIZE
-                    {
-                        self.flush()?;
-                    }
-                } else {
+        // An early return on error could cause a new buffer to be created, should not be a big deal.
+        self.scratch_buffer.set(buffer);
+        if let Err(err) = self.expand_buckets() {
+            // Rollback the write.
+            self.write_buffer.resize(start_write_buffer_len, 0);
+            return Err(err);
+        }
+        if let Err(err) = self.save_to_bucket(&key, hash, (record_pos, record_size)) {
+            // Rollback the write.
+            self.write_buffer.resize(start_write_buffer_len, 0);
+            return Err(err);
+        }
+        // Now errors are tricky, we have already updated the index.  Leave the data for now...
+        if self.config.auto_flush {
+            if self.config.cache_writes {
+                if self.bucket_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE {
                     self.flush()?;
                 }
             } else {
-                // Even with no auto flush we will flush the data file now and then (but not the index).
-                // Since the data file is append only this should be safe and can keep memory usage down.
-                if self.write_buffer.len() >= INSERT_BUFFER_SIZE {
-                    self.data_file
-                        .write_all(&self.write_buffer)
-                        .map_err(FlushError::WriteData)?;
-                    self.data_file_end += self.write_buffer.len() as u64;
-                    self.write_buffer.clear();
-                }
+                self.flush()?;
             }
-            self.hdx_header.inc_values();
+        } else {
+            // Even with no auto flush we will flush the data file now and then (but not the index).
+            // Since the data file is append only this should be safe and can keep memory usage down.
+            if self.write_buffer.len() >= INSERT_BUFFER_SIZE {
+                self.data_file
+                    .write_all(&self.write_buffer)
+                    .map_err(FlushError::WriteData)?;
+                self.data_file_end += self.write_buffer.len() as u64;
+                self.write_buffer.clear();
+            }
         }
+        self.hdx_header.inc_values();
         Ok(())
     }
 
@@ -582,9 +587,9 @@ where
             buffer
         };
 
-        self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer)?;
+        let result = self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer);
         self.bucket_cache.insert(bucket, buffer);
-        Ok(())
+        result
     }
 
     /// Flush (save) the hash bucket cache to disk.
@@ -1214,5 +1219,50 @@ mod tests {
                 &format!("Value {}", i)
             );
         }
+    }
+
+    #[test]
+    fn test_duplicates() {
+        {
+            let mut db: DbCore<u64, u64, 8> = DbConfig::new(".", "xxxDupTest", 1)
+                .create()
+                .truncate()
+                .build()
+                .unwrap();
+            db.insert(1, &1).unwrap();
+            db.insert(2, &2).unwrap();
+            db.insert(3, &3).unwrap();
+            db.insert(4, &4).unwrap();
+            db.insert(5, &5).unwrap();
+            let r1 = db.insert(1, &10);
+            assert!(matches!(r1.unwrap_err(), InsertError::DuplicateKey));
+            let r2 = db.insert(3, &10);
+            assert!(matches!(r2.unwrap_err(), InsertError::DuplicateKey));
+            let r3 = db.insert(5, &10);
+            assert!(matches!(r3.unwrap_err(), InsertError::DuplicateKey));
+            db.insert(6, &6).unwrap();
+            assert_eq!(1, db.fetch(&1).unwrap());
+            assert_eq!(2, db.fetch(&2).unwrap());
+            assert_eq!(3, db.fetch(&3).unwrap());
+            assert_eq!(4, db.fetch(&4).unwrap());
+            assert_eq!(5, db.fetch(&5).unwrap());
+        }
+        let mut db: DbCore<u64, u64, 8> = DbConfig::new(".", "xxxDupTest", 1)
+            .allow_duplicate_inserts()
+            .build()
+            .unwrap();
+        assert_eq!(1, db.fetch(&1).unwrap());
+        assert_eq!(2, db.fetch(&2).unwrap());
+        assert_eq!(3, db.fetch(&3).unwrap());
+        assert_eq!(4, db.fetch(&4).unwrap());
+        assert_eq!(5, db.fetch(&5).unwrap());
+        db.insert(1, &10).unwrap();
+        db.insert(3, &30).unwrap();
+        db.insert(5, &50).unwrap();
+        assert_eq!(10, db.fetch(&1).unwrap());
+        assert_eq!(2, db.fetch(&2).unwrap());
+        assert_eq!(30, db.fetch(&3).unwrap());
+        assert_eq!(4, db.fetch(&4).unwrap());
+        assert_eq!(50, db.fetch(&5).unwrap());
     }
 }

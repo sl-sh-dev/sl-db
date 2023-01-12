@@ -18,6 +18,7 @@ pub enum InsertError {
     /// Invalid key length for a fixed sized key.
     InvalidKeyLength,
     /// Error on flush.
+    /// The inserted record is still available but some of the data failed to persist to disk.
     Flush(FlushError),
     /// Error accessing key.
     KeyError(ReadKeyError),
