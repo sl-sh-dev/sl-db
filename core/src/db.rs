@@ -255,9 +255,6 @@ where
         if !self.config.write {
             return Err(InsertError::ReadOnly);
         }
-        if !self.config.allow_duplicate_inserts && self.contains_key(&key)? {
-            return Err(InsertError::DuplicateKey);
-        }
         {
             let mut buffer = self.scratch_buffer.take();
             let start_write_buffer_len = self.write_buffer.len();
@@ -307,8 +304,13 @@ where
             // An early return on error could cause a new buffer to be created, should not be a big deal.
             self.scratch_buffer.set(buffer);
             self.expand_buckets()?;
-            self.save_to_bucket(&key, hash, (record_pos, record_size))
-                .map_err(InsertError::KeyError)?;
+            if let Err(err) = self.save_to_bucket(&key, hash, (record_pos, record_size)) {
+                if let InsertError::DuplicateKey = err {
+                    // Truncate the write buffer to roll back the current insert.
+                    self.write_buffer.resize(start_write_buffer_len, 0);
+                }
+                return Err(err);
+            }
             if self.config.auto_flush {
                 if self.config.cache_writes {
                     if self.bucket_cache.len() > 200
@@ -558,7 +560,7 @@ where
         key: &K,
         hash: u64,
         pos_size: (u64, u32),
-    ) -> Result<(), ReadKeyError> {
+    ) -> Result<(), InsertError> {
         let bucket = self.get_bucket(hash);
         let mut buffer = if let Some(buf) = self.bucket_cache.remove(&bucket) {
             buf
@@ -567,10 +569,14 @@ where
             let mut buffer = vec![0; bucket_size];
             let bucket_pos: u64 = (HDX_HEADER_SIZE + (bucket as usize * bucket_size)) as u64;
             {
-                self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-                self.hdx_file.read_exact(&mut buffer)?;
+                self.hdx_file
+                    .seek(SeekFrom::Start(bucket_pos))
+                    .map_err(|e| InsertError::KeyError(e.into()))?;
+                self.hdx_file
+                    .read_exact(&mut buffer)
+                    .map_err(|e| InsertError::KeyError(e.into()))?;
                 if !check_crc(&buffer) {
-                    return Err(ReadKeyError::CrcFailed);
+                    return Err(InsertError::KeyError(ReadKeyError::CrcFailed));
                 }
             }
             buffer
@@ -601,7 +607,7 @@ where
         hash: u64,
         pos_size: (u64, u32),
         buffer: &mut [u8],
-    ) -> io::Result<()> {
+    ) -> Result<(), InsertError> {
         let (record_pos, record_size) = pos_size;
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.hdx_header.bucket_elements() as u64 {
@@ -629,26 +635,38 @@ where
                 if let Some(key) = key {
                     if let Ok(rkey) = self.read_key(rec_pos) {
                         if &rkey == key {
-                            // Overwrite the old element with the new in the index. This will leave
-                            // garbage in the data file but lookups will work and be consistent.
-                            let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                            buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
-                            pos += 8;
-                            buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                            pos += 8;
-                            buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
-                            return Ok(());
+                            if self.config.allow_duplicate_inserts {
+                                // Overwrite the old element with the new in the index. This will leave
+                                // garbage in the data file but lookups will work and be consistent.
+                                let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
+                                buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
+                                pos += 8;
+                                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+                                pos += 8;
+                                buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
+                                return Ok(());
+                            } else {
+                                // Don't allow duplicates so error out (caller should roll back insert).
+                                return Err(InsertError::DuplicateKey);
+                            }
                         }
                     }
                 }
             }
         }
         // false, save bucket as an overflow record and add to the fresh bucket.
-        self.odx_file.seek(SeekFrom::End(0))?;
-        let overflow_pos = self.odx_file.seek(SeekFrom::Current(0))?;
+        self.odx_file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| InsertError::KeyError(e.into()))?;
+        let overflow_pos = self
+            .odx_file
+            .seek(SeekFrom::Current(0))
+            .map_err(|e| InsertError::KeyError(e.into()))?;
         add_crc32(buffer);
         // Write the old buffer into the data file as an overflow record.
-        self.odx_file.write_all(buffer)?;
+        self.odx_file
+            .write_all(buffer)
+            .map_err(|e| InsertError::KeyError(e.into()))?;
         // clear buffer and reset to 0.
         buffer.fill(0);
         // Copy the position of the overflow record into the first u64.
@@ -1113,10 +1131,9 @@ mod tests {
         let mut db: DbCore<u64, String, 8> = DbConfig::new(".", "xxx50k", 1)
             .create()
             .truncate()
-            .allow_duplicate_inserts()
             .no_auto_flush()
-            //.set_bucket_elements(8)
-            .set_load_factor(0.5)
+            //.set_bucket_elements(25)
+            .set_load_factor(0.6)
             .build()
             .unwrap();
         assert!(!db.contains_key(&0).unwrap());

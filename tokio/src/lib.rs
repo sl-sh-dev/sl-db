@@ -272,9 +272,8 @@ mod tests {
         let config = DbConfig::new(".", "xxx50k", 1)
             .no_auto_flush()
             .create()
-            .allow_duplicate_inserts()
-            //.set_bucket_elements(8)
-            //.set_load_factor(0.5)
+            //.set_bucket_elements(100)
+            .set_load_factor(0.6)
             .truncate(); //.no_write_cache();
         let db: AsyncDb<u64, String, 8> = AsyncDb::open(config).unwrap();
         assert!(!db.contains_key(0).await.unwrap());
