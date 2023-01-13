@@ -197,7 +197,7 @@ pub enum FetchError {
     DeserializeKey(DeserializeError),
     /// Failed to deserialize the value.
     DeserializeValue(DeserializeError),
-    /// An seeking in the data file (this should be hard to get).
+    /// An IO error seeking or reading in the data file.
     IO(io::Error),
     /// Requested item was not found.
     NotFound,

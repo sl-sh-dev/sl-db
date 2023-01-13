@@ -63,7 +63,9 @@ pub trait DbBytes<T> {
 }
 
 /// An instance of a DB.
-/// Will consist of a data file and hash index with optional log for commit recovery.
+/// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
+/// This is synchronous and single threaded.  It is intended to keep the algorithms clearer and
+/// to be wrapped for async or multi-threaded synchronous use.
 pub struct DbCore<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
@@ -77,7 +79,7 @@ where
     odx_file: File,
     hasher: S,
     // Keep a buffer around to share and avoid allocations.
-    // It is a Cell for interior mutability so we can use avoid borrow errors.
+    // It is a Cell for interior mutability so we can avoid borrow errors.
     scratch_buffer: Cell<Vec<u8>>,
     write_buffer: Vec<u8>,
     bucket_cache: FxHashMap<u64, Vec<u8>>,
@@ -251,6 +253,8 @@ where
     ///   - value size (u32)
     ///   - key data
     ///   - value data
+    /// After an InsertError::Flush the data will still be available in memory but failed to persist
+    /// to disk.  After any other error the insert will have rolled back.
     pub fn insert(&mut self, key: K, value: &V) -> Result<(), InsertError> {
         if !self.config.write {
             return Err(InsertError::ReadOnly);
@@ -318,6 +322,9 @@ where
             self.write_buffer.resize(start_write_buffer_len, 0);
             return Err(err);
         }
+        // Since the inserted data will still be "available" even after an error after this point go
+        // ahead and increment the values.
+        self.hdx_header.inc_values();
         // Now errors are tricky, we have already updated the index.  Leave the data for now...
         if self.config.auto_flush {
             if self.config.cache_writes {
@@ -338,7 +345,6 @@ where
                 self.write_buffer.clear();
             }
         }
-        self.hdx_header.inc_values();
         Ok(())
     }
 
@@ -503,6 +509,8 @@ where
     }
 
     /// Add one new bucket to the hash index.
+    /// Buckets are split "in order" determined by the current modulus not based on how full any
+    /// bucket is.
     fn split_one_bucket(&mut self) -> Result<(), InsertError> {
         let old_modulus = self.modulus;
         // This is the bucket that is being split.
@@ -548,6 +556,8 @@ where
     }
 
     /// Add buckets to expand capacity.
+    /// Capacity is number of elements per bucket * number of buckets.
+    /// If current length >= capacity * load factor then split buckets until this is not true.
     fn expand_buckets(&mut self) -> Result<(), InsertError> {
         if self.config.allow_bucket_expansion {
             while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
@@ -568,8 +578,10 @@ where
     ) -> Result<(), InsertError> {
         let bucket = self.get_bucket(hash);
         let mut buffer = if let Some(buf) = self.bucket_cache.remove(&bucket) {
+            // Get the bucket from the bucket cache.
             buf
         } else {
+            // Read the bucket from the index and verify (crc32) it.
             let bucket_size = self.hdx_header.bucket_size() as usize;
             let mut buffer = vec![0; bucket_size];
             let bucket_pos: u64 = (HDX_HEADER_SIZE + (bucket as usize * bucket_size)) as u64;
@@ -588,6 +600,7 @@ where
         };
 
         let result = self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer);
+        // Need to make sure the bucket goes into the cache even on error.
         self.bucket_cache.insert(bucket, buffer);
         result
     }
@@ -606,6 +619,7 @@ where
     }
 
     /// Save the (hash, position, record_size) tuple to the bucket.  Handles overflow records.
+    /// If this produces and Error then buffer will contain the same data.
     fn save_to_bucket_buffer(
         &mut self,
         key: Option<&K>,
@@ -685,8 +699,7 @@ where
 
     /// Read the record at position.
     /// Returns the (key, value) tuple
-    /// Will produce an error for IO or if the record at position is actually an overflow bucket not
-    /// a data record.
+    /// Will produce an error for IO or or for a failed CRC32 integrity check.
     fn read_record_raw(
         &mut self,
         position: u64,
@@ -725,8 +738,7 @@ where
 
     /// Read the record at position.
     /// Returns the (key, value) tuple.
-    /// Will produce an error for IO or if the record at position is actually an overflow bucket not
-    /// a data record.
+    /// Will produce an error for IO or or for a failed CRC32 integrity check.
     fn read_record(&mut self, position: u64, size: usize) -> Result<(K, V), FetchError> {
         let mut buffer = self.scratch_buffer.take();
         let result = self.read_record_raw(position, size, &mut buffer);
@@ -735,8 +747,8 @@ where
     }
 
     /// Read the key for the record at position.
-    /// The position needs to be valid, attempting to read an overflow bucket or other invalid area will
-    /// produce an error or invalid key.
+    /// The position needs to be valid, attempting to read an invalid area will
+    /// produce an error or invalid key.  This is a truncated read and DOES NOT do a CRC32 check.
     fn read_key(&mut self, position: u64) -> Result<K, ReadKeyError> {
         let mut buffer = self.scratch_buffer.take();
 
@@ -761,7 +773,7 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
+    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE>, LoadHeaderError> {
         let dat_file = { self.data_file.try_clone()? };
         DbRawIter::with_file(dat_file)
     }
@@ -1004,7 +1016,6 @@ mod tests {
     }
 
     type TestDb = DbCore<Key, String, 32>;
-    type TestDbRawIter = DbRawIter<Key, String, 32>;
 
     #[test]
     fn test_one() {
@@ -1041,7 +1052,7 @@ mod tests {
             assert_eq!(v, "Value Four");
 
             db.flush().unwrap();
-            let mut iter = db.raw_iter().unwrap();
+            let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
             let key = Key([1_u8; 32]);
             assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
             let key = Key([2_u8; 32]);
@@ -1085,7 +1096,7 @@ mod tests {
         assert_eq!(v, "Value Three2");
         drop(db);
 
-        let mut iter: TestDbRawIter = DbRawIter::open(".", "xxx1").unwrap();
+        let mut iter = DbRawIter::open(".", "xxx1").unwrap().map(|r| r.unwrap());
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
         let key = Key([2_u8; 32]);
@@ -1104,7 +1115,7 @@ mod tests {
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
 
         let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
-        let mut iter = db.raw_iter().unwrap();
+        let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
         let key = Key([2_u8; 32]);
@@ -1177,7 +1188,8 @@ mod tests {
         db.commit().unwrap();
         println!("XXXX commit time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
-        let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
+        //let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
+        let vals: Vec<String> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
         assert_eq!(vals.len(), max as usize);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));
@@ -1206,7 +1218,7 @@ mod tests {
         }
         assert_eq!(db.len(), 50_000);
         db.flush().unwrap();
-        let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
+        let vals: Vec<String> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
         assert_eq!(vals.len(), 50_000);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));

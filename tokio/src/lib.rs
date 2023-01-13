@@ -133,7 +133,7 @@ where
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
-    pub async fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE, S>, LoadHeaderError> {
+    pub async fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE>, LoadHeaderError> {
         self.db_read.lock().await.raw_iter()
     }
 
@@ -320,7 +320,7 @@ mod tests {
         db.commit().await.unwrap();
         println!("XXXX TOK commit time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
-        let vals: Vec<String> = db.raw_iter().await.unwrap().map(|(_k, v)| v).collect();
+        let vals: Vec<String> = db.raw_iter().await.unwrap().map(|r| r.unwrap().1).collect();
         assert_eq!(vals.len(), max as usize);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v, &format!("Value {}", i));

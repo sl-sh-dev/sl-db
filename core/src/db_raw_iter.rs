@@ -5,32 +5,30 @@ use crate::db::data_header::DataHeader;
 use crate::db::{DbBytes, DbKey};
 use crate::error::FetchError;
 use crate::error::LoadHeaderError;
-use crate::fxhasher::FxHasher;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, BuildHasherDefault};
+use std::io;
 use std::io::{BufReader, Read, Seek};
 use std::marker::PhantomData;
 use std::path::Path;
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
-pub struct DbRawIter<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+pub struct DbRawIter<K, V, const KSIZE: u16>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
 {
-    _db: PhantomData<(K, V, S)>,
+    _key: PhantomData<K>,
+    _val: PhantomData<V>,
     file: BufReader<File>,
     buffer: Vec<u8>,
 }
 
-impl<K, V, const KSIZE: u16, S> DbRawIter<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16> DbRawIter<K, V, KSIZE>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
 {
     /// Open the data file in dir with base_name (note do not include the .dat- that is appended).
     /// Produces an iterator over all the (key, values).  Does not use the index at all and records
@@ -46,7 +44,8 @@ where
         let _header = DataHeader::load_header(&mut data_file)?;
         let file = BufReader::new(data_file);
         Ok(Self {
-            _db: PhantomData,
+            _key: PhantomData,
+            _val: PhantomData,
             file,
             buffer: Vec::new(),
         })
@@ -58,7 +57,8 @@ where
         let _header = DataHeader::load_header(&mut dat_file)?;
         let file = BufReader::new(dat_file);
         Ok(Self {
-            _db: PhantomData,
+            _key: PhantomData,
+            _val: PhantomData,
             file,
             buffer: Vec::new(),
         })
@@ -73,7 +73,14 @@ where
         let mut crc32_hasher = crc32fast::Hasher::new();
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
-            file.read_exact(&mut key_size)?;
+            if let Err(err) = file.read_exact(&mut key_size) {
+                // An EOF here should be caused by no more records although it is possible there
+                // was a bit of garbage at the end of the file, not worrying about that now (maybe ever).
+                if let io::ErrorKind::UnexpectedEof = err.kind() {
+                    return Err(FetchError::NotFound);
+                }
+                return Err(FetchError::IO(err));
+            }
             crc32_hasher.update(&key_size);
             u16::from_le_bytes(key_size)
         } else {
@@ -81,7 +88,16 @@ where
         } as usize;
 
         let mut val_size_buf = [0_u8; 4];
-        file.read_exact(&mut val_size_buf)?;
+        if K::is_variable_key_size() {
+            file.read_exact(&mut val_size_buf)?;
+        } else if let Err(err) = file.read_exact(&mut val_size_buf) {
+            // An EOF here should be caused by no more records although it is possible there
+            // was a bit of garbage at the end of the file, not worrying about that now (maybe ever).
+            if let io::ErrorKind::UnexpectedEof = err.kind() {
+                return Err(FetchError::NotFound);
+            }
+            return Err(FetchError::IO(err));
+        }
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         buffer.resize(key_size as usize, 0);
@@ -103,19 +119,20 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> Iterator for DbRawIter<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16> Iterator for DbRawIter<K, V, KSIZE>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
 {
-    type Item = (K, V);
+    type Item = Result<(K, V), FetchError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Ok(ret) = Self::read_record_file(&mut self.file, &mut self.buffer) {
-            Some(ret)
-        } else {
-            None
+        match Self::read_record_file(&mut self.file, &mut self.buffer) {
+            Ok(kv) => Some(Ok(kv)),
+            Err(err) => match err {
+                FetchError::NotFound => None,
+                _ => Some(Err(err)),
+            },
         }
     }
 }
