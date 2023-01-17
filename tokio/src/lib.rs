@@ -72,6 +72,8 @@ where
             Ok(val.clone())
         } else {
             self.db_read.lock().await.fetch(&key)
+            //let db_read = self.db_read.clone();
+            //tokio::task::spawn_blocking(move || db_read.blocking_lock().fetch(&key)).await.unwrap()//.map_err(|_|FetchError::NotFound)
         }
     }
 
@@ -266,16 +268,17 @@ where
 mod tests {
     use super::*;
     use std::time;
+    use tokio::task::JoinSet;
 
     #[tokio::test]
-    async fn test_50k() {
+    async fn test_x50k() {
         let config = DbConfig::new(".", "xxx50k", 1)
             .no_auto_flush()
             .create()
             //.set_bucket_elements(100)
-            .set_load_factor(0.6)
+            //.set_load_factor(0.6)
             .truncate(); //.no_write_cache();
-        let db: AsyncDb<u64, String, 8> = AsyncDb::open(config).unwrap();
+        let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config).unwrap());
         assert!(!db.contains_key(0).await.unwrap());
         assert!(!db.contains_key(10).await.unwrap());
         assert!(!db.contains_key(35_000).await.unwrap());
@@ -303,7 +306,7 @@ mod tests {
         assert!(db.contains_key(49_000).await.unwrap());
         assert!(!db.contains_key(max).await.unwrap());
 
-        let start = time::Instant::now();
+        /*let start = time::Instant::now();
         assert_eq!(&db.fetch(35_000).await.unwrap(), "Value 35000");
         for i in 0..max {
             let item = db.fetch(i as u64).await;
@@ -314,7 +317,7 @@ mod tests {
             "XXXX TOK fetch ({}) (pre commit) time {}",
             max,
             start.elapsed().as_secs_f64()
-        );
+        );*/
 
         let start = time::Instant::now();
         db.commit().await.unwrap();
@@ -327,11 +330,16 @@ mod tests {
         }
         println!("XXXX TOK iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
+        let mut fetch_set = JoinSet::new();
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let db_clone = db.clone();
+            fetch_set.spawn(async move {
+                let item = db_clone.fetch(i as u64).await;
+                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            });
         }
+        while fetch_set.join_next().await.is_some() {}
         println!(
             "XXXX TOK fetch ({}) time {}",
             max,

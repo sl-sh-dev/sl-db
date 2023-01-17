@@ -82,6 +82,9 @@ where
     // It is a Cell for interior mutability so we can avoid borrow errors.
     scratch_buffer: Cell<Vec<u8>>,
     write_buffer: Vec<u8>,
+    read_buffer: Vec<u8>,
+    read_buffer_start: usize,
+    read_buffer_len: usize,
     bucket_cache: FxHashMap<u64, Vec<u8>>,
     hdx_header: HdxHeader,
     modulus: u32,
@@ -152,10 +155,7 @@ where
         let odx_name = config.dir.join(&config.base_name).with_extension("odx");
         let (mut data_file, header) =
             Self::open_data_file(&data_name, &config).map_err(OpenError::DataFileOpen)?;
-        data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
-        let data_file_end = data_file
-            .seek(SeekFrom::Current(0))
-            .map_err(OpenError::Seek)?;
+        let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
         let (hdx_file, hdx_header) =
             Self::open_hdx_file(&hdx_name, &header, &config).map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
@@ -168,6 +168,25 @@ where
             // If opening read only wont need capacity.
             (Vec::new(), FxHashMap::default())
         };
+        let mut read_buffer = vec![0; config.read_buffer_size as usize];
+        // Prime the read buffer so we don't have to check if it is empty, etc.
+        let mut read_buffer_len = 0_usize;
+        if data_file_end > 0 {
+            data_file
+                .seek(SeekFrom::Start(0))
+                .map_err(OpenError::Seek)?;
+            if data_file_end < config.read_buffer_size as u64 {
+                data_file
+                    .read_exact(&mut read_buffer[..data_file_end as usize])
+                    .map_err(OpenError::DataReadError)?;
+                read_buffer_len = data_file_end as usize;
+            } else {
+                data_file
+                    .read_exact(&mut read_buffer[..])
+                    .map_err(OpenError::DataReadError)?;
+                read_buffer_len = config.read_buffer_size as usize;
+            }
+        }
         let (odx_file, _odx_header) = Self::open_odx_file(&odx_name, &hdx_header, &config)
             .map_err(OpenError::IndexFileOpen)?;
         // TODO, crosscheck all the headers and make sure everything checks out.
@@ -184,6 +203,9 @@ where
             capacity: hdx_header.buckets() as u64 * hdx_header.bucket_elements() as u64,
             scratch_buffer: Cell::new(Vec::new()),
             write_buffer,
+            read_buffer,
+            read_buffer_start: 0,
+            read_buffer_len,
             bucket_cache,
             seek_pos: 0,
             config,
@@ -198,10 +220,10 @@ where
         let bucket = self.get_bucket(hash);
 
         let mut iter = bucket_iter!(self, bucket);
-        for (rec_hash, rec_pos, rec_size) in &mut iter {
+        for (rec_hash, rec_pos) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
-                let (rkey, val) = self.read_record(rec_pos, rec_size as usize)?;
+                let (rkey, val) = self.read_record(rec_pos)?;
                 if &rkey == key {
                     return Ok(val);
                 }
@@ -219,7 +241,7 @@ where
         let hash = self.hash(key);
         let bucket = self.get_bucket(hash);
         let mut iter = bucket_iter!(self, bucket);
-        for (rec_hash, rec_pos, _rec_size) in &mut iter {
+        for (rec_hash, rec_pos) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
                 let rkey = self.read_key(rec_pos)?;
@@ -244,6 +266,10 @@ where
                 // Don't want buckets and modulus to be the same, so +1
                 self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
             }
+            self.data_file_end = self
+                .data_file
+                .seek(SeekFrom::End(0))
+                .unwrap_or(self.data_file_end);
         }
     }
 
@@ -308,7 +334,6 @@ where
         self.write_buffer
             .write_all(&crc32.to_le_bytes())
             .expect("write_all to Vec is infallible");
-        let record_size = (self.write_buffer.len() - start_write_buffer_len) as u32;
 
         // An early return on error could cause a new buffer to be created, should not be a big deal.
         self.scratch_buffer.set(buffer);
@@ -317,7 +342,7 @@ where
             self.write_buffer.resize(start_write_buffer_len, 0);
             return Err(err);
         }
-        if let Err(err) = self.save_to_bucket(&key, hash, (record_pos, record_size)) {
+        if let Err(err) = self.save_to_bucket(&key, hash, record_pos) {
             // Rollback the write.
             self.write_buffer.resize(start_write_buffer_len, 0);
             return Err(err);
@@ -526,7 +551,7 @@ where
         let mut buffer2 = vec![0; bucket_size];
 
         let mut iter = bucket_iter!(self, split_bucket);
-        for (rec_hash, rec_pos, rec_size) in &mut iter {
+        for (rec_hash, rec_pos) in &mut iter {
             if rec_pos > 0 {
                 let bucket = self.get_bucket(rec_hash);
                 if bucket != split_bucket && bucket != new_bucket {
@@ -539,10 +564,10 @@ where
                     );
                 }
                 if bucket == split_bucket {
-                    self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer)
+                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer)
                         .map_err(|_| InsertError::IndexOverflow)?;
                 } else {
-                    self.save_to_bucket_buffer(None, rec_hash, (rec_pos, rec_size), &mut buffer2)
+                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer2)
                         .map_err(|_| InsertError::IndexOverflow)?;
                 }
             }
@@ -570,12 +595,7 @@ where
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket(
-        &mut self,
-        key: &K,
-        hash: u64,
-        pos_size: (u64, u32),
-    ) -> Result<(), InsertError> {
+    fn save_to_bucket(&mut self, key: &K, hash: u64, record_pos: u64) -> Result<(), InsertError> {
         let bucket = self.get_bucket(hash);
         let mut buffer = if let Some(buf) = self.bucket_cache.remove(&bucket) {
             // Get the bucket from the bucket cache.
@@ -599,7 +619,7 @@ where
             buffer
         };
 
-        let result = self.save_to_bucket_buffer(Some(key), hash, pos_size, &mut buffer);
+        let result = self.save_to_bucket_buffer(Some(key), hash, record_pos, &mut buffer);
         // Need to make sure the bucket goes into the cache even on error.
         self.bucket_cache.insert(bucket, buffer);
         result
@@ -624,10 +644,9 @@ where
         &mut self,
         key: Option<&K>,
         hash: u64,
-        pos_size: (u64, u32),
+        record_pos: u64,
         buffer: &mut [u8],
     ) -> Result<(), InsertError> {
-        let (record_pos, record_size) = pos_size;
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.hdx_header.bucket_elements() as u64 {
             let mut buf64 = [0_u8; 8];
@@ -636,8 +655,7 @@ where
             pos += 8;
             buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
             let rec_pos = u64::from_le_bytes(buf64);
-            // Skip over size
-            pos += 12;
+            pos += 8;
             // Test rec_pos == 0 to handle degenerate case of a hash of 0.
             // Find an empty element should indicate no more elements (so the key check below is ok).
             if rec_hash == 0 && rec_pos == 0 {
@@ -646,8 +664,6 @@ where
                 buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
                 pos += 8;
                 buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                pos += 8;
-                buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
                 return Ok(());
             }
             if rec_hash == hash {
@@ -661,8 +677,6 @@ where
                                 buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
                                 pos += 8;
                                 buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                                pos += 8;
-                                buffer[pos..pos + 4].copy_from_slice(&record_size.to_le_bytes());
                                 return Ok(());
                             } else {
                                 // Don't allow duplicates so error out (caller should roll back insert).
@@ -674,12 +688,9 @@ where
             }
         }
         // false, save bucket as an overflow record and add to the fresh bucket.
-        self.odx_file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| InsertError::KeyError(e.into()))?;
         let overflow_pos = self
             .odx_file
-            .seek(SeekFrom::Current(0))
+            .seek(SeekFrom::End(0))
             .map_err(|e| InsertError::KeyError(e.into()))?;
         add_crc32(buffer);
         // Write the old buffer into the data file as an overflow record.
@@ -693,7 +704,6 @@ where
         // First element will be the hash and position being saved (rest of new bucket is empty).
         buffer[8..16].copy_from_slice(&hash.to_le_bytes());
         buffer[16..24].copy_from_slice(&record_pos.to_le_bytes());
-        buffer[24..28].copy_from_slice(&record_size.to_le_bytes());
         Ok(())
     }
 
@@ -703,45 +713,56 @@ where
     fn read_record_raw(
         &mut self,
         position: u64,
-        size: usize,
         buffer: &mut Vec<u8>,
     ) -> Result<(K, V), FetchError> {
-        buffer.resize(size, 0);
-        // Move the read cursor to position.  Note the data file is opened in append mode so write
-        // cursor is always EOF.
         self.seek(SeekFrom::Start(position))?;
-        self.read_exact(&mut buffer[..])?;
-        let mut buf_32 = [0_u8; 4];
-        if !check_crc(buffer) {
-            return Err(FetchError::CrcFailed);
-        }
-        let mut pos = 0;
+        let mut crc32_hasher = crc32fast::Hasher::new();
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
-            key_size.copy_from_slice(&buffer[0..2]);
-            pos += 2;
+            self.read_exact(&mut key_size)?;
+            crc32_hasher.update(&key_size);
             u16::from_le_bytes(key_size)
         } else {
             K::KEY_SIZE
         } as usize;
 
-        buf_32.copy_from_slice(&buffer[pos..pos + 4]);
-        pos += 4;
-        let val_size = u32::from_le_bytes(buf_32) as usize;
-        let key =
-            K::deserialize(&buffer[pos..pos + key_size]).map_err(FetchError::DeserializeKey)?;
-        pos += key_size;
-        let val =
-            V::deserialize(&buffer[pos..pos + val_size]).map_err(FetchError::DeserializeValue)?;
+        let mut val_size_buf = [0_u8; 4];
+        if K::is_variable_key_size() {
+            self.read_exact(&mut val_size_buf)?;
+        } else if let Err(err) = self.read_exact(&mut val_size_buf) {
+            // An EOF here should be caused by no more records although it is possible there
+            // was a bit of garbage at the end of the file, not worrying about that now (maybe ever).
+            if let io::ErrorKind::UnexpectedEof = err.kind() {
+                return Err(FetchError::NotFound);
+            }
+            return Err(FetchError::IO(err));
+        }
+        crc32_hasher.update(&val_size_buf);
+        let val_size = u32::from_le_bytes(val_size_buf);
+        buffer.resize(key_size as usize, 0);
+        self.read_exact(buffer)?;
+        crc32_hasher.update(buffer);
+        let key = K::deserialize(&buffer[..]).map_err(FetchError::DeserializeKey)?;
+        buffer.resize(val_size as usize, 0);
+        self.read_exact(buffer)?;
+        crc32_hasher.update(buffer);
+        let calc_crc32 = crc32_hasher.finalize();
+        let val = V::deserialize(&buffer[..]).map_err(FetchError::DeserializeValue)?;
+        let mut buf_u32 = [0_u8; 4];
+        self.read_exact(&mut buf_u32)?;
+        let read_crc32 = u32::from_le_bytes(buf_u32);
+        if calc_crc32 != read_crc32 {
+            return Err(FetchError::CrcFailed);
+        }
         Ok((key, val))
     }
 
     /// Read the record at position.
     /// Returns the (key, value) tuple.
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn read_record(&mut self, position: u64, size: usize) -> Result<(K, V), FetchError> {
+    fn read_record(&mut self, position: u64) -> Result<(K, V), FetchError> {
         let mut buffer = self.scratch_buffer.take();
-        let result = self.read_record_raw(position, size, &mut buffer);
+        let result = self.read_record_raw(position, &mut buffer);
         self.scratch_buffer.set(buffer);
         result
     }
@@ -777,6 +798,23 @@ where
         let dat_file = { self.data_file.try_clone()? };
         DbRawIter::with_file(dat_file)
     }
+
+    /// Copy bytes form the read buffer into buf.  This expects seek_pos to be within the
+    /// read_buffer (will panic if called incorrectly).
+    fn copy_read_buffer(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut size = buf.len();
+        let read_depth = self.seek_pos as usize - self.read_buffer_start;
+        if read_depth + size > self.read_buffer_len {
+            size = self.read_buffer_len - read_depth;
+        }
+        buf[..size].copy_from_slice(&self.read_buffer[read_depth..read_depth + size]);
+        self.seek_pos += size as u64;
+        if size == 0 {
+            panic!("Invalid call to from_read_buffer, size: {}, read buffer index: {}, seek pos: {}, read buffer start: {}",
+                   size, read_depth, self.seek_pos, self.read_buffer_start);
+        }
+        Ok(size)
+    }
 }
 
 impl<K, V, const KSIZE: u16, S> Read for DbCore<K, V, KSIZE, S>
@@ -786,16 +824,11 @@ where
     S: BuildHasher + Default,
 {
     /// Read for the DbInner.  This allows other code to not worry about whether data is read from
-    /// the file or the write buffer.  The file and write buffer will not have overlapping records
+    /// the file, write buffer or the read buffer.  The file and write buffer will not have overlapping records
     /// so this will not read across them in one call.  This will not happen on a proper DB although
     /// the Read contract should handle this fine.
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.config.write {
-            // Assume file is at the correct position.
-            let size = self.data_file.read(buf)?;
-            self.seek_pos += size as u64;
-            Ok(size)
-        } else if self.seek_pos >= self.data_file_end {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.seek_pos >= self.data_file_end {
             let write_pos = (self.seek_pos - self.data_file_end) as usize;
             if write_pos < self.write_buffer.len() {
                 let mut size = buf.len();
@@ -808,11 +841,45 @@ where
             } else {
                 Ok(0)
             }
+        } else if self.seek_pos >= self.read_buffer_start as u64
+            && self.seek_pos < (self.read_buffer_start + self.read_buffer_len) as u64
+        {
+            self.copy_read_buffer(buf)
         } else {
-            // Assume file is at the correct position.
-            let size = self.data_file.read(buf)?;
-            self.seek_pos += size as u64;
-            Ok(size)
+            let mut seek_pos = self.seek_pos;
+            let mut end = self.data_file_end - seek_pos;
+            if end < self.config.read_buffer_size as u64 {
+                // If remaining bytes are less then the buffer pull back seek_pos to fill the buffer.
+                seek_pos = if self.data_file_end > self.config.read_buffer_size as u64 {
+                    self.data_file_end - self.config.read_buffer_size as u64
+                } else {
+                    0
+                };
+            } else {
+                // Put the seek position in the mid point of the read buffer.  This might help increase
+                // buffer hits or might do nothing or hurt depending on fetch patterns.
+                seek_pos = if seek_pos > (self.config.read_buffer_size / 2) as u64 {
+                    seek_pos - (self.config.read_buffer_size / 2) as u64
+                } else {
+                    0
+                };
+            }
+            end = self.data_file_end - seek_pos;
+            if end > 0 {
+                self.data_file.seek(SeekFrom::Start(seek_pos))?;
+                if end < self.config.read_buffer_size as u64 {
+                    self.data_file
+                        .read_exact(&mut self.read_buffer[..end as usize])?;
+                    self.read_buffer_len = end as usize;
+                } else {
+                    self.data_file.read_exact(&mut self.read_buffer[..])?;
+                    self.read_buffer_len = self.config.read_buffer_size as usize;
+                }
+                self.read_buffer_start = seek_pos as usize;
+                self.copy_read_buffer(buf)
+            } else {
+                Ok(0)
+            }
         }
     }
 }
@@ -825,34 +892,26 @@ where
 {
     /// Seek on the DbInner treating the file and write cache as one byte array.
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        if !self.config.write {
-            self.seek_pos = self.data_file.seek(pos)?; //SeekFrom::Start(self.seek_pos))?;
-            Ok(self.seek_pos)
-        } else {
-            match pos {
-                SeekFrom::Start(pos) => self.seek_pos = pos,
-                SeekFrom::End(pos) => {
-                    let end = (self.data_file_end + self.write_buffer.len() as u64) as i64 + pos;
-                    if end >= 0 {
-                        self.seek_pos = end as u64;
-                    } else {
-                        self.seek_pos = 0;
-                    }
-                }
-                SeekFrom::Current(pos) => {
-                    let end = self.seek_pos as i64 + pos;
-                    if end >= 0 {
-                        self.seek_pos = end as u64;
-                    } else {
-                        self.seek_pos = 0;
-                    }
+        match pos {
+            SeekFrom::Start(pos) => self.seek_pos = pos,
+            SeekFrom::End(pos) => {
+                let end = (self.data_file_end + self.write_buffer.len() as u64) as i64 + pos;
+                if end >= 0 {
+                    self.seek_pos = end as u64;
+                } else {
+                    self.seek_pos = 0;
                 }
             }
-            if self.seek_pos < self.data_file_end || !self.config.write {
-                self.data_file.seek(SeekFrom::Start(self.seek_pos))?;
+            SeekFrom::Current(pos) => {
+                let end = self.seek_pos as i64 + pos;
+                if end >= 0 {
+                    self.seek_pos = end as u64;
+                } else {
+                    self.seek_pos = 0;
+                }
             }
-            Ok(self.seek_pos)
         }
+        Ok(self.seek_pos)
     }
 }
 
@@ -913,7 +972,7 @@ impl<'src, R: Read + Seek> BucketIter<'src, R> {
 }
 
 impl<'src, R: Read + Seek> Iterator for &mut BucketIter<'src, R> {
-    type Item = (u64, u64, u32);
+    type Item = (u64, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.crc_failure {
@@ -921,8 +980,6 @@ impl<'src, R: Read + Seek> Iterator for &mut BucketIter<'src, R> {
         }
         // For reading u64 values, needs an array.
         let mut buf64 = [0_u8; 8];
-        // For reading u32 values, needs an array.
-        let mut buf32 = [0_u8; 4];
         loop {
             if self.bucket_pos < self.elements as usize {
                 let mut pos = 8 + (self.bucket_pos * BUCKET_ELEMENT_SIZE);
@@ -931,14 +988,11 @@ impl<'src, R: Read + Seek> Iterator for &mut BucketIter<'src, R> {
                 pos += 8;
                 buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
                 let rec_pos = u64::from_le_bytes(buf64);
-                pos += 8;
-                buf32.copy_from_slice(&self.buffer[pos..(pos + 4)]);
-                let rec_size = u32::from_le_bytes(buf32);
                 if hash == 0 && rec_pos == 0 {
                     self.bucket_pos += 1;
                 } else {
                     self.bucket_pos += 1;
-                    return Some((hash, rec_pos, rec_size));
+                    return Some((hash, rec_pos));
                 }
             } else if self.overflow_pos > 0 {
                 // We have an overflow bucket to search as well.
@@ -1149,7 +1203,7 @@ mod tests {
             .truncate()
             .no_auto_flush()
             //.set_bucket_elements(25)
-            .set_load_factor(0.6)
+            //.set_load_factor(0.6)
             .build()
             .unwrap();
         assert!(!db.contains_key(&0).unwrap());
@@ -1203,6 +1257,31 @@ mod tests {
             assert_eq!(&item.unwrap(), &format!("Value {}", i));
         }
         println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
+
+        let start = time::Instant::now();
+        //assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
+        for i in 1..=max {
+            //if i % 10_000 == 0 {println!("XXXXX fetching {}", max - i as u64); }
+            let item = db.fetch(&(max - i as u64));
+            assert!(item.is_ok(), "Failed on item {}", max - i);
+            assert_eq!(&item.unwrap(), &format!("Value {}", max - i));
+        }
+        println!("XXXX fetch (REV) time {}", start.elapsed().as_secs_f64());
+
+        let start = time::Instant::now();
+        //assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
+        let max_val = max - 1;
+        for i in 0..(max / 2) {
+            //if i % 10_000 == 0 {println!("XXXXX fetching {}", max - i as u64); }
+            let item = db.fetch(&(i as u64));
+            assert!(item.is_ok(), "Failed on item {}", i);
+            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+
+            let item = db.fetch(&(max_val - i as u64));
+            assert!(item.is_ok(), "Failed on item {}", max_val - i);
+            assert_eq!(&item.unwrap(), &format!("Value {}", max_val - i));
+        }
+        println!("XXXX fetch (MIX) time {}", start.elapsed().as_secs_f64());
     }
 
     #[test]

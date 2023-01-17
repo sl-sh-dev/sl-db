@@ -24,6 +24,7 @@ pub struct DbConfig {
     pub(crate) allow_duplicate_inserts: bool,
     pub(crate) cache_writes: bool,
     pub(crate) auto_flush: bool,
+    pub(crate) read_buffer_size: u32,
 }
 
 impl DbConfig {
@@ -47,6 +48,7 @@ impl DbConfig {
             allow_duplicate_inserts: false,
             cache_writes: true,
             auto_flush: true,
+            read_buffer_size: 8 * 1024, // 8kb default.
         }
     }
 

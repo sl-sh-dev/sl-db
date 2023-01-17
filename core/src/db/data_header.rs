@@ -6,8 +6,8 @@ use crate::error::LoadHeaderError;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-// Each bucket element is a (u64, u64, u32)- (hash, record_pos, record_size).
-pub(crate) const BUCKET_ELEMENT_SIZE: usize = 20;
+// Each bucket element is a (u64, u64)- (hash, record_pos).
+pub(crate) const BUCKET_ELEMENT_SIZE: usize = 16;
 const HEADER_BYTES: usize = 30;
 
 /// Struct that contains the header for a sldb data file.
