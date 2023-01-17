@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use sldb_core::db::{DbBytes, DbCore, DbKey};
-use sldb_core::db_config::DbConfig;
+use sldb_core::db_config::{DbConfig, DbFiles};
 use sldb_core::db_raw_iter::DbRawIter;
 use sldb_core::error::flush::FlushError;
 use sldb_core::error::insert::InsertError;
@@ -23,6 +23,7 @@ where
     write_cache: Arc<DashMap<K, V>>,
     insert_tx: mpsc::Sender<InsertCommand<K, KSIZE>>,
     insert_thread: Option<std::thread::JoinHandle<()>>,
+    config: DbConfig,
 }
 
 impl<K, V, const KSIZE: u16, S> Drop for AsyncDb<K, V, KSIZE, S>
@@ -51,7 +52,9 @@ where
         // Open the write db (passed to the insert thread).
         let db = DbCore::open(config.clone())?;
         // Open a read only DB for fetching, reduces locks.
-        let db_read = Arc::new(tokio::sync::Mutex::new(DbCore::open(config.read_only())?));
+        let db_read = Arc::new(tokio::sync::Mutex::new(DbCore::open(
+            config.clone().read_only(),
+        )?));
         let write_cache: Arc<DashMap<K, V>> = Arc::new(DashMap::new());
         let write_cache_clone = write_cache.clone();
         let db_read_clone = db_read.clone();
@@ -63,7 +66,13 @@ where
             write_cache,
             insert_tx,
             insert_thread: Some(db_thread),
+            config,
         })
+    }
+
+    /// Returns a reference to the file names for this DB.
+    pub fn files(&self) -> &DbFiles {
+        self.config.files()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.

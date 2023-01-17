@@ -7,11 +7,47 @@ use std::fmt::Debug;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
 
+/// Contains the file names, paths etc for all the files in a DB.
+#[derive(Clone)]
+pub struct DbFiles {
+    /// The directory containing the DB.
+    pub dir: PathBuf,
+    /// Base name (without directory) of the DB.
+    pub base_name: PathBuf,
+    /// The full path and name of the data file.
+    pub data_file: PathBuf,
+    /// The full path and name of the index file.
+    pub hdx_file: PathBuf,
+    /// The full path and name of the index overflow file.
+    pub odx_file: PathBuf,
+    /// Reserved for a future log file.
+    pub log_file: PathBuf,
+}
+
+impl DbFiles {
+    /// Create a new DbFiles struct from a directory and base name.
+    pub fn new<P: Into<PathBuf>>(dir: P, base_name: P) -> Self {
+        let dir: PathBuf = dir.into();
+        let base_name: PathBuf = base_name.into();
+        let data_file = dir.join(&base_name).with_extension("dat");
+        let hdx_file = dir.join(&base_name).with_extension("hdx");
+        let odx_file = dir.join(&base_name).with_extension("odx");
+        let log_file = dir.join(&base_name).with_extension("log");
+        DbFiles {
+            dir,
+            base_name,
+            data_file,
+            hdx_file,
+            odx_file,
+            log_file,
+        }
+    }
+}
+
 /// Configuration for a database.
 #[derive(Clone)]
 pub struct DbConfig {
-    pub(crate) dir: PathBuf,
-    pub(crate) base_name: PathBuf,
+    pub(crate) files: DbFiles,
     pub(crate) appnum: u64,
     pub(crate) initial_buckets: u32,
     pub(crate) bucket_elements: u16,
@@ -33,9 +69,9 @@ impl DbConfig {
         let initial_buckets = 128;
         let bucket_elements = 25; //(bucket_size - 8) / BUCKET_ELEMENT_SIZE as u16;
         let bucket_size = 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
+        let files = DbFiles::new(dir, base_name);
         Self {
-            dir: dir.into(),
-            base_name: base_name.into(),
+            files,
             appnum,
             initial_buckets,
             bucket_elements,
@@ -52,16 +88,9 @@ impl DbConfig {
         }
     }
 
-    /// Set the directory that contains the DB files.
-    pub fn set_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
-        self.dir = dir.into();
-        self
-    }
-
-    /// Set the base name for the DB files in dir.
-    pub fn set_base_name<P: Into<PathBuf>>(mut self, base_name: P) -> Self {
-        self.base_name = base_name.into();
-        self
+    /// Returns a reference to the file names for this DB.
+    pub fn files(&self) -> &DbFiles {
+        &self.files
     }
 
     /// Open the database as read-only.

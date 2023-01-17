@@ -3,7 +3,7 @@
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
 use crate::db::hdx_header::{HdxHeader, HDX_HEADER_SIZE};
 use crate::db::odx_header::OdxHeader;
-use crate::db_config::DbConfig;
+use crate::db_config::{DbConfig, DbFiles};
 use crate::db_raw_iter::DbRawIter;
 use crate::error::flush::FlushError;
 use crate::error::insert::InsertError;
@@ -20,7 +20,6 @@ use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
-use std::path::Path;
 
 pub mod data_header;
 pub mod hdx_header;
@@ -150,14 +149,11 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        let data_name = config.dir.join(&config.base_name).with_extension("dat");
-        let hdx_name = config.dir.join(&config.base_name).with_extension("hdx");
-        let odx_name = config.dir.join(&config.base_name).with_extension("odx");
         let (mut data_file, header) =
-            Self::open_data_file(&data_name, &config).map_err(OpenError::DataFileOpen)?;
+            Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
         let (hdx_file, hdx_header) =
-            Self::open_hdx_file(&hdx_name, &header, &config).map_err(OpenError::IndexFileOpen)?;
+            Self::open_hdx_file(&header, &config).map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
         let (write_buffer, bucket_cache) = if config.write {
@@ -187,8 +183,8 @@ where
                 read_buffer_len = config.read_buffer_size as usize;
             }
         }
-        let (odx_file, _odx_header) = Self::open_odx_file(&odx_name, &hdx_header, &config)
-            .map_err(OpenError::IndexFileOpen)?;
+        let (odx_file, _odx_header) =
+            Self::open_odx_file(&hdx_header, &config).map_err(OpenError::IndexFileOpen)?;
         // TODO, crosscheck all the headers and make sure everything checks out.
         Ok(Self {
             _header: header,
@@ -212,6 +208,11 @@ where
             _key: PhantomData,
             _value: PhantomData,
         })
+    }
+
+    /// Returns a reference to the file names for this DB.
+    pub fn files(&self) -> &DbFiles {
+        &self.config.files
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
@@ -424,23 +425,20 @@ where
         Ok(())
     }
 
-    fn open_data_file(
-        data_name: &Path,
-        config: &DbConfig,
-    ) -> Result<(File, DataHeader), LoadHeaderError> {
+    fn open_data_file(config: &DbConfig) -> Result<(File, DataHeader), LoadHeaderError> {
         if config.truncate && config.write {
             // truncate is incompatible with append so truncate then open for append.
             OpenOptions::new()
                 .write(true)
                 .create(config.create)
                 .truncate(true)
-                .open(data_name)?;
+                .open(&config.files.data_file)?;
         }
         let mut file = OpenOptions::new()
             .read(true)
             .append(config.write)
             .create(config.create && config.write)
-            .open(data_name)?;
+            .open(&config.files.data_file)?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
 
@@ -455,7 +453,6 @@ where
     }
 
     fn open_hdx_file(
-        data_name: &Path,
         data_header: &DataHeader,
         config: &DbConfig,
     ) -> Result<(File, HdxHeader), LoadHeaderError> {
@@ -464,7 +461,7 @@ where
             .write(config.write)
             .create(config.create && config.write)
             .truncate(config.truncate && config.write)
-            .open(data_name)?;
+            .open(&config.files.hdx_file)?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
 
@@ -485,7 +482,6 @@ where
     }
 
     fn open_odx_file(
-        data_name: &Path,
         hdx_header: &HdxHeader,
         config: &DbConfig,
     ) -> Result<(File, OdxHeader), LoadHeaderError> {
@@ -495,13 +491,13 @@ where
                 .write(true)
                 .create(config.create)
                 .truncate(true)
-                .open(data_name)?;
+                .open(&config.files.odx_file)?;
         }
         let mut file = OpenOptions::new()
             .read(true)
             .append(config.write)
             .create(config.create && config.write)
-            .open(data_name)?;
+            .open(&config.files.odx_file)?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
 
