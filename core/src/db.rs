@@ -149,8 +149,9 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        if config.create && !config.files.dir.is_dir() {
-            fs::create_dir(&config.files.dir).map_err(OpenError::CreateDir)?;
+        if config.create {
+            // Best effort to create the dir if asked to create the DB.
+            let _ = fs::create_dir_all(&config.files.dir);
         }
         let (mut data_file, header) =
             Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
