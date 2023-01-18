@@ -17,9 +17,9 @@ use std::cell::Cell;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::{fs, io};
 
 pub mod data_header;
 pub mod hdx_header;
@@ -149,6 +149,9 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+        if config.create && !config.files.dir.is_dir() {
+            fs::create_dir(&config.files.dir).map_err(OpenError::CreateDir)?;
+        }
         let (mut data_file, header) =
             Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
@@ -1070,7 +1073,7 @@ mod tests {
     #[test]
     fn test_one() {
         {
-            let mut db: TestDb = DbConfig::new(".", "xxx1", 2)
+            let mut db: TestDb = DbConfig::new("db_tests", "xxx1", 2)
                 .create()
                 .truncate()
                 .build()
@@ -1116,7 +1119,7 @@ mod tests {
             assert!(iter.next().is_none());
             assert_eq!(db.len(), 5);
         }
-        let mut db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
+        let mut db: TestDb = DbConfig::new("db_tests", "xxx1", 2).build().unwrap();
         let key = Key([6_u8; 32]);
         db.insert(key, &"Value One2".to_string()).unwrap();
         let key = Key([7_u8; 32]);
@@ -1134,7 +1137,7 @@ mod tests {
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value Three2");
         drop(db);
-        let mut db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
+        let mut db: TestDb = DbConfig::new("db_tests", "xxx1", 2).build().unwrap();
         let key = Key([6_u8; 32]);
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value One2");
@@ -1146,7 +1149,9 @@ mod tests {
         assert_eq!(v, "Value Three2");
         drop(db);
 
-        let mut iter = DbRawIter::open(".", "xxx1").unwrap().map(|r| r.unwrap());
+        let mut iter = DbRawIter::open("db_tests", "xxx1")
+            .unwrap()
+            .map(|r| r.unwrap());
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
         let key = Key([2_u8; 32]);
@@ -1164,7 +1169,7 @@ mod tests {
         let key = Key([8_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
 
-        let db: TestDb = DbConfig::new(".", "xxx1", 2).build().unwrap();
+        let db: TestDb = DbConfig::new("db_tests", "xxx1", 2).build().unwrap();
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
@@ -1194,7 +1199,7 @@ mod tests {
             println!("XXXX {:?}", e);
         }
         println!("{}", err_info!());*/
-        let mut db: DbCore<u64, String, 8> = DbConfig::new(".", "xxx50k", 1)
+        let mut db: DbCore<u64, String, 8> = DbConfig::new("db_tests", "xxx50k", 1)
             .create()
             .truncate()
             .no_auto_flush()
@@ -1282,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_x50k_str() {
-        let mut db: DbCore<String, String, 0> = DbConfig::new(".", "xxx50k_str", 1)
+        let mut db: DbCore<String, String, 0> = DbConfig::new("db_tests", "xxx50k_str", 1)
             .create()
             .truncate()
             .build()
@@ -1311,7 +1316,7 @@ mod tests {
     #[test]
     fn test_duplicates() {
         {
-            let mut db: DbCore<u64, u64, 8> = DbConfig::new(".", "xxxDupTest", 1)
+            let mut db: DbCore<u64, u64, 8> = DbConfig::new("db_tests", "xxxDupTest", 1)
                 .create()
                 .truncate()
                 .build()
@@ -1334,7 +1339,7 @@ mod tests {
             assert_eq!(4, db.fetch(&4).unwrap());
             assert_eq!(5, db.fetch(&5).unwrap());
         }
-        let mut db: DbCore<u64, u64, 8> = DbConfig::new(".", "xxxDupTest", 1)
+        let mut db: DbCore<u64, u64, 8> = DbConfig::new("db_tests", "xxxDupTest", 1)
             .allow_duplicate_inserts()
             .build()
             .unwrap();

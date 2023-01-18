@@ -178,6 +178,8 @@ pub enum OpenError {
     IndexFileOpen(LoadHeaderError),
     /// An seeking in the data file (this should be hard to get).
     Seek(io::Error),
+    /// Error creating the DB directory when create is requested.
+    CreateDir(io::Error),
 }
 
 impl Error for OpenError {}
@@ -189,6 +191,7 @@ impl fmt::Display for OpenError {
             Self::DataReadError(e) => write!(f, "data read failed: {}", e),
             Self::IndexFileOpen(e) => write!(f, "index open failed: {}", e),
             Self::Seek(e) => write!(f, "seek: {}", e),
+            Self::CreateDir(e) => write!(f, "create dir: {}", e),
         }
     }
 }
