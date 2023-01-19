@@ -1043,6 +1043,21 @@ impl DbBytes<u64> for u64 {
     }
 }
 
+/// Allow raw bytes to be used as a value.
+impl DbBytes<Vec<u8>> for Vec<u8> {
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
+        buffer.resize(self.len(), 0);
+        buffer.copy_from_slice(self);
+        Ok(())
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<Vec<u8>, DeserializeError> {
+        let mut v = vec![0_u8; buffer.len()];
+        v.copy_from_slice(buffer);
+        Ok(v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,6 +1203,59 @@ mod tests {
         assert_eq!(iter.next().unwrap(), (key, "Value Two2".to_string()));
         let key = Key([8_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
+    }
+
+    #[test]
+    fn test_vec_val() {
+        let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_vec", 1)
+            .create()
+            .truncate()
+            .no_auto_flush()
+            //.set_bucket_elements(25)
+            //.set_load_factor(0.6)
+            .build()
+            .unwrap();
+        let val = vec![0_u8; 512];
+        let max = 1_000_000;
+        let start = time::Instant::now();
+        for i in 0_u64..max {
+            db.insert(i, &val).unwrap();
+            if i % 100_000 == 0 {
+                db.commit().unwrap();
+            }
+        }
+        println!("XXXX insert time {}", start.elapsed().as_secs_f64());
+        assert_eq!(db.len(), max as usize);
+
+        let start = time::Instant::now();
+        for i in 0..max {
+            let item = db.fetch(&(i as u64));
+            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+            assert_eq!(&item.unwrap(), &val);
+        }
+        println!(
+            "XXXX fetch (pre commit) time {}",
+            start.elapsed().as_secs_f64()
+        );
+
+        let start = time::Instant::now();
+        db.commit().unwrap();
+        println!("XXXX commit time {}", start.elapsed().as_secs_f64());
+        let start = time::Instant::now();
+        //let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
+        let vals: Vec<Vec<u8>> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
+        assert_eq!(vals.len(), max as usize);
+        for (_i, v) in vals.iter().enumerate() {
+            assert_eq!(v, &val);
+        }
+        println!("XXXX iter time {}", start.elapsed().as_secs_f64());
+        let start = time::Instant::now();
+        for i in 0..max {
+            let item = db.fetch(&(i as u64));
+            assert!(item.is_ok(), "Failed on item {}", i);
+            assert_eq!(&item.unwrap(), &val);
+        }
+        println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
     }
 
     #[test]
