@@ -727,16 +727,7 @@ where
         } as usize;
 
         let mut val_size_buf = [0_u8; 4];
-        if K::is_variable_key_size() {
-            self.read_exact(&mut val_size_buf)?;
-        } else if let Err(err) = self.read_exact(&mut val_size_buf) {
-            // An EOF here should be caused by no more records although it is possible there
-            // was a bit of garbage at the end of the file, not worrying about that now (maybe ever).
-            if let io::ErrorKind::UnexpectedEof = err.kind() {
-                return Err(FetchError::NotFound);
-            }
-            return Err(FetchError::IO(err));
-        }
+        self.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         buffer.resize(key_size as usize, 0);
