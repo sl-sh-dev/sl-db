@@ -175,11 +175,11 @@ where
                         last_insert_error = None;
                     } else {
                         let mut db_read = db_read.blocking_lock();
-                        //let res = db.commit();
-                        let _ = db.flush();
+                        let res = db.commit();
+                        //let _ = db.flush();
                         db_read.refresh_index();
                         drop(db_read);
-                        let res = db.commit();
+                        //let res = db.commit();
                         match res {
                             Ok(()) => {
                                 let _ = tx.send(Ok(()));
@@ -195,11 +195,11 @@ where
                 }
                 Some(InsertCommand::CommitBG) => {
                     let mut db_read = db_read.blocking_lock();
-                    let _ = db.flush();
-                    //let res = db.commit();
+                    //let _ = db.flush();
+                    let res = db.commit();
                     db_read.refresh_index();
                     drop(db_read);
-                    let res = db.commit();
+                    //let res = db.commit();
                     match res {
                         Ok(()) => {
                             for key in inserts.drain(..) {
@@ -277,10 +277,10 @@ where
 mod tests {
     use super::*;
     use std::time;
-    use tokio::task::JoinSet;
+    //use tokio::task::JoinSet;
 
     #[tokio::test]
-    async fn test_x50k() {
+    async fn test_50k() {
         let config = DbConfig::new(".", "xxx50k", 1)
             .no_auto_flush()
             .create()
@@ -315,8 +315,7 @@ mod tests {
         assert!(db.contains_key(49_000).await.unwrap());
         assert!(!db.contains_key(max).await.unwrap());
 
-        /*let start = time::Instant::now();
-        assert_eq!(&db.fetch(35_000).await.unwrap(), "Value 35000");
+        let start = time::Instant::now();
         for i in 0..max {
             let item = db.fetch(i as u64).await;
             assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
@@ -326,7 +325,7 @@ mod tests {
             "XXXX TOK fetch ({}) (pre commit) time {}",
             max,
             start.elapsed().as_secs_f64()
-        );*/
+        );
 
         let start = time::Instant::now();
         db.commit().await.unwrap();
@@ -339,16 +338,19 @@ mod tests {
         }
         println!("XXXX TOK iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
-        let mut fetch_set = JoinSet::new();
+        //let mut fetch_set = JoinSet::new();
         for i in 0..max {
-            let db_clone = db.clone();
+            let item = db.fetch(i as u64).await;
+            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            /*let db_clone = db.clone();
             fetch_set.spawn(async move {
                 let item = db_clone.fetch(i as u64).await;
                 assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
                 assert_eq!(&item.unwrap(), &format!("Value {}", i));
-            });
+            });*/
         }
-        while fetch_set.join_next().await.is_some() {}
+        //while fetch_set.join_next().await.is_some() {}
         println!(
             "XXXX TOK fetch ({}) time {}",
             max,
