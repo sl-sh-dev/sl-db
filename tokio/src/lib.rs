@@ -48,6 +48,8 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+        let auto_commit = config.auto_flush();
+        let config = config.no_auto_flush(); // Wrapper needs to control commit.
         let (insert_tx, insert_rx) = mpsc::channel(100_000);
         // Open the write db (passed to the insert thread).
         let db = DbCore::open(config.clone())?;
@@ -59,7 +61,7 @@ where
         let write_cache_clone = write_cache.clone();
         let db_read_clone = db_read.clone();
         let db_thread = std::thread::spawn(move || {
-            Self::insert_thread(db, db_read_clone, write_cache_clone, insert_rx)
+            Self::insert_thread(db, db_read_clone, write_cache_clone, insert_rx, auto_commit)
         });
         Ok(Self {
             db_read,
@@ -104,7 +106,7 @@ where
     pub async fn insert(&self, key: K, value: V) {
         if !self.write_cache.contains_key(&key) {
             self.write_cache.insert(key.clone(), value);
-            // An error here menas the receiver in the insert thread was closed/dropped.
+            // An error here indicates the receiver in the insert thread was closed/dropped.
             let _ = self.insert_tx.send(InsertCommand::Insert(key)).await;
         }
     }
@@ -138,7 +140,7 @@ where
 
     /// Schedule a commit but don't wait for it to complete.
     pub async fn commit_bg(&self) {
-        // An error here menas the receiver in the insert thread was closed/dropped.
+        // An error here indicates the receiver in the insert thread was closed/dropped.
         let _ = self.insert_tx.send(InsertCommand::CommitBG).await;
     }
 
@@ -148,15 +150,39 @@ where
         self.db_read.lock().await.raw_iter()
     }
 
+    fn commit_bg_thread(
+        db: &mut DbCore<K, V, KSIZE, S>,
+        db_read: &Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+        write_cache: &DashMap<K, V>,
+        inserts: &mut Vec<K>,
+    ) -> Result<(), CommitError> {
+        let mut db_read = db_read.blocking_lock();
+        let _ = db.flush();
+        db_read.refresh_index();
+        drop(db_read);
+        let res = db.commit();
+        match res {
+            Ok(()) => {
+                for key in inserts.drain(..) {
+                    write_cache.remove(&key);
+                }
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn insert_thread(
         mut db: DbCore<K, V, KSIZE, S>,
         db_read: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
         write_cache: Arc<DashMap<K, V>>,
         mut insert_rx: mpsc::Receiver<InsertCommand<K, KSIZE>>,
+        auto_commit: bool,
     ) {
         let mut inserts = Vec::new();
         let mut done = false;
         let mut last_insert_error: Option<InsertError> = None;
+        let mut insert_count: u32 = 0;
         while !done {
             match insert_rx.blocking_recv() {
                 Some(InsertCommand::Insert(key)) => {
@@ -167,6 +193,15 @@ where
                             Ok(_) => {}
                         }
                         inserts.push(key);
+                        if auto_commit && insert_count >= 10_000 {
+                            insert_count += 1;
+                            let _ = Self::commit_bg_thread(
+                                &mut db,
+                                &db_read,
+                                &write_cache,
+                                &mut inserts,
+                            );
+                        }
                     }
                 }
                 Some(InsertCommand::Commit(tx)) => {
@@ -175,11 +210,10 @@ where
                         last_insert_error = None;
                     } else {
                         let mut db_read = db_read.blocking_lock();
-                        let res = db.commit();
-                        //let _ = db.flush();
+                        let _ = db.flush();
                         db_read.refresh_index();
                         drop(db_read);
-                        //let res = db.commit();
+                        let res = db.commit();
                         match res {
                             Ok(()) => {
                                 let _ = tx.send(Ok(()));
@@ -194,20 +228,7 @@ where
                     }
                 }
                 Some(InsertCommand::CommitBG) => {
-                    let mut db_read = db_read.blocking_lock();
-                    //let _ = db.flush();
-                    let res = db.commit();
-                    db_read.refresh_index();
-                    drop(db_read);
-                    //let res = db.commit();
-                    match res {
-                        Ok(()) => {
-                            for key in inserts.drain(..) {
-                                write_cache.remove(&key);
-                            }
-                        }
-                        Err(_err) => {}
-                    }
+                    let _ = Self::commit_bg_thread(&mut db, &db_read, &write_cache, &mut inserts);
                 }
                 Some(InsertCommand::Done) => done = true,
                 None => done = true, // The sender has been closed or dropped so nothing left to do.
@@ -282,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn test_50k() {
         let config = DbConfig::new(".", "xxx50k", 1)
-            .no_auto_flush()
+            //.no_auto_flush()
             .create()
             //.set_bucket_elements(100)
             //.set_load_factor(0.6)
@@ -343,12 +364,12 @@ mod tests {
             let item = db.fetch(i as u64).await;
             assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
             assert_eq!(&item.unwrap(), &format!("Value {}", i));
-            /*let db_clone = db.clone();
-            fetch_set.spawn(async move {
-                let item = db_clone.fetch(i as u64).await;
-                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-                assert_eq!(&item.unwrap(), &format!("Value {}", i));
-            });*/
+            //let db_clone = db.clone();
+            //fetch_set.spawn(async move {
+            //    let item = db_clone.fetch(i as u64).await;
+            //    assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+            //    assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            //});
         }
         //while fetch_set.join_next().await.is_some() {}
         println!(

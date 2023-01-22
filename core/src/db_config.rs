@@ -119,6 +119,11 @@ impl DbConfig {
         self
     }
 
+    /// Return the auto flush state.
+    pub fn auto_flush(&self) -> bool {
+        self.auto_flush
+    }
+
     /// If the database exists then truncate it on open, requires write mode (option ignored if read-only).
     /// This will rebuild the database with new parameters instead of using the old parameters.
     pub fn truncate(mut self) -> Self {
