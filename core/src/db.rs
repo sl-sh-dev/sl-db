@@ -71,7 +71,7 @@ where
     V: Debug + DbBytes<V>,
     S: BuildHasher + Default,
 {
-    _header: DataHeader,
+    header: DataHeader,
     data_file: File,
     data_file_end: u64,
     hdx_file: File,
@@ -153,11 +153,12 @@ where
             // Best effort to create the dir if asked to create the DB.
             let _ = fs::create_dir_all(&config.files.dir);
         }
+        let hasher = S::default();
         let (mut data_file, header) =
             Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
         let (hdx_file, hdx_header) =
-            Self::open_hdx_file(&header, &config).map_err(OpenError::IndexFileOpen)?;
+            Self::open_hdx_file(&header, &config, &hasher).map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
         let (write_buffer, bucket_cache) = if config.write {
@@ -191,12 +192,12 @@ where
             Self::open_odx_file(&hdx_header, &config).map_err(OpenError::IndexFileOpen)?;
         // TODO, crosscheck all the headers and make sure everything checks out.
         Ok(Self {
-            _header: header,
+            header,
             data_file,
             data_file_end,
             hdx_file,
             odx_file,
-            hasher: S::default(),
+            hasher,
             hdx_header,
             modulus,
             load_factor: hdx_header.load_factor(),
@@ -388,6 +389,33 @@ where
         self.len() == 0
     }
 
+    /// Return the DB version.
+    pub fn version(&self) -> u16 {
+        self.header.version()
+    }
+
+    /// Return the DB application number (set at creation).
+    pub fn appnum(&self) -> u64 {
+        self.header.appnum()
+    }
+
+    /// Return the DB uid (generated at creation).
+    pub fn uid(&self) -> u64 {
+        self.header.uid()
+    }
+
+    /// Return the DB index salt (generated at creation).
+    /// Can be used with the pepper to test the hasher.
+    pub fn salt(&self) -> u64 {
+        self.hdx_header.salt()
+    }
+
+    /// Return the DB pepper (generated at creation from the salt with Hasher).
+    /// Can be used with the salt to test the hasher.
+    pub fn pepper(&self) -> u64 {
+        self.hdx_header.pepper()
+    }
+
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
@@ -451,7 +479,14 @@ where
             header.write_header(&mut file)?;
             header
         } else {
-            DataHeader::load_header(&mut file)?
+            let header = DataHeader::load_header(&mut file)?;
+            if header.version() != 0 {
+                return Err(LoadHeaderError::InvalidVersion);
+            }
+            if header.appnum() != config.appnum {
+                return Err(LoadHeaderError::InvalidAppNum);
+            }
+            header
         };
         Ok((file, header))
     }
@@ -459,6 +494,7 @@ where
     fn open_hdx_file(
         data_header: &DataHeader,
         config: &DbConfig,
+        hasher: &S,
     ) -> Result<(File, HdxHeader), LoadHeaderError> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -470,7 +506,13 @@ where
         let file_end = file.seek(SeekFrom::Current(0))?;
 
         let header = if file_end == 0 {
-            let header = HdxHeader::from_data_header(data_header, config);
+            let mut fx_hasher = FxHasher::default();
+            fx_hasher.write_u64(data_header.uid());
+            let salt = fx_hasher.finish();
+            let mut hasher = hasher.build_hasher();
+            salt.hash(&mut hasher);
+            let pepper = hasher.finish();
+            let header = HdxHeader::from_data_header(data_header, config, salt, pepper);
             header.write_header(&mut file)?;
             let bucket_size = header.bucket_size() as usize;
             let mut buffer = vec![0_u8; bucket_size];
@@ -480,7 +522,26 @@ where
             }
             header
         } else {
-            HdxHeader::load_header(&mut file)?
+            let header = HdxHeader::load_header(&mut file)?;
+            // Basic validation of the odx header.
+            if header.version() != data_header.version() {
+                return Err(LoadHeaderError::InvalidIndexVersion);
+            }
+            if header.appnum() != data_header.appnum() {
+                return Err(LoadHeaderError::InvalidIndexAppNum);
+            }
+            if header.uid() != data_header.uid() {
+                return Err(LoadHeaderError::InvalidIndexUID);
+            }
+            // Check the salt/pepper.  This will make sure you are using the same hasher and it seems
+            // to be stable (not the default Rust hasher for instance) since changing the hasher would
+            // invalidate the index.
+            let mut hasher = hasher.build_hasher();
+            header.salt().hash(&mut hasher);
+            if header.pepper() != hasher.finish() {
+                return Err(LoadHeaderError::InvalidHasher);
+            }
+            header
         };
         Ok((file, header))
     }
@@ -510,7 +571,18 @@ where
             header.write_header(&mut file)?;
             header
         } else {
-            OdxHeader::load_header(&mut file)?
+            let header = OdxHeader::load_header(&mut file)?;
+            // Basic validation of the odx header.
+            if header.version() != hdx_header.version() {
+                return Err(LoadHeaderError::InvalidIndexVersion);
+            }
+            if header.appnum() != hdx_header.appnum() {
+                return Err(LoadHeaderError::InvalidIndexAppNum);
+            }
+            if header.uid() != hdx_header.uid() {
+                return Err(LoadHeaderError::InvalidIndexUID);
+            }
+            header
         };
         Ok((file, header))
     }
@@ -1259,7 +1331,7 @@ mod tests {
             println!("XXXX {:?}", e);
         }
         println!("{}", err_info!());*/
-        let mut db: DbCore<u64, String, 8> = DbConfig::new("db_tests", "xxx50k", 1)
+        let mut db: DbCore<u64, String, 8> = DbConfig::new("db_tests", "xxx50k", 10)
             .create()
             .truncate()
             .no_auto_flush()
@@ -1267,6 +1339,11 @@ mod tests {
             //.set_load_factor(0.6)
             .build()
             .unwrap();
+        println!("XXXX version: {}", db.version());
+        println!("XXXX appnum: {}", db.appnum());
+        println!("XXXX uid: {}", db.uid());
+        println!("XXXX salt: {}", db.salt());
+        println!("XXXX pepper: {}", db.pepper());
         assert!(!db.contains_key(&0).unwrap());
         assert!(!db.contains_key(&10).unwrap());
         assert!(!db.contains_key(&35_000).unwrap());

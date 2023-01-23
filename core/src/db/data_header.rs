@@ -3,8 +3,11 @@
 use crate::db::add_crc32;
 use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
-use std::io;
+use crate::fxhasher::FxHasher;
+use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::UNIX_EPOCH;
+use std::{io, time};
 
 // Each bucket element is a (u64, u64)- (hash, record_pos).
 pub(crate) const BUCKET_ELEMENT_SIZE: usize = 16;
@@ -25,10 +28,22 @@ pub(crate) struct DataHeader {
 
 impl DataHeader {
     pub fn new(config: &DbConfig) -> Self {
+        let mut hasher = FxHasher::default();
+        let now = time::SystemTime::now();
+        let now_millis = now
+            .duration_since(UNIX_EPOCH)
+            // Time went backwards, WTF?  This could lead to common uid I guess if using
+            // machines with broken time (i.e. clocks set before the Unix epoch)...
+            .unwrap_or_else(|_| time::Duration::from_millis(66))
+            .as_millis();
+        hasher.write_u128(now_millis);
+        // This is pretty basic, just has the current millis with FX to get a UID.
+        // This is just to make sure sets of files belong together so not going crazy here.
+        let uid = hasher.finish();
         Self {
             type_id: *b"sldb.dat",
             version: 0,
-            uid: 0,
+            uid,
             appnum: config.appnum,
         }
     }

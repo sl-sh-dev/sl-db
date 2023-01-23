@@ -92,4 +92,19 @@ impl OdxHeader {
         sync.write_all(&buffer)?;
         Ok(())
     }
+
+    /// File version number.
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Unique ID generated on creation
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Application defined constant
+    pub fn appnum(&self) -> u64 {
+        self.appnum
+    }
 }

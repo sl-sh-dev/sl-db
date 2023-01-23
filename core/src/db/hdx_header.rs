@@ -31,7 +31,12 @@ pub(crate) struct HdxHeader {
 impl HdxHeader {
     /// Return a default HdxHeader with any values from data_header overridden.
     /// This includes the version, uid, appnum, bucket_size and bucket_elements.
-    pub fn from_data_header(data_header: &DataHeader, config: &DbConfig) -> Self {
+    pub fn from_data_header(
+        data_header: &DataHeader,
+        config: &DbConfig,
+        salt: u64,
+        pepper: u64,
+    ) -> Self {
         Self {
             type_id: *b"sldb.hdx",
             version: data_header.version(),
@@ -41,8 +46,8 @@ impl HdxHeader {
             bucket_size: config.bucket_size,
             buckets: config.initial_buckets,
             load_factor: (u16::MAX as f32 * config.load_factor) as u16,
-            salt: 0,
-            pepper: 0,
+            salt,
+            pepper,
             values: 0,
         }
     }
@@ -200,5 +205,15 @@ impl HdxHeader {
     /// Application defined constant
     pub fn appnum(&self) -> u64 {
         self.appnum
+    }
+
+    /// Return the index salt.
+    pub fn salt(&self) -> u64 {
+        self.salt
+    }
+
+    /// Return the index pepper.
+    pub fn pepper(&self) -> u64 {
+        self.pepper
     }
 }
