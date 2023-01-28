@@ -224,6 +224,32 @@ impl fmt::Display for OpenError {
     }
 }
 
+/// Error renaming a DB.
+#[derive(Debug)]
+pub enum RenameError {
+    /// One or more of the target named files already exist.
+    FilesExist,
+    /// Error renaming the data file.
+    DataFileRename(io::Error),
+    /// Error renaming the index file.
+    HdxFileRename(io::Error),
+    /// Error renaming the overflow index file.
+    OdxFileRename(io::Error),
+}
+
+impl Error for RenameError {}
+
+impl fmt::Display for RenameError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self {
+            Self::FilesExist => write!(f, "one or more targets for rename already exist"),
+            Self::DataFileRename(e) => write!(f, "data file rename failed: {}", e),
+            Self::HdxFileRename(e) => write!(f, "index file rename failed: {}", e),
+            Self::OdxFileRename(e) => write!(f, "overflow index file rename failed: {}", e),
+        }
+    }
+}
+
 /// Error on reading a DB record.
 #[derive(Debug)]
 pub enum FetchError {

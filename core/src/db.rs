@@ -8,16 +8,17 @@ use crate::db_raw_iter::DbRawIter;
 use crate::error::flush::FlushError;
 use crate::error::insert::InsertError;
 use crate::error::serialize::SerializeError;
-use crate::error::ReadKeyError;
 use crate::error::{
     deserialize::DeserializeError, CommitError, FetchError, LoadHeaderError, OpenError,
 };
+use crate::error::{ReadKeyError, RenameError};
 use crate::fxhasher::{FxHashMap, FxHasher};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::{fs, io};
 
 pub mod data_header;
@@ -268,6 +269,30 @@ where
         let _ = fs::remove_file(&files.data_file);
         let _ = fs::remove_file(&files.hdx_file);
         let _ = fs::remove_file(&files.odx_file);
+    }
+
+    /// Rename the database to new_name.
+    pub fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> Result<(), RenameError> {
+        let new_name: PathBuf = new_name.into();
+        let new_files = DbFiles::new(&self.config.files.dir, new_name);
+        if new_files.data_file.exists()
+            || new_files.hdx_file.exists()
+            || new_files.odx_file.exists()
+        {
+            Err(RenameError::FilesExist)
+        } else if let Err(e) = fs::rename(&self.config.files.data_file, &new_files.data_file) {
+            Err(RenameError::DataFileRename(e))
+        } else if let Err(e) = fs::rename(&self.config.files.hdx_file, &new_files.hdx_file) {
+            let _ = fs::rename(&new_files.data_file, &self.config.files.data_file);
+            Err(RenameError::HdxFileRename(e))
+        } else if let Err(e) = fs::rename(&self.config.files.odx_file, &new_files.odx_file) {
+            let _ = fs::rename(&new_files.data_file, &self.config.files.data_file);
+            let _ = fs::rename(&new_files.hdx_file, &self.config.files.hdx_file);
+            Err(RenameError::OdxFileRename(e))
+        } else {
+            self.config.files = new_files;
+            Ok(())
+        }
     }
 
     /// Returns a reference to the file names for this DB.
@@ -1506,6 +1531,60 @@ mod tests {
         assert_eq!(db.len(), 0);
         assert_eq!(db.raw_iter().unwrap().count(), 0);
         db.destroy();
+    }
+
+    #[test]
+    fn test_rename() {
+        let max = 1_000;
+        let val = vec![0_u8; 512];
+        {
+            let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_rename", 1)
+                .create()
+                .truncate()
+                .build()
+                .unwrap();
+            for i in 0_u64..max {
+                db.insert(i, &val).unwrap();
+            }
+            assert_eq!(db.len(), max as usize);
+
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                assert_eq!(&item.unwrap(), &val);
+            }
+
+            db.commit().unwrap();
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}", i);
+                assert_eq!(&item.unwrap(), &val);
+            }
+            db.rename("xxx_rename2").unwrap();
+        }
+        {
+            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+        }
+        let config = DbConfig::new("db_tests", "xxx_rename2", 1);
+        let mut db = DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+        assert_eq!(db.len(), max as usize);
+        for i in 0..max {
+            let item = db.fetch(&(i as u64));
+            assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+            assert_eq!(&item.unwrap(), &val);
+        }
+        assert!(matches!(
+            db.rename("xxx_rename3").unwrap_err(),
+            RenameError::FilesExist
+        ));
+        db.destroy();
+        {
+            // Clean up db files.
+            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let db = DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+            db.destroy();
+        }
     }
 
     #[test]

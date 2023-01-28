@@ -26,7 +26,7 @@ pub struct DbFiles {
 
 impl DbFiles {
     /// Create a new DbFiles struct from a directory and base name.
-    pub fn new<P: Into<PathBuf>>(dir: P, base_name: P) -> Self {
+    pub fn new<P: Into<PathBuf>, Q: Into<PathBuf>>(dir: P, base_name: Q) -> Self {
         let dir: PathBuf = dir.into();
         let base_name: PathBuf = base_name.into();
         let data_file = dir.join(&base_name).with_extension("dat");
