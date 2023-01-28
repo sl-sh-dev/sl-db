@@ -8,7 +8,7 @@ use crate::error::LoadHeaderError;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -62,6 +62,11 @@ where
             file,
             buffer: Vec::new(),
         })
+    }
+
+    /// Return the current position of the data file.
+    pub fn position(&mut self) -> io::Result<u64> {
+        self.file.seek(SeekFrom::Current(0))
     }
 
     /// Read the next record or return an error if an overflow bucket.

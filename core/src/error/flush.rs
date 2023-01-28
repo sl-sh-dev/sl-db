@@ -18,6 +18,8 @@ pub enum FlushError {
     IndexHeader(io::Error),
     /// Error writing bucket(s) to the index file.
     WriteIndexData(io::Error),
+    /// Database opened read-only.
+    ReadOnly,
 }
 
 impl Error for FlushError {}
@@ -30,6 +32,7 @@ impl fmt::Display for FlushError {
             Self::SaveToBucket(e) => write!(f, "save bucket: {}", e),
             Self::IndexHeader(e) => write!(f, "write index header: {}", e),
             Self::WriteIndexData(e) => write!(f, "write index data: {}", e),
+            Self::ReadOnly => write!(f, "read only"),
         }
     }
 }

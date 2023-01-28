@@ -8,6 +8,7 @@ pub mod source;
 
 use crate::error::deserialize::DeserializeError;
 use crate::error::flush::FlushError;
+use crate::error::insert::InsertError;
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt;
@@ -205,6 +206,8 @@ pub enum OpenError {
     IndexFileOpen(LoadHeaderError),
     /// An seeking in the data file (this should be hard to get).
     Seek(io::Error),
+    /// An error occurred trying to rebuild the index while opening.
+    RebuildIndex(InsertError),
 }
 
 impl Error for OpenError {}
@@ -216,6 +219,7 @@ impl fmt::Display for OpenError {
             Self::DataReadError(e) => write!(f, "data read failed: {}", e),
             Self::IndexFileOpen(e) => write!(f, "index open failed: {}", e),
             Self::Seek(e) => write!(f, "seek: {}", e),
+            Self::RebuildIndex(e) => write!(f, "rebuild index: {}", e),
         }
     }
 }

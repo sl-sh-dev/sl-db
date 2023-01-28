@@ -13,7 +13,6 @@ use crate::error::{
     deserialize::DeserializeError, CommitError, FetchError, LoadHeaderError, OpenError,
 };
 use crate::fxhasher::{FxHashMap, FxHasher};
-use std::cell::Cell;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
@@ -24,10 +23,6 @@ use std::{fs, io};
 pub mod data_header;
 pub mod hdx_header;
 pub mod odx_header;
-
-/// Use a 16Mb buffer for inserts.
-/// TODO- make this a setting instead.
-const INSERT_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
 /// Required trait for a key.  Note that setting KSIZE to 0 indicates a variable sized key.
 pub trait DbKey<const KSIZE: u16>: Eq + Hash + Debug {
@@ -77,9 +72,8 @@ where
     hdx_file: File,
     odx_file: File,
     hasher: S,
-    // Keep a buffer around to share and avoid allocations.
-    // It is a Cell for interior mutability so we can avoid borrow errors.
-    scratch_buffer: Cell<Vec<u8>>,
+    key_buffer: Vec<u8>,
+    value_buffer: Vec<u8>,
     write_buffer: Vec<u8>,
     read_buffer: Vec<u8>,
     read_buffer_start: usize,
@@ -91,6 +85,7 @@ where
     capacity: u64,
     seek_pos: u64,
     config: DbConfig,
+    failed: bool,
     _key: PhantomData<K>,
     _value: PhantomData<V>,
 }
@@ -164,7 +159,10 @@ where
         let (write_buffer, bucket_cache) = if config.write {
             let mut bucket_cache = FxHashMap::default();
             bucket_cache.reserve(500);
-            (Vec::with_capacity(INSERT_BUFFER_SIZE + 1024), bucket_cache)
+            (
+                Vec::with_capacity(config.write_buffer_size as usize),
+                bucket_cache,
+            )
         } else {
             // If opening read only wont need capacity.
             (Vec::new(), FxHashMap::default())
@@ -202,7 +200,8 @@ where
             modulus,
             load_factor: hdx_header.load_factor(),
             capacity: hdx_header.buckets() as u64 * hdx_header.bucket_elements() as u64,
-            scratch_buffer: Cell::new(Vec::new()),
+            key_buffer: Vec::new(),
+            value_buffer: Vec::new(),
             write_buffer,
             read_buffer,
             read_buffer_start: 0,
@@ -210,9 +209,65 @@ where
             bucket_cache,
             seek_pos: 0,
             config,
+            failed: false,
             _key: PhantomData,
             _value: PhantomData,
         })
+    }
+
+    /// Will destroy the existing index for DB and rebuild it based on the data file.
+    /// This will also verify the integrity of the data file.  If only the final record is corrupt
+    /// then the file will be truncated to leave a valid DB.  Other corrupt records will be ignored
+    /// (they will be garbage in the data file but won't be indexed).
+    pub fn reindex(config: DbConfig) -> Result<Self, OpenError> {
+        let config = config.create();
+        let _ = fs::remove_file(&config.files.hdx_file);
+        let _ = fs::remove_file(&config.files.odx_file);
+
+        let mut db = Self::open(config)?;
+
+        let mut iter = db.raw_iter().map_err(OpenError::DataFileOpen)?;
+        let mut record_pos = iter.position().map_err(OpenError::Seek)?;
+        let mut prev_record_pos = record_pos;
+        let mut last_err = false;
+        while let Some(rec) = iter.next() {
+            last_err = false;
+            if let Ok((key, _value)) = rec {
+                let hash = db.hash(&key);
+                if let Err(err) = db.expand_buckets() {
+                    return Err(OpenError::RebuildIndex(err));
+                }
+                if let Err(err) = db.save_to_bucket(&key, hash, record_pos) {
+                    return Err(OpenError::RebuildIndex(err));
+                }
+                db.hdx_header.inc_values();
+            } else {
+                last_err = true;
+            }
+            prev_record_pos = record_pos;
+            record_pos = iter.position().map_err(OpenError::Seek)?;
+        }
+        if last_err {
+            // If the final record was corrupt then truncate to remove it.
+            db.data_file
+                .set_len(prev_record_pos)
+                .map_err(OpenError::Seek)?;
+            let config = db.config.clone();
+            // Need to drop and reopen after a truncate or the write position will be past the end.
+            drop(db);
+            db = Self::open(config)?;
+        }
+        Ok(db)
+    }
+
+    /// Close and destroy the DB (remove all it's files).
+    /// If it can not remove a file it will silently ignore this.
+    pub fn destroy(self) {
+        let files = self.config.files.clone();
+        drop(self);
+        let _ = fs::remove_file(&files.data_file);
+        let _ = fs::remove_file(&files.hdx_file);
+        let _ = fs::remove_file(&files.odx_file);
     }
 
     /// Returns a reference to the file names for this DB.
@@ -279,104 +334,96 @@ where
         }
     }
 
+    /// Do the actual insert so the public function can rollback easily on an error.
+    fn insert_inner(&mut self, key: K, value: &V) -> Result<(), InsertError> {
+        let record_pos = self.data_file_end + self.write_buffer.len() as u64;
+        let hash = self.hash(&key);
+        let mut crc32_hasher = crc32fast::Hasher::new();
+
+        // Try to serialize the key and value and error out before saving anything if that fails.
+        key.serialize(&mut self.key_buffer)
+            .map_err(InsertError::SerializeKey)?;
+        value
+            .serialize(&mut self.value_buffer)
+            .map_err(InsertError::SerializeValue)?;
+
+        // Go ahead and expand the index if needed and return an error before we save anything.
+        self.expand_buckets()?;
+
+        // If we have a variable sized key write it's size otherwise no need.
+        if K::is_variable_key_size() {
+            let key_size = (self.key_buffer.len() as u16).to_le_bytes();
+            // We have to write the key size when variable.
+            self.write_all(&key_size)?;
+            crc32_hasher.update(&key_size);
+        } else if K::KEY_SIZE as usize != self.key_buffer.len() {
+            return Err(InsertError::InvalidKeyLength);
+        }
+        // Once we have written to write_buffer, it needs to be rolled back before returning an error.
+        // Space for the value length.
+        let value_size = (self.value_buffer.len() as u32).to_le_bytes();
+        self.write_all(&value_size)?;
+        crc32_hasher.update(&value_size);
+
+        {
+            // Turn self into a reference to a Write trait.
+            // Need this to write buffers owned by self.
+            let writer: &mut dyn Write = unsafe {
+                (self as *mut dyn Write)
+                    .as_mut()
+                    .expect("this can't be null")
+            };
+            // Write the key to the buffer.
+            writer.write_all(&self.key_buffer)?;
+            crc32_hasher.update(&self.key_buffer);
+
+            // Save current pos, then jump back to the value size and write that then finally write
+            // the value into the saved position.
+            writer.write_all(&self.value_buffer)?;
+            crc32_hasher.update(&self.value_buffer);
+        }
+        let crc32 = crc32_hasher.finalize();
+        self.write_all(&crc32.to_le_bytes())?;
+
+        // Save the key to the index, do this now so the data file will not have been written if the
+        // index update fails.
+        self.save_to_bucket(&key, hash, record_pos)?;
+
+        // Since the inserted data will still be "available" even after an error after this point go
+        // ahead and increment the values.
+        self.hdx_header.inc_values();
+        Ok(())
+    }
+
     /// Insert a new key/value pair in Db.
     /// For the data file this means inserting:
     ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
     ///   - value size (u32)
     ///   - key data
     ///   - value data
-    /// After an InsertError::Flush the data will still be available in memory but failed to persist
-    /// to disk.  After any other error the insert will have rolled back.
+    /// For the erros IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
+    /// failed state and become read only.  These errors all indicate serious underlying issues that
+    /// can not be trivially fixed, a reopen/repair might help.
     pub fn insert(&mut self, key: K, value: &V) -> Result<(), InsertError> {
-        if !self.config.write {
+        if !self.config.write || self.failed {
             return Err(InsertError::ReadOnly);
         }
-        let mut buffer = self.scratch_buffer.take();
-        let start_write_buffer_len = self.write_buffer.len();
-        let record_pos = self.data_file_end + self.write_buffer.len() as u64;
-        let hash = self.hash(&key);
-        key.serialize(&mut buffer)
-            .map_err(InsertError::SerializeKey)?;
-        // If we have a variable sized key write it's size otherwise no need.
-        if K::is_variable_key_size() {
-            // We have to write the key size when variable.
-            self.write_buffer
-                .write_all(&(buffer.len() as u16).to_le_bytes())
-                .expect("write_all to Vec is infallible");
-        } else if K::KEY_SIZE as usize != buffer.len() {
-            return Err(InsertError::InvalidKeyLength);
-        }
-        // Once we have written to write_buffer, it needs to be rolled back before returning an error.
-        // Space for the value length.
-        let val_size_pos = self.write_buffer.len();
-        self.write_buffer
-            .write_all(&[0_u8; 4])
-            .expect("write_all to Vec is infallible");
-
-        // Write the key to the buffer.
-        self.write_buffer
-            .write_all(&buffer)
-            .expect("write_all to Vec is infallible");
-
-        if let Err(err) = value
-            .serialize(&mut buffer)
-            .map_err(InsertError::SerializeValue)
-        {
-            // Rollback the write.
-            self.write_buffer.resize(start_write_buffer_len, 0);
-            return Err(err);
-        }
-
-        // Save current pos, then jump back to the value size and write that then finally write
-        // the value into the saved position.
-        self.write_buffer[val_size_pos..val_size_pos + 4]
-            .copy_from_slice(&(buffer.len() as u32).to_le_bytes());
-        self.write_buffer
-            .write_all(&buffer)
-            .expect("write_all to Vec is infallible");
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        crc32_hasher.update(&self.write_buffer[start_write_buffer_len..]);
-        let crc32 = crc32_hasher.finalize();
-        self.write_buffer
-            .write_all(&crc32.to_le_bytes())
-            .expect("write_all to Vec is infallible");
-
-        // An early return on error could cause a new buffer to be created, should not be a big deal.
-        self.scratch_buffer.set(buffer);
-        if let Err(err) = self.expand_buckets() {
-            // Rollback the write.
-            self.write_buffer.resize(start_write_buffer_len, 0);
-            return Err(err);
-        }
-        if let Err(err) = self.save_to_bucket(&key, hash, record_pos) {
-            // Rollback the write.
-            self.write_buffer.resize(start_write_buffer_len, 0);
-            return Err(err);
-        }
-        // Since the inserted data will still be "available" even after an error after this point go
-        // ahead and increment the values.
-        self.hdx_header.inc_values();
-        // Now errors are tricky, we have already updated the index.  Leave the data for now...
-        if self.config.auto_flush {
-            if self.config.cache_writes {
-                if self.bucket_cache.len() > 200 || self.write_buffer.len() >= INSERT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-            } else {
-                self.flush()?;
-            }
-        } else {
-            // Even with no auto flush we will flush the data file now and then (but not the index).
-            // Since the data file is append only this should be safe and can keep memory usage down.
-            if self.write_buffer.len() >= INSERT_BUFFER_SIZE {
-                self.data_file
-                    .write_all(&self.write_buffer)
-                    .map_err(FlushError::WriteData)?;
-                self.data_file_end += self.write_buffer.len() as u64;
-                self.write_buffer.clear();
+        let result = self.insert_inner(key, value);
+        if let Err(err) = &result {
+            match err {
+                // These errors all indicate a failed DB that can no longer be inserted too.
+                InsertError::IndexCrcError | InsertError::IndexOverflow => self.failed = true,
+                InsertError::WriteDataError(_io_err) => self.failed = true,
+                InsertError::KeyError(_key_err) => self.failed = true,
+                // These errors do not indicate a failed DB.
+                InsertError::DuplicateKey
+                | InsertError::SerializeKey(_)
+                | InsertError::SerializeValue(_)
+                | InsertError::InvalidKeyLength
+                | InsertError::ReadOnly => {}
             }
         }
-        Ok(())
+        result
     }
 
     /// Return the number of records in Db.
@@ -420,7 +467,7 @@ where
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
     pub fn commit(&mut self) -> Result<(), CommitError> {
-        if !self.config.write {
+        if !self.config.write || self.failed {
             return Err(CommitError::ReadOnly);
         }
         self.flush().map_err(CommitError::Flush)?;
@@ -439,13 +486,10 @@ where
     /// Flush any in memory caches to file.
     /// Note this is only a flush not a commit, it does not do a sync on the files.
     pub fn flush(&mut self) -> Result<(), FlushError> {
-        {
-            self.data_file
-                .write_all(&self.write_buffer)
-                .map_err(FlushError::WriteData)?;
-            self.data_file_end += self.write_buffer.len() as u64;
-            self.write_buffer.clear();
+        if !self.config.write || self.failed {
+            return Err(FlushError::ReadOnly);
         }
+        Write::flush(self).map_err(FlushError::WriteData)?;
         self.save_bucket_cache()
             .map_err(FlushError::WriteIndexData)?;
         self.hdx_file
@@ -782,16 +826,21 @@ where
     /// Read the record at position.
     /// Returns the (key, value) tuple
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn read_record_raw(
-        &mut self,
-        position: u64,
-        buffer: &mut Vec<u8>,
-    ) -> Result<(K, V), FetchError> {
+    fn read_record(&mut self, position: u64) -> Result<(K, V), FetchError> {
+        // Turn self into a reference to a Read trait with it's own lifetime.
+        // This is so we can call read_exact with a buffer owned by self.  There will not be any
+        // overlap doing this so should be safe, restricting the reference to the Read trait to help
+        // enforce this.
+        let reader: &mut dyn Read = unsafe {
+            (self as *mut dyn Read)
+                .as_mut()
+                .expect("this can't be null")
+        };
         self.seek(SeekFrom::Start(position))?;
         let mut crc32_hasher = crc32fast::Hasher::new();
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
-            self.read_exact(&mut key_size)?;
+            reader.read_exact(&mut key_size)?;
             crc32_hasher.update(&key_size);
             u16::from_le_bytes(key_size)
         } else {
@@ -799,20 +848,20 @@ where
         } as usize;
 
         let mut val_size_buf = [0_u8; 4];
-        self.read_exact(&mut val_size_buf)?;
+        reader.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
-        buffer.resize(key_size as usize, 0);
-        self.read_exact(buffer)?;
-        crc32_hasher.update(buffer);
-        let key = K::deserialize(&buffer[..]).map_err(FetchError::DeserializeKey)?;
-        buffer.resize(val_size as usize, 0);
-        self.read_exact(buffer)?;
-        crc32_hasher.update(buffer);
+        self.key_buffer.resize(key_size as usize, 0);
+        reader.read_exact(&mut self.key_buffer[..])?;
+        crc32_hasher.update(&self.key_buffer);
+        let key = K::deserialize(&self.key_buffer[..]).map_err(FetchError::DeserializeKey)?;
+        self.value_buffer.resize(val_size as usize, 0);
+        reader.read_exact(&mut self.value_buffer[..])?;
+        crc32_hasher.update(&self.value_buffer);
         let calc_crc32 = crc32_hasher.finalize();
-        let val = V::deserialize(&buffer[..]).map_err(FetchError::DeserializeValue)?;
+        let val = V::deserialize(&self.value_buffer[..]).map_err(FetchError::DeserializeValue)?;
         let mut buf_u32 = [0_u8; 4];
-        self.read_exact(&mut buf_u32)?;
+        reader.read_exact(&mut buf_u32)?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
@@ -820,21 +869,19 @@ where
         Ok((key, val))
     }
 
-    /// Read the record at position.
-    /// Returns the (key, value) tuple.
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn read_record(&mut self, position: u64) -> Result<(K, V), FetchError> {
-        let mut buffer = self.scratch_buffer.take();
-        let result = self.read_record_raw(position, &mut buffer);
-        self.scratch_buffer.set(buffer);
-        result
-    }
-
     /// Read the key for the record at position.
     /// The position needs to be valid, attempting to read an invalid area will
     /// produce an error or invalid key.  This is a truncated read and DOES NOT do a CRC32 check.
     fn read_key(&mut self, position: u64) -> Result<K, ReadKeyError> {
-        let mut buffer = self.scratch_buffer.take();
+        // Turn self into a reference to a Read trait with it's own lifetime.
+        // This is so we can call read_exact with a buffer owned by self.  There will not be any
+        // overlap doing this so should be safe, restricting the reference to the Read trait to help
+        // enforce this.
+        let reader: &mut dyn Read = unsafe {
+            (self as *mut dyn Read)
+                .as_mut()
+                .expect("this can't be null")
+        };
 
         self.seek(SeekFrom::Start(position))?;
         let key_size = if K::is_variable_key_size() {
@@ -845,12 +892,12 @@ where
         } else {
             K::KEY_SIZE as usize
         };
-        buffer.resize(key_size + 4, 0);
-        self.read_exact(&mut buffer[..])?;
+        self.key_buffer.resize(key_size, 0);
+        self.seek(SeekFrom::Current(4))?;
+        reader.read_exact(&mut self.key_buffer[..])?;
         // Skip the value size and read the key.
-        let key = K::deserialize(&buffer[4..])?;
+        let key = K::deserialize(&self.key_buffer[..])?;
 
-        self.scratch_buffer.set(buffer);
         Ok(key)
     }
 
@@ -975,6 +1022,41 @@ where
             }
         }
         Ok(self.seek_pos)
+    }
+}
+
+impl<K, V, const KSIZE: u16, S> Write for DbCore<K, V, KSIZE, S>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.write_buffer.len() >= self.config.write_buffer_size as usize {
+            self.data_file.write_all(&self.write_buffer)?;
+            self.data_file_end += self.write_buffer.len() as u64;
+            self.write_buffer.clear();
+        }
+        let write_buffer_len = self.write_buffer.len();
+        let write_capacity = self.config.write_buffer_size as usize - write_buffer_len;
+        let buf_len = buf.len();
+        if write_capacity > buf_len {
+            self.write_buffer.write_all(buf)?;
+            Ok(buf_len)
+        } else {
+            self.write_buffer.write_all(&buf[..write_capacity])?;
+            self.data_file.write_all(&self.write_buffer)?;
+            self.data_file_end += self.write_buffer.len() as u64;
+            self.write_buffer.clear();
+            Ok(write_capacity)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.data_file.write_all(&self.write_buffer)?;
+        self.data_file_end += self.write_buffer.len() as u64;
+        self.write_buffer.clear();
+        Ok(())
     }
 }
 
@@ -1106,6 +1188,8 @@ impl DbBytes<u64> for u64 {
     }
 }
 
+/// Allow raw bytes to be used as a key.
+impl DbKey<0> for Vec<u8> {}
 /// Allow raw bytes to be used as a value.
 impl DbBytes<Vec<u8>> for Vec<u8> {
     fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
@@ -1322,6 +1406,90 @@ mod tests {
     }
 
     #[test]
+    fn test_reindex() {
+        let max = 10_000;
+        let val = vec![0_u8; 512];
+        {
+            let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_reindex", 1)
+                .create()
+                .truncate()
+                .no_auto_flush()
+                //.set_bucket_elements(25)
+                //.set_load_factor(0.6)
+                .build()
+                .unwrap();
+            let start = time::Instant::now();
+            for i in 0_u64..max {
+                db.insert(i, &val).unwrap();
+            }
+            println!("XXXX insert time {}", start.elapsed().as_secs_f64());
+            assert_eq!(db.len(), max as usize);
+
+            let start = time::Instant::now();
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                assert_eq!(&item.unwrap(), &val);
+            }
+            println!(
+                "XXXX fetch (pre commit) time {}",
+                start.elapsed().as_secs_f64()
+            );
+
+            let start = time::Instant::now();
+            db.commit().unwrap();
+            println!("XXXX commit time {}", start.elapsed().as_secs_f64());
+            let start = time::Instant::now();
+            //let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
+            let vals: Vec<Vec<u8>> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
+            assert_eq!(vals.len(), max as usize);
+            for (_i, v) in vals.iter().enumerate() {
+                assert_eq!(v, &val);
+            }
+            println!("XXXX iter time {}", start.elapsed().as_secs_f64());
+            let start = time::Instant::now();
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}", i);
+                assert_eq!(&item.unwrap(), &val);
+            }
+            println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
+        }
+        let config = DbConfig::new("db_tests", "xxx_reindex", 1);
+        {
+            let mut db = DbCore::<u64, Vec<u8>, 8>::reindex(config.clone()).unwrap();
+            assert_eq!(db.len(), max as usize);
+            let start = time::Instant::now();
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+                assert_eq!(&item.unwrap(), &val);
+            }
+            println!(
+                "XXXX fetch (reindex) time {}",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        {
+            let mut data_file = OpenOptions::new()
+                .write(true)
+                .open(&config.files.data_file)
+                .unwrap();
+            let data_len = data_file.seek(SeekFrom::End(0)).unwrap();
+            println!("XXXX data len {}", data_len);
+            data_file.set_len(data_len - 16).unwrap(); // Truncate the file making the last record corrupt.
+        }
+        let db = DbCore::<u64, Vec<u8>, 8>::reindex(config).unwrap();
+        assert_eq!(db.len(), max as usize - 1);
+        let vals: Vec<Vec<u8>> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
+        // Make sure the last record was removed (corrupted).
+        assert_eq!(vals.len(), max as usize - 1);
+        for (_i, v) in vals.iter().enumerate() {
+            assert_eq!(v, &val);
+        }
+    }
+
+    #[test]
     fn test_50k() {
         /*let e: Box<dyn std::error::Error + Send + Sync> =
             std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
@@ -1444,7 +1612,7 @@ mod tests {
         for i in 0..50_000 {
             assert_eq!(
                 &db.fetch(&format!("key {i}"))
-                    .unwrap_or_else(|_| panic!("Failed to read item {}", i)),
+                    .unwrap_or_else(|e| panic!("Failed to read item {}, {}", i, e)),
                 &format!("Value {}", i)
             );
         }
