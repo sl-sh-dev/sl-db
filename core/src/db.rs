@@ -1350,6 +1350,7 @@ mod tests {
         assert_eq!(iter.next().unwrap(), (key, "Value Two2".to_string()));
         let key = Key([8_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
+        db.destroy();
     }
 
     #[test]
@@ -1413,62 +1414,35 @@ mod tests {
             let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_reindex", 1)
                 .create()
                 .truncate()
-                .no_auto_flush()
-                //.set_bucket_elements(25)
-                //.set_load_factor(0.6)
                 .build()
                 .unwrap();
-            let start = time::Instant::now();
             for i in 0_u64..max {
                 db.insert(i, &val).unwrap();
             }
-            println!("XXXX insert time {}", start.elapsed().as_secs_f64());
             assert_eq!(db.len(), max as usize);
 
-            let start = time::Instant::now();
             for i in 0..max {
                 let item = db.fetch(&(i as u64));
                 assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
                 assert_eq!(&item.unwrap(), &val);
             }
-            println!(
-                "XXXX fetch (pre commit) time {}",
-                start.elapsed().as_secs_f64()
-            );
 
-            let start = time::Instant::now();
             db.commit().unwrap();
-            println!("XXXX commit time {}", start.elapsed().as_secs_f64());
-            let start = time::Instant::now();
-            //let vals: Vec<String> = db.raw_iter().unwrap().map(|(_k, v)| v).collect();
-            let vals: Vec<Vec<u8>> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
-            assert_eq!(vals.len(), max as usize);
-            for (_i, v) in vals.iter().enumerate() {
-                assert_eq!(v, &val);
-            }
-            println!("XXXX iter time {}", start.elapsed().as_secs_f64());
-            let start = time::Instant::now();
             for i in 0..max {
                 let item = db.fetch(&(i as u64));
                 assert!(item.is_ok(), "Failed on item {}", i);
                 assert_eq!(&item.unwrap(), &val);
             }
-            println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
         }
         let config = DbConfig::new("db_tests", "xxx_reindex", 1);
         {
             let mut db = DbCore::<u64, Vec<u8>, 8>::reindex(config.clone()).unwrap();
             assert_eq!(db.len(), max as usize);
-            let start = time::Instant::now();
             for i in 0..max {
                 let item = db.fetch(&(i as u64));
                 assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
                 assert_eq!(&item.unwrap(), &val);
             }
-            println!(
-                "XXXX fetch (reindex) time {}",
-                start.elapsed().as_secs_f64()
-            );
         }
         {
             let mut data_file = OpenOptions::new()
@@ -1476,7 +1450,6 @@ mod tests {
                 .open(&config.files.data_file)
                 .unwrap();
             let data_len = data_file.seek(SeekFrom::End(0)).unwrap();
-            println!("XXXX data len {}", data_len);
             data_file.set_len(data_len - 16).unwrap(); // Truncate the file making the last record corrupt.
         }
         let db = DbCore::<u64, Vec<u8>, 8>::reindex(config).unwrap();
@@ -1487,6 +1460,52 @@ mod tests {
         for (_i, v) in vals.iter().enumerate() {
             assert_eq!(v, &val);
         }
+        db.destroy();
+    }
+
+    #[test]
+    fn test_destroy() {
+        let max = 1_000;
+        let val = vec![0_u8; 512];
+        {
+            let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_destroy", 1)
+                .create()
+                .truncate()
+                .build()
+                .unwrap();
+            for i in 0_u64..max {
+                db.insert(i, &val).unwrap();
+            }
+            assert_eq!(db.len(), max as usize);
+
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                assert_eq!(&item.unwrap(), &val);
+            }
+
+            db.commit().unwrap();
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}", i);
+                assert_eq!(&item.unwrap(), &val);
+            }
+        }
+        let config = DbConfig::new("db_tests", "xxx_destroy", 1);
+        {
+            let mut db = DbCore::<u64, Vec<u8>, 8>::open(config.clone().create()).unwrap();
+            assert_eq!(db.len(), max as usize);
+            for i in 0..max {
+                let item = db.fetch(&(i as u64));
+                assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+                assert_eq!(&item.unwrap(), &val);
+            }
+            db.destroy();
+        }
+        let db = DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+        assert_eq!(db.len(), 0);
+        assert_eq!(db.raw_iter().unwrap().count(), 0);
+        db.destroy();
     }
 
     #[test]
@@ -1616,6 +1635,7 @@ mod tests {
                 &format!("Value {}", i)
             );
         }
+        db.destroy();
     }
 
     #[test]
@@ -1661,5 +1681,6 @@ mod tests {
         assert_eq!(30, db.fetch(&3).unwrap());
         assert_eq!(4, db.fetch(&4).unwrap());
         assert_eq!(50, db.fetch(&5).unwrap());
+        db.destroy();
     }
 }
