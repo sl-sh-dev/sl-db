@@ -1,13 +1,18 @@
 //! Contains the Hash Index (HDX) structure and code.
 
+use crate::crc::{add_crc32, check_crc};
 use crate::db::data_header::DataHeader;
 use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
+use crate::fxhasher::FxHasher;
+use std::fs::{File, OpenOptions};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-/// Size of an index header.
-pub const HDX_HEADER_SIZE: usize = 64;
+/// Minimum size to hold a header.  THe header will be padded to bucket_size if it is larger.
+/// This is to allow the hdx file to accessed in sector sized chunks.
+const MIN_HEADER_SIZE: usize = 64;
 
 /// Header for an hdx (index) file.  This contains the hash buckets for lookups.
 /// This file is not a log file and the header and buckets will change in place over time.
@@ -29,6 +34,61 @@ pub(crate) struct HdxHeader {
 }
 
 impl HdxHeader {
+    /// Open an HDX index file and return the open file and the header.
+    pub fn open_hdx_file<S: BuildHasher + Default>(
+        data_header: &DataHeader,
+        config: &DbConfig,
+        hasher: &S,
+    ) -> Result<(File, HdxHeader), LoadHeaderError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(config.write)
+            .create(config.create && config.write)
+            .truncate(config.truncate && config.write)
+            .open(&config.files.hdx_file)?;
+        let file_end = file.seek(SeekFrom::End(0))?;
+
+        let header = if file_end == 0 {
+            let mut fx_hasher = FxHasher::default();
+            fx_hasher.write_u64(data_header.uid());
+            let salt = fx_hasher.finish();
+            let mut hasher = hasher.build_hasher();
+            salt.hash(&mut hasher);
+            let pepper = hasher.finish();
+            let header = HdxHeader::from_data_header(data_header, config, salt, pepper);
+            header.write_header(&mut file)?;
+            let bucket_size = header.bucket_size() as usize;
+            let mut buffer = vec![0_u8; bucket_size];
+            add_crc32(&mut buffer);
+            for _ in 0..header.buckets() {
+                file.write_all(&buffer)?;
+            }
+            header
+        } else {
+            let header = HdxHeader::load_header(&mut file, config.bucket_size)?;
+            // Basic validation of the odx header.
+            if header.version() != data_header.version() {
+                return Err(LoadHeaderError::InvalidIndexVersion);
+            }
+            if header.appnum() != data_header.appnum() {
+                return Err(LoadHeaderError::InvalidIndexAppNum);
+            }
+            if header.uid() != data_header.uid() {
+                return Err(LoadHeaderError::InvalidIndexUID);
+            }
+            // Check the salt/pepper.  This will make sure you are using the same hasher and it seems
+            // to be stable (not the default Rust hasher for instance) since changing the hasher would
+            // invalidate the index.
+            let mut hasher = hasher.build_hasher();
+            header.salt().hash(&mut hasher);
+            if header.pepper() != hasher.finish() {
+                return Err(LoadHeaderError::InvalidHasher);
+            }
+            header
+        };
+        Ok((file, header))
+    }
+
     /// Return a default HdxHeader with any values from data_header overridden.
     /// This includes the version, uid, appnum, bucket_size and bucket_elements.
     pub fn from_data_header(
@@ -54,20 +114,23 @@ impl HdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
+    pub fn load_header<R: Read + Seek>(
+        source: &mut R,
+        header_size: u16,
+    ) -> Result<Self, LoadHeaderError> {
+        let header_size = if (header_size as usize) < MIN_HEADER_SIZE {
+            MIN_HEADER_SIZE
+        } else {
+            header_size as usize
+        };
         source.seek(SeekFrom::Start(0))?;
-        let mut buffer = [0_u8; HDX_HEADER_SIZE];
+        let mut buffer = vec![0_u8; header_size];
         let mut buf16 = [0_u8; 2];
         let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
         source.read_exact(&mut buffer[..])?;
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        crc32_hasher.update(&buffer[..(HDX_HEADER_SIZE - 4)]);
-        let calc_crc32 = crc32_hasher.finalize();
-        buf32.copy_from_slice(&buffer[(HDX_HEADER_SIZE - 4)..]);
-        let read_crc32 = u32::from_le_bytes(buf32);
-        if calc_crc32 != read_crc32 {
+        if !check_crc(&buffer) {
             return Err(LoadHeaderError::CrcFailed);
         }
         let mut type_id = [0_u8; 8];
@@ -123,7 +186,8 @@ impl HdxHeader {
 
     /// Write this header to sync at current seek position.
     pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
-        let mut buffer = [0_u8; HDX_HEADER_SIZE];
+        let header_size = self.header_size();
+        let mut buffer = vec![0_u8; header_size];
         let mut pos = 0;
         buffer[pos..8].copy_from_slice(&self.type_id);
         pos += 8;
@@ -146,15 +210,18 @@ impl HdxHeader {
         buffer[pos..(pos + 2)].copy_from_slice(&self.load_factor.to_le_bytes());
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.values.to_le_bytes());
-        pos += 8;
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        crc32_hasher.update(&buffer[..pos]);
-        let crc32 = crc32_hasher.finalize();
-        buffer[pos..(pos + 4)].copy_from_slice(&crc32.to_le_bytes());
-        pos += 4;
-        assert_eq!(pos, HDX_HEADER_SIZE);
+        add_crc32(&mut buffer);
         sync.write_all(&buffer)?;
         Ok(())
+    }
+
+    /// Return the size of the HDX header.
+    pub fn header_size(&self) -> usize {
+        if (self.bucket_size as usize) < MIN_HEADER_SIZE {
+            MIN_HEADER_SIZE
+        } else {
+            self.bucket_size as usize
+        }
     }
 
     /// Number of buckets in this index file.

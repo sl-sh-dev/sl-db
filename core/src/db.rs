@@ -1,61 +1,32 @@
 //! Main module for the SLDB core.  This implements the core sync single threaded access to the DB.
 
+use crate::crc::{add_crc32, check_crc};
+use crate::db::bucket_iter::BucketIter;
 use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
-use crate::db::hdx_header::{HdxHeader, HDX_HEADER_SIZE};
+use crate::db::hdx_header::HdxHeader;
 use crate::db::odx_header::OdxHeader;
+use crate::db_bytes::DbBytes;
 use crate::db_config::{DbConfig, DbFiles};
+use crate::db_key::DbKey;
 use crate::db_raw_iter::DbRawIter;
 use crate::error::flush::FlushError;
 use crate::error::insert::InsertError;
-use crate::error::serialize::SerializeError;
-use crate::error::{
-    deserialize::DeserializeError, CommitError, FetchError, LoadHeaderError, OpenError,
-};
+use crate::error::{CommitError, FetchError, LoadHeaderError, OpenError};
 use crate::error::{ReadKeyError, RenameError};
 use crate::fxhasher::{FxHashMap, FxHasher};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::{fs, io};
 
+mod bucket_iter;
+mod core_io_traits;
 pub mod data_header;
 pub mod hdx_header;
 pub mod odx_header;
-
-/// Required trait for a key.  Note that setting KSIZE to 0 indicates a variable sized key.
-pub trait DbKey<const KSIZE: u16>: Eq + Hash + Debug {
-    /// Defines the key size for fixed size keys (will be 0 for variable sized keys).
-    const KEY_SIZE: u16 = KSIZE;
-
-    /// True if this DB has a fixed size key.
-    #[inline(always)]
-    fn is_fixed_key_size() -> bool {
-        Self::KEY_SIZE > 0
-    }
-
-    /// True if this DB has a variable size key.
-    /// Variable sized keys require key sizes to be saved in the DB.
-    #[inline(always)]
-    fn is_variable_key_size() -> bool {
-        Self::KEY_SIZE == 0
-    }
-}
-
-/// Trait that all key and values types must implement to convert to from bytes for the DB.
-pub trait DbBytes<T> {
-    /// Serialize the type into buffer.
-    /// Buffer is expected to contain exactly the serialized type and nothing more.
-    /// Implementations can make no assumptions about the state of the buffer passed in.
-    /// Resizing the buffer is expected (why it is a Vec not a slice) and may already have sufficient
-    /// capacity.
-    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError>;
-
-    /// Deserialize a byte slice back into the type or error out.
-    fn deserialize(buffer: &[u8]) -> Result<T, DeserializeError>;
-}
 
 /// An instance of a DB.
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
@@ -91,16 +62,19 @@ where
     _value: PhantomData<V>,
 }
 
+trait ReadSeek: Read + Seek {}
+impl ReadSeek for File {}
+
 /// Macro to get an iterator over all the entries in a bucket (including overflow buckets).
 /// For internal use only!  The unsafe should be fine as long as the iterators are used internally
 /// in the single threaded/sync module.
 macro_rules! bucket_iter {
     ($db:expr, $bucket:expr) => {{
-        // Break the db lifetime away so we can get a usable bucket iter.
-        // The db reference that the iter holds is used as a Read/Seek object and since the data
-        // file is append only and this code is single threaded this should be perfectly safe.
-        let unsafe_db: &mut DbCore<K, V, KSIZE, S> = unsafe {
-            ($db as *mut DbCore<K, V, KSIZE, S>)
+        // Turn $db.odx_file into a reference to a Read + Seek trait.
+        // Need this to break away the odx file lifetime to use in the iter.
+        // The ODX file should not change under the iterator and is therefore safe.
+        let odx_reader: &mut dyn ReadSeek = unsafe {
+            (&mut $db.odx_file as *mut dyn ReadSeek)
                 .as_mut()
                 .expect("this can't be null")
         };
@@ -111,16 +85,13 @@ macro_rules! bucket_iter {
             add_crc32(&mut buffer);
         } else {
             let bucket_size = $db.hdx_header.bucket_size() as usize;
-            let bucket_pos: u64 = (HDX_HEADER_SIZE + ($bucket as usize * bucket_size)) as u64;
+            let bucket_pos: u64 =
+                ($db.hdx_header.header_size() + ($bucket as usize * bucket_size)) as u64;
             if let Ok(_) = $db.hdx_file.seek(SeekFrom::Start(bucket_pos)) {
                 let _ = $db.hdx_file.read_exact(&mut buffer);
             }
         }
-        BucketIter::new(
-            &mut unsafe_db.odx_file,
-            buffer,
-            $db.hdx_header.bucket_elements(),
-        )
+        BucketIter::new(odx_reader, buffer, $db.hdx_header.bucket_elements())
     }};
 }
 
@@ -153,8 +124,8 @@ where
         let (mut data_file, header) =
             Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
-        let (hdx_file, hdx_header) =
-            Self::open_hdx_file(&header, &config, &hasher).map_err(OpenError::IndexFileOpen)?;
+        let (hdx_file, hdx_header) = HdxHeader::open_hdx_file(&header, &config, &hasher)
+            .map_err(OpenError::IndexFileOpen)?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (hdx_header.buckets() + 1).next_power_of_two();
         let (write_buffer, bucket_cache) = if config.write {
@@ -188,7 +159,7 @@ where
             }
         }
         let (odx_file, _odx_header) =
-            Self::open_odx_file(&hdx_header, &config).map_err(OpenError::IndexFileOpen)?;
+            OdxHeader::open_odx_file(&hdx_header, &config).map_err(OpenError::IndexFileOpen)?;
         // TODO, crosscheck all the headers and make sure everything checks out.
         Ok(Self {
             header,
@@ -315,7 +286,7 @@ where
                 }
             }
         }
-        if iter.crc_failure {
+        if iter.crc_failure() {
             Err(FetchError::CrcFailed)
         } else {
             Err(FetchError::NotFound)
@@ -336,7 +307,7 @@ where
                 }
             }
         }
-        if iter.crc_failure {
+        if iter.crc_failure() {
             Err(ReadKeyError::CrcFailed)
         } else {
             Ok(false)
@@ -347,7 +318,8 @@ where
     /// Useful if the DB is also opened for writing.
     pub fn refresh_index(&mut self) {
         if !self.config.write {
-            if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file) {
+            if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file, self.config.bucket_size)
+            {
                 self.hdx_header = header;
                 // Don't want buckets and modulus to be the same, so +1
                 self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
@@ -560,102 +532,6 @@ where
         Ok((file, header))
     }
 
-    fn open_hdx_file(
-        data_header: &DataHeader,
-        config: &DbConfig,
-        hasher: &S,
-    ) -> Result<(File, HdxHeader), LoadHeaderError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(config.write)
-            .create(config.create && config.write)
-            .truncate(config.truncate && config.write)
-            .open(&config.files.hdx_file)?;
-        file.seek(SeekFrom::End(0))?;
-        let file_end = file.seek(SeekFrom::Current(0))?;
-
-        let header = if file_end == 0 {
-            let mut fx_hasher = FxHasher::default();
-            fx_hasher.write_u64(data_header.uid());
-            let salt = fx_hasher.finish();
-            let mut hasher = hasher.build_hasher();
-            salt.hash(&mut hasher);
-            let pepper = hasher.finish();
-            let header = HdxHeader::from_data_header(data_header, config, salt, pepper);
-            header.write_header(&mut file)?;
-            let bucket_size = header.bucket_size() as usize;
-            let mut buffer = vec![0_u8; bucket_size];
-            add_crc32(&mut buffer);
-            for _ in 0..header.buckets() {
-                file.write_all(&buffer)?;
-            }
-            header
-        } else {
-            let header = HdxHeader::load_header(&mut file)?;
-            // Basic validation of the odx header.
-            if header.version() != data_header.version() {
-                return Err(LoadHeaderError::InvalidIndexVersion);
-            }
-            if header.appnum() != data_header.appnum() {
-                return Err(LoadHeaderError::InvalidIndexAppNum);
-            }
-            if header.uid() != data_header.uid() {
-                return Err(LoadHeaderError::InvalidIndexUID);
-            }
-            // Check the salt/pepper.  This will make sure you are using the same hasher and it seems
-            // to be stable (not the default Rust hasher for instance) since changing the hasher would
-            // invalidate the index.
-            let mut hasher = hasher.build_hasher();
-            header.salt().hash(&mut hasher);
-            if header.pepper() != hasher.finish() {
-                return Err(LoadHeaderError::InvalidHasher);
-            }
-            header
-        };
-        Ok((file, header))
-    }
-
-    fn open_odx_file(
-        hdx_header: &HdxHeader,
-        config: &DbConfig,
-    ) -> Result<(File, OdxHeader), LoadHeaderError> {
-        if config.truncate && config.write {
-            // truncate is incompatible with append so truncate then open for append.
-            OpenOptions::new()
-                .write(true)
-                .create(config.create)
-                .truncate(true)
-                .open(&config.files.odx_file)?;
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(config.write)
-            .create(config.create && config.write)
-            .open(&config.files.odx_file)?;
-        file.seek(SeekFrom::End(0))?;
-        let file_end = file.seek(SeekFrom::Current(0))?;
-
-        let header = if file_end == 0 {
-            let header = OdxHeader::from_hdx_header(hdx_header);
-            header.write_header(&mut file)?;
-            header
-        } else {
-            let header = OdxHeader::load_header(&mut file)?;
-            // Basic validation of the odx header.
-            if header.version() != hdx_header.version() {
-                return Err(LoadHeaderError::InvalidIndexVersion);
-            }
-            if header.appnum() != hdx_header.appnum() {
-                return Err(LoadHeaderError::InvalidIndexAppNum);
-            }
-            if header.uid() != hdx_header.uid() {
-                return Err(LoadHeaderError::InvalidIndexUID);
-            }
-            header
-        };
-        Ok((file, header))
-    }
-
     /// Return the u64 hash of key.
     fn hash(&self, key: &K) -> u64 {
         let mut hasher = self.hasher.build_hasher();
@@ -713,7 +589,7 @@ where
                 }
             }
         }
-        if iter.crc_failure {
+        if iter.crc_failure() {
             return Err(InsertError::IndexCrcError);
         }
         self.bucket_cache.insert(split_bucket, buffer);
@@ -745,7 +621,8 @@ where
             // Read the bucket from the index and verify (crc32) it.
             let bucket_size = self.hdx_header.bucket_size() as usize;
             let mut buffer = vec![0; bucket_size];
-            let bucket_pos: u64 = (HDX_HEADER_SIZE + (bucket as usize * bucket_size)) as u64;
+            let bucket_pos: u64 =
+                (self.hdx_header.header_size() + (bucket as usize * bucket_size)) as u64;
             {
                 self.hdx_file
                     .seek(SeekFrom::Start(bucket_pos))
@@ -770,7 +647,8 @@ where
     fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
         let bucket_size = self.hdx_header.bucket_size() as usize;
         for (bucket, mut buffer) in self.bucket_cache.drain() {
-            let bucket_pos: u64 = (HDX_HEADER_SIZE + (bucket as usize * bucket_size)) as u64;
+            let bucket_pos: u64 =
+                (self.hdx_header.header_size() + (bucket as usize * bucket_size)) as u64;
             add_crc32(&mut buffer);
             // Seeking and writing past the file end seems to extend the file correctly.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
@@ -952,290 +830,14 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> Read for DbCore<K, V, KSIZE, S>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    /// Read for the DbInner.  This allows other code to not worry about whether data is read from
-    /// the file, write buffer or the read buffer.  The file and write buffer will not have overlapping records
-    /// so this will not read across them in one call.  This will not happen on a proper DB although
-    /// the Read contract should handle this fine.
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.seek_pos >= self.data_file_end {
-            let write_pos = (self.seek_pos - self.data_file_end) as usize;
-            if write_pos < self.write_buffer.len() {
-                let mut size = buf.len();
-                if write_pos + size > self.write_buffer.len() {
-                    size = self.write_buffer.len() - write_pos;
-                }
-                buf[..size].copy_from_slice(&self.write_buffer[write_pos..write_pos + size]);
-                self.seek_pos += size as u64;
-                Ok(size)
-            } else {
-                Ok(0)
-            }
-        } else if self.seek_pos >= self.read_buffer_start as u64
-            && self.seek_pos < (self.read_buffer_start + self.read_buffer_len) as u64
-        {
-            self.copy_read_buffer(buf)
-        } else {
-            let mut seek_pos = self.seek_pos;
-            let mut end = self.data_file_end - seek_pos;
-            if end < self.config.read_buffer_size as u64 {
-                // If remaining bytes are less then the buffer pull back seek_pos to fill the buffer.
-                seek_pos = if self.data_file_end > self.config.read_buffer_size as u64 {
-                    self.data_file_end - self.config.read_buffer_size as u64
-                } else {
-                    0
-                };
-            } else {
-                // Put the seek position in the mid point of the read buffer.  This might help increase
-                // buffer hits or might do nothing or hurt depending on fetch patterns.
-                seek_pos = if seek_pos > (self.config.read_buffer_size / 2) as u64 {
-                    seek_pos - (self.config.read_buffer_size / 2) as u64
-                } else {
-                    0
-                };
-            }
-            end = self.data_file_end - seek_pos;
-            if end > 0 {
-                self.data_file.seek(SeekFrom::Start(seek_pos))?;
-                if end < self.config.read_buffer_size as u64 {
-                    self.data_file
-                        .read_exact(&mut self.read_buffer[..end as usize])?;
-                    self.read_buffer_len = end as usize;
-                } else {
-                    self.data_file.read_exact(&mut self.read_buffer[..])?;
-                    self.read_buffer_len = self.config.read_buffer_size as usize;
-                }
-                self.read_buffer_start = seek_pos as usize;
-                self.copy_read_buffer(buf)
-            } else {
-                Ok(0)
-            }
-        }
-    }
-}
-
-impl<K, V, const KSIZE: u16, S> Seek for DbCore<K, V, KSIZE, S>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    /// Seek on the DbInner treating the file and write cache as one byte array.
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match pos {
-            SeekFrom::Start(pos) => self.seek_pos = pos,
-            SeekFrom::End(pos) => {
-                let end = (self.data_file_end + self.write_buffer.len() as u64) as i64 + pos;
-                if end >= 0 {
-                    self.seek_pos = end as u64;
-                } else {
-                    self.seek_pos = 0;
-                }
-            }
-            SeekFrom::Current(pos) => {
-                let end = self.seek_pos as i64 + pos;
-                if end >= 0 {
-                    self.seek_pos = end as u64;
-                } else {
-                    self.seek_pos = 0;
-                }
-            }
-        }
-        Ok(self.seek_pos)
-    }
-}
-
-impl<K, V, const KSIZE: u16, S> Write for DbCore<K, V, KSIZE, S>
-where
-    K: DbKey<KSIZE> + DbBytes<K>,
-    V: Debug + DbBytes<V>,
-    S: BuildHasher + Default,
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.write_buffer.len() >= self.config.write_buffer_size as usize {
-            self.data_file.write_all(&self.write_buffer)?;
-            self.data_file_end += self.write_buffer.len() as u64;
-            self.write_buffer.clear();
-        }
-        let write_buffer_len = self.write_buffer.len();
-        let write_capacity = self.config.write_buffer_size as usize - write_buffer_len;
-        let buf_len = buf.len();
-        if write_capacity > buf_len {
-            self.write_buffer.write_all(buf)?;
-            Ok(buf_len)
-        } else {
-            self.write_buffer.write_all(&buf[..write_capacity])?;
-            self.data_file.write_all(&self.write_buffer)?;
-            self.data_file_end += self.write_buffer.len() as u64;
-            self.write_buffer.clear();
-            Ok(write_capacity)
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.data_file.write_all(&self.write_buffer)?;
-        self.data_file_end += self.write_buffer.len() as u64;
-        self.write_buffer.clear();
-        Ok(())
-    }
-}
-
-/// Check buffers crc32.  The last 4 bytes of the buffer are the CRC32 code and rest of the buffer
-/// is checked against that.
-fn check_crc(buffer: &[u8]) -> bool {
-    let len = buffer.len();
-    if len < 5 {
-        return false;
-    }
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(&buffer[..(len - 4)]);
-    let calc_crc32 = crc32_hasher.finalize();
-    let mut buf32 = [0_u8; 4];
-    buf32.copy_from_slice(&buffer[(len - 4)..]);
-    let read_crc32 = u32::from_le_bytes(buf32);
-    calc_crc32 == read_crc32
-}
-
-/// Add a crc32 code to buffer.  The last four bytes of buffer are overwritten by the crc32 code of
-/// the rest of the buffer.
-pub(crate) fn add_crc32(buffer: &mut [u8]) {
-    let len = buffer.len();
-    if len < 4 {
-        return;
-    }
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(&buffer[..(len - 4)]);
-    let crc32 = crc32_hasher.finalize();
-    buffer[len - 4..].copy_from_slice(&crc32.to_le_bytes());
-}
-
-/// Iterates over the (hash, record_position) values contained in a bucket.
-struct BucketIter<'src, R: Read + Seek> {
-    odx_file: &'src mut R,
-    buffer: Vec<u8>,
-    bucket_pos: usize,
-    overflow_pos: u64,
-    elements: u16,
-    crc_failure: bool,
-}
-
-impl<'src, R: Read + Seek> BucketIter<'src, R> {
-    fn new(odx_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> Self {
-        let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
-        buf.copy_from_slice(&buffer[0..8]);
-        let overflow_pos = u64::from_le_bytes(buf);
-        let crc_failure = !check_crc(&buffer);
-        Self {
-            odx_file,
-            buffer,
-            bucket_pos: 0,
-            overflow_pos,
-            elements,
-            crc_failure,
-        }
-    }
-}
-
-impl<'src, R: Read + Seek> Iterator for &mut BucketIter<'src, R> {
-    type Item = (u64, u64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.crc_failure {
-            return None;
-        }
-        // For reading u64 values, needs an array.
-        let mut buf64 = [0_u8; 8];
-        loop {
-            if self.bucket_pos < self.elements as usize {
-                let mut pos = 8 + (self.bucket_pos * BUCKET_ELEMENT_SIZE);
-                buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
-                let hash = u64::from_le_bytes(buf64);
-                pos += 8;
-                buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
-                let rec_pos = u64::from_le_bytes(buf64);
-                if hash == 0 && rec_pos == 0 {
-                    self.bucket_pos += 1;
-                } else {
-                    self.bucket_pos += 1;
-                    return Some((hash, rec_pos));
-                }
-            } else if self.overflow_pos > 0 {
-                // We have an overflow bucket to search as well.
-                self.odx_file
-                    .seek(SeekFrom::Start(self.overflow_pos))
-                    .ok()?;
-                self.odx_file.read_exact(&mut self.buffer[..]).ok()?;
-                if !check_crc(&self.buffer) {
-                    self.crc_failure = true;
-                    return None;
-                }
-                self.bucket_pos = 0;
-                buf64.copy_from_slice(&self.buffer[0..8]);
-                self.overflow_pos = u64::from_le_bytes(buf64);
-            } else {
-                return None;
-            }
-        }
-    }
-}
-
-impl DbKey<0> for String {}
-impl DbBytes<String> for String {
-    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
-        let bytes = self.as_bytes();
-        buffer.resize(bytes.len(), 0);
-        buffer.copy_from_slice(bytes);
-        Ok(())
-    }
-
-    fn deserialize(buffer: &[u8]) -> Result<String, DeserializeError> {
-        Ok(String::from_utf8_lossy(buffer).to_string())
-    }
-}
-
-impl DbKey<8> for u64 {}
-impl DbBytes<u64> for u64 {
-    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
-        buffer.resize(8, 0);
-        buffer.copy_from_slice(&self.to_le_bytes());
-        Ok(())
-    }
-
-    fn deserialize(buffer: &[u8]) -> Result<u64, DeserializeError> {
-        let mut buf = [0_u8; 8];
-        buf.copy_from_slice(buffer);
-        Ok(Self::from_le_bytes(buf))
-    }
-}
-
-/// Allow raw bytes to be used as a key.
-impl DbKey<0> for Vec<u8> {}
-/// Allow raw bytes to be used as a value.
-impl DbBytes<Vec<u8>> for Vec<u8> {
-    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
-        buffer.resize(self.len(), 0);
-        buffer.copy_from_slice(self);
-        Ok(())
-    }
-
-    fn deserialize(buffer: &[u8]) -> Result<Vec<u8>, DeserializeError> {
-        let mut v = vec![0_u8; buffer.len()];
-        v.copy_from_slice(buffer);
-        Ok(v)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     //use crate::err_info;
     //use crate::error::source::SourceError;
     //use std::io::ErrorKind;
+    use crate::error::deserialize::DeserializeError;
+    use crate::error::serialize::SerializeError;
     use std::time;
 
     #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]

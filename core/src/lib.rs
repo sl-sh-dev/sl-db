@@ -6,8 +6,11 @@
 //! It is possible to iterate the data without the key and and a new index can also be built from
 //! just an intact data file.
 
+pub(crate) mod crc;
 pub mod db;
+pub mod db_bytes;
 pub mod db_config;
+pub mod db_key;
 pub mod db_raw_iter;
 pub mod error;
 pub mod fxhasher;

@@ -2,7 +2,8 @@
 //! open the file directly.
 
 use crate::db::data_header::DataHeader;
-use crate::db::{DbBytes, DbKey};
+use crate::db_bytes::DbBytes;
+use crate::db_key::DbKey;
 use crate::error::FetchError;
 use crate::error::LoadHeaderError;
 use std::fmt::Debug;

@@ -1,7 +1,9 @@
 //! Define the configuration used to create a SLDB.
 
 use crate::db::data_header::BUCKET_ELEMENT_SIZE;
-use crate::db::{DbBytes, DbCore, DbKey};
+use crate::db::DbCore;
+use crate::db_bytes::DbBytes;
+use crate::db_key::DbKey;
 use crate::error::OpenError;
 use std::fmt::Debug;
 use std::hash::BuildHasher;
@@ -68,8 +70,8 @@ impl DbConfig {
     /// Create a new config.
     pub fn new<P: Into<PathBuf>>(dir: P, base_name: P, appnum: u64) -> Self {
         let initial_buckets = 128;
-        let bucket_elements = 25; //(bucket_size - 8) / BUCKET_ELEMENT_SIZE as u16;
-        let bucket_size = 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
+        let bucket_size = 512; //12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
+        let bucket_elements = (bucket_size - 12) / BUCKET_ELEMENT_SIZE as u16;
         let files = DbFiles::new(dir, base_name);
         Self {
             files,
