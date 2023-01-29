@@ -1,7 +1,7 @@
 //! Implement the core io traints (Read, Seek and Write) on DbCore.  This allows other code to
 //! easily access the underlying data without worring about the read or write buffers.
 
-use crate::db::DbCore;
+use crate::db::DbInner;
 use crate::db_bytes::DbBytes;
 use crate::db_key::DbKey;
 use std::fmt::Debug;
@@ -9,7 +9,7 @@ use std::hash::BuildHasher;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-impl<K, V, const KSIZE: u16, S> Read for DbCore<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Read for DbInner<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -76,7 +76,7 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> Seek for DbCore<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Seek for DbInner<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -107,7 +107,7 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> Write for DbCore<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Write for DbInner<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,

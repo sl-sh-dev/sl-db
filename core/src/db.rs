@@ -30,9 +30,147 @@ pub mod odx_header;
 
 /// An instance of a DB.
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
+pub struct DbCore<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
+    inner: DbInner<K, V, KSIZE, S>,
+}
+
+impl<K, V, const KSIZE: u16, S> DbCore<K, V, KSIZE, S>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+    V: Debug + DbBytes<V>,
+    S: BuildHasher + Default,
+{
+    /// Open a new or reopen an existing database.
+    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+        Ok(Self {
+            inner: DbInner::open(config)?,
+        })
+    }
+
+    /// Will destroy the existing index for DB and rebuild it based on the data file.
+    /// This will also verify the integrity of the data file.  If only the final record is corrupt
+    /// then the file will be truncated to leave a valid DB.  Other corrupt records will be ignored
+    /// (they will be garbage in the data file but won't be indexed).
+    pub fn reindex(config: DbConfig) -> Result<Self, OpenError> {
+        Ok(Self {
+            inner: DbInner::reindex(config)?,
+        })
+    }
+
+    /// Close and destroy the DB (remove all it's files).
+    /// If it can not remove a file it will silently ignore this.
+    pub fn destroy(self) {
+        self.inner.destroy();
+    }
+
+    /// Rename the database to new_name.
+    pub fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> Result<(), RenameError> {
+        self.inner.rename(new_name)
+    }
+
+    /// Returns a reference to the file names for this DB.
+    pub fn files(&self) -> &DbFiles {
+        self.inner.files()
+    }
+
+    /// Fetch the value stored at key.  Will return an error if not found.
+    pub fn fetch(&mut self, key: &K) -> Result<V, FetchError> {
+        self.inner.fetch(key)
+    }
+
+    /// True if the database contains key.
+    pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
+        self.inner.contains_key(key)
+    }
+
+    /// If in read-only mode refresh the index header data from on-disk.
+    /// Useful if the DB is also opened for writing.
+    pub fn refresh_index(&mut self) {
+        self.inner.refresh_index()
+    }
+
+    /// Insert a new key/value pair in Db.
+    /// For the data file this means inserting:
+    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
+    ///   - value size (u32)
+    ///   - key data
+    ///   - value data
+    /// For the erros IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
+    /// failed state and become read only.  These errors all indicate serious underlying issues that
+    /// can not be trivially fixed, a reopen/repair might help.
+    pub fn insert(&mut self, key: K, value: &V) -> Result<(), InsertError> {
+        self.inner.insert(key, value)
+    }
+
+    /// Return the number of records in Db.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Is the DB empty?
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Return the DB version.
+    pub fn version(&self) -> u16 {
+        self.inner.version()
+    }
+
+    /// Return the DB application number (set at creation).
+    pub fn appnum(&self) -> u64 {
+        self.inner.appnum()
+    }
+
+    /// Return the DB uid (generated at creation).
+    pub fn uid(&self) -> u64 {
+        self.inner.uid()
+    }
+
+    /// Return the DB index salt (generated at creation).
+    /// Can be used with the pepper to test the hasher.
+    pub fn salt(&self) -> u64 {
+        self.inner.salt()
+    }
+
+    /// Return the DB pepper (generated at creation from the salt with Hasher).
+    /// Can be used with the salt to test the hasher.
+    pub fn pepper(&self) -> u64 {
+        self.inner.pepper()
+    }
+
+    /// Flush any caches to disk and sync the data and index file.
+    /// All data should be safely on disk if this call succeeds.
+    /// Note this is an expensive call (syncing to disk is not cheap).
+    pub fn commit(&mut self) -> Result<(), CommitError> {
+        self.inner.commit()
+    }
+
+    /// Flush any in memory caches to file.
+    /// Note this is only a flush not a commit, it does not do a sync on the files.
+    pub fn flush(&mut self) -> Result<(), FlushError> {
+        self.inner.flush()
+    }
+
+    /// Return an iterator over the key values in insertion order.
+    /// Note this iterator only uses the data file not the indexes.
+    /// This iterator will not see any data in the write cache.
+    pub fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE>, LoadHeaderError> {
+        self.inner.raw_iter()
+    }
+}
+
+/// An instance of a DB.
+/// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
 /// This is synchronous and single threaded.  It is intended to keep the algorithms clearer and
 /// to be wrapped for async or multi-threaded synchronous use.
-pub struct DbCore<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
+/// This is the private inner type, this protects the io (Read, Write, Sync) traits from external use).
+struct DbInner<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -95,7 +233,7 @@ macro_rules! bucket_iter {
     }};
 }
 
-impl<K, V, const KSIZE: u16, S> Drop for DbCore<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> Drop for DbInner<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
@@ -108,7 +246,7 @@ where
     }
 }
 
-impl<K, V, const KSIZE: u16, S> DbCore<K, V, KSIZE, S>
+impl<K, V, const KSIZE: u16, S> DbInner<K, V, KSIZE, S>
 where
     K: DbKey<KSIZE> + DbBytes<K>,
     V: Debug + DbBytes<V>,
