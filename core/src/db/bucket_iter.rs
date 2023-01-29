@@ -7,7 +7,7 @@ use crate::db::data_header::BUCKET_ELEMENT_SIZE;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Iterates over the (hash, record_position) values contained in a bucket.
-pub(super) struct BucketIter<'src, R: Read + Seek + ?Sized> {
+pub(crate) struct BucketIter<'src, R: Read + Seek + ?Sized> {
     odx_file: &'src mut R,
     buffer: Vec<u8>,
     bucket_pos: usize,

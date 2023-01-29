@@ -1,7 +1,6 @@
 //! Contains the Hash Index overflow buckets (ODX) structure and code.
 
 use crate::crc::{add_crc32, check_crc};
-use crate::db::hdx_header::HdxHeader;
 use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
 use std::fs::{File, OpenOptions};
@@ -27,7 +26,9 @@ pub(crate) struct OdxHeader {
 impl OdxHeader {
     /// Open the index overflow file (odx file) and return the open file and header.
     pub fn open_odx_file(
-        hdx_header: &HdxHeader,
+        version: u16,
+        uid: u64,
+        appnum: u64,
         config: &DbConfig,
     ) -> Result<(File, OdxHeader), LoadHeaderError> {
         if config.truncate && config.write {
@@ -46,19 +47,19 @@ impl OdxHeader {
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
-            let header = OdxHeader::from_hdx_header(hdx_header);
+            let header = OdxHeader::new(version, uid, appnum, config.bucket_size);
             header.write_header(&mut file)?;
             header
         } else {
             let header = OdxHeader::load_header(&mut file, config.bucket_size)?;
             // Basic validation of the odx header.
-            if header.version() != hdx_header.version() {
+            if header.version() != version {
                 return Err(LoadHeaderError::InvalidIndexVersion);
             }
-            if header.appnum() != hdx_header.appnum() {
+            if header.appnum() != appnum {
                 return Err(LoadHeaderError::InvalidIndexAppNum);
             }
-            if header.uid() != hdx_header.uid() {
+            if header.uid() != uid {
                 return Err(LoadHeaderError::InvalidIndexUID);
             }
             header
@@ -68,17 +69,17 @@ impl OdxHeader {
 
     /// Return a default OdxHeader with any values from hdx_header overridden.
     /// This includes the version, uid, appnum and bucket_size.
-    pub fn from_hdx_header(hdx_header: &HdxHeader) -> Self {
-        let header_size = if (hdx_header.bucket_size() as usize) < MIN_HEADER_SIZE {
+    pub fn new(version: u16, uid: u64, appnum: u64, bucket_size: u16) -> Self {
+        let header_size = if (bucket_size as usize) < MIN_HEADER_SIZE {
             MIN_HEADER_SIZE
         } else {
-            hdx_header.bucket_size() as usize
+            bucket_size as usize
         };
         Self {
             type_id: *b"sldb.odx",
-            version: hdx_header.version(),
-            uid: hdx_header.uid(),
-            appnum: hdx_header.appnum(),
+            version,
+            uid,
+            appnum,
             header_size,
         }
     }

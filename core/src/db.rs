@@ -1,10 +1,8 @@
 //! Main module for the SLDB core.  This implements the core sync single threaded access to the DB.
 
-use crate::crc::{add_crc32, check_crc};
-use crate::db::bucket_iter::BucketIter;
-use crate::db::data_header::{DataHeader, BUCKET_ELEMENT_SIZE};
-use crate::db::hdx_header::HdxHeader;
-use crate::db::odx_header::OdxHeader;
+use crate::crc::add_crc32;
+use crate::db::data_header::DataHeader;
+use crate::db::hdx_index::HdxIndex;
 use crate::db_bytes::DbBytes;
 use crate::db_config::{DbConfig, DbFiles};
 use crate::db_key::DbKey;
@@ -13,7 +11,7 @@ use crate::error::flush::FlushError;
 use crate::error::insert::InsertError;
 use crate::error::{CommitError, FetchError, LoadHeaderError, OpenError};
 use crate::error::{ReadKeyError, RenameError};
-use crate::fxhasher::{FxHashMap, FxHasher};
+use crate::fxhasher::FxHasher;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
@@ -25,7 +23,7 @@ use std::{fs, io};
 mod bucket_iter;
 mod core_io_traits;
 pub mod data_header;
-pub mod hdx_header;
+pub mod hdx_index;
 pub mod odx_header;
 
 /// An instance of a DB.
@@ -179,8 +177,6 @@ where
     header: DataHeader,
     data_file: File,
     data_file_end: u64,
-    hdx_file: File,
-    odx_file: File,
     hasher: S,
     key_buffer: Vec<u8>,
     value_buffer: Vec<u8>,
@@ -188,49 +184,12 @@ where
     read_buffer: Vec<u8>,
     read_buffer_start: usize,
     read_buffer_len: usize,
-    bucket_cache: FxHashMap<u64, Vec<u8>>,
-    hdx_header: HdxHeader,
-    modulus: u32,
-    load_factor: f32,
-    capacity: u64,
+    hdx_index: HdxIndex<K, KSIZE>,
     seek_pos: u64,
     config: DbConfig,
     failed: bool,
     _key: PhantomData<K>,
     _value: PhantomData<V>,
-}
-
-trait ReadSeek: Read + Seek {}
-impl ReadSeek for File {}
-
-/// Macro to get an iterator over all the entries in a bucket (including overflow buckets).
-/// For internal use only!  The unsafe should be fine as long as the iterators are used internally
-/// in the single threaded/sync module.
-macro_rules! bucket_iter {
-    ($db:expr, $bucket:expr) => {{
-        // Turn $db.odx_file into a reference to a Read + Seek trait.
-        // Need this to break away the odx file lifetime to use in the iter.
-        // The ODX file should not change under the iterator and is therefore safe.
-        let odx_reader: &mut dyn ReadSeek = unsafe {
-            (&mut $db.odx_file as *mut dyn ReadSeek)
-                .as_mut()
-                .expect("this can't be null")
-        };
-        let mut buffer = vec![0; $db.hdx_header.bucket_size() as usize];
-        if let Some(bucket) = $db.bucket_cache.get(&$bucket) {
-            buffer.copy_from_slice(&bucket);
-            // These cached buffers may be missing their crc32 so add it now.
-            add_crc32(&mut buffer);
-        } else {
-            let bucket_size = $db.hdx_header.bucket_size() as usize;
-            let bucket_pos: u64 =
-                ($db.hdx_header.header_size() + ($bucket as usize * bucket_size)) as u64;
-            if let Ok(_) = $db.hdx_file.seek(SeekFrom::Start(bucket_pos)) {
-                let _ = $db.hdx_file.read_exact(&mut buffer);
-            }
-        }
-        BucketIter::new(odx_reader, buffer, $db.hdx_header.bucket_elements())
-    }};
 }
 
 impl<K, V, const KSIZE: u16, S> Drop for DbInner<K, V, KSIZE, S>
@@ -262,20 +221,13 @@ where
         let (mut data_file, header) =
             Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
-        let (hdx_file, hdx_header) = HdxHeader::open_hdx_file(&header, &config, &hasher)
+        let hdx_index = HdxIndex::open_hdx_file(&header, config.clone(), &hasher)
             .map_err(OpenError::IndexFileOpen)?;
-        // Don't want buckets and modulus to be the same, so +1
-        let modulus = (hdx_header.buckets() + 1).next_power_of_two();
-        let (write_buffer, bucket_cache) = if config.write {
-            let mut bucket_cache = FxHashMap::default();
-            bucket_cache.reserve(500);
-            (
-                Vec::with_capacity(config.write_buffer_size as usize),
-                bucket_cache,
-            )
+        let write_buffer = if config.write {
+            Vec::with_capacity(config.write_buffer_size as usize)
         } else {
             // If opening read only wont need capacity.
-            (Vec::new(), FxHashMap::default())
+            Vec::new()
         };
         let mut read_buffer = vec![0; config.read_buffer_size as usize];
         // Prime the read buffer so we don't have to check if it is empty, etc.
@@ -296,27 +248,19 @@ where
                 read_buffer_len = config.read_buffer_size as usize;
             }
         }
-        let (odx_file, _odx_header) =
-            OdxHeader::open_odx_file(&hdx_header, &config).map_err(OpenError::IndexFileOpen)?;
         // TODO, crosscheck all the headers and make sure everything checks out.
         Ok(Self {
             header,
             data_file,
             data_file_end,
-            hdx_file,
-            odx_file,
             hasher,
-            hdx_header,
-            modulus,
-            load_factor: hdx_header.load_factor(),
-            capacity: hdx_header.buckets() as u64 * hdx_header.bucket_elements() as u64,
+            hdx_index,
             key_buffer: Vec::new(),
             value_buffer: Vec::new(),
             write_buffer,
             read_buffer,
             read_buffer_start: 0,
             read_buffer_len,
-            bucket_cache,
             seek_pos: 0,
             config,
             failed: false,
@@ -350,7 +294,7 @@ where
                 if let Err(err) = db.save_to_bucket(&key, hash, record_pos) {
                     return Err(OpenError::RebuildIndex(err));
                 }
-                db.hdx_header.inc_values();
+                db.hdx_index.inc_values();
             } else {
                 last_err = true;
             }
@@ -412,9 +356,9 @@ where
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, key: &K) -> Result<V, FetchError> {
         let hash = self.hash(key);
-        let bucket = self.get_bucket(hash);
+        let bucket = self.hdx_index.hash_to_bucket(hash);
 
-        let mut iter = bucket_iter!(self, bucket);
+        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket) };
         for (rec_hash, rec_pos) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
@@ -434,8 +378,8 @@ where
     /// True if the database contains key.
     pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
         let hash = self.hash(key);
-        let bucket = self.get_bucket(hash);
-        let mut iter = bucket_iter!(self, bucket);
+        let bucket = self.hdx_index.hash_to_bucket(hash);
+        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket) };
         for (rec_hash, rec_pos) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
@@ -456,12 +400,7 @@ where
     /// Useful if the DB is also opened for writing.
     pub fn refresh_index(&mut self) {
         if !self.config.write {
-            if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file, self.config.bucket_size)
-            {
-                self.hdx_header = header;
-                // Don't want buckets and modulus to be the same, so +1
-                self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
-            }
+            self.hdx_index.reload_header();
             self.data_file_end = self
                 .data_file
                 .seek(SeekFrom::End(0))
@@ -526,7 +465,7 @@ where
 
         // Since the inserted data will still be "available" even after an error after this point go
         // ahead and increment the values.
-        self.hdx_header.inc_values();
+        self.hdx_index.inc_values();
         Ok(())
     }
 
@@ -563,7 +502,7 @@ where
 
     /// Return the number of records in Db.
     pub fn len(&self) -> usize {
-        self.hdx_header.values() as usize
+        self.hdx_index.values() as usize
     }
 
     /// Is the DB empty?
@@ -589,13 +528,13 @@ where
     /// Return the DB index salt (generated at creation).
     /// Can be used with the pepper to test the hasher.
     pub fn salt(&self) -> u64 {
-        self.hdx_header.salt()
+        self.hdx_index.header().salt()
     }
 
     /// Return the DB pepper (generated at creation from the salt with Hasher).
     /// Can be used with the salt to test the hasher.
     pub fn pepper(&self) -> u64 {
-        self.hdx_header.pepper()
+        self.hdx_index.header().pepper()
     }
 
     /// Flush any caches to disk and sync the data and index file.
@@ -609,12 +548,7 @@ where
         self.data_file
             .sync_all()
             .map_err(CommitError::DataFileSync)?;
-        self.odx_file
-            .sync_all()
-            .map_err(CommitError::IndexFileSync)?;
-        self.hdx_file
-            .sync_all()
-            .map_err(CommitError::IndexFileSync)?;
+        self.hdx_index.sync()?;
         Ok(())
     }
 
@@ -625,13 +559,12 @@ where
             return Err(FlushError::ReadOnly);
         }
         Write::flush(self).map_err(FlushError::WriteData)?;
-        self.save_bucket_cache()
+        self.hdx_index
+            .save_bucket_cache()
             .map_err(FlushError::WriteIndexData)?;
-        self.hdx_file
-            .seek(SeekFrom::Start(0))
-            .map_err(FlushError::IndexHeader)?;
-        self.hdx_header
-            .write_header(&mut self.hdx_file)
+        self.hdx_index.set_data_file_length(self.data_file_end);
+        self.hdx_index
+            .write_header()
             .map_err(FlushError::IndexHeader)?;
         Ok(())
     }
@@ -677,191 +610,30 @@ where
         hasher.finish()
     }
 
-    /// Return the bucket that will contain hash (if hash is available).
-    fn get_bucket(&self, hash: u64) -> u64 {
-        let modulus = self.modulus as u64;
-        let bucket = hash % modulus;
-        if bucket >= self.hdx_header.buckets() as u64 {
-            bucket - modulus / 2
-        } else {
-            bucket
-        }
-    }
-
-    /// Add one new bucket to the hash index.
-    /// Buckets are split "in order" determined by the current modulus not based on how full any
-    /// bucket is.
-    fn split_one_bucket(&mut self) -> Result<(), InsertError> {
-        let old_modulus = self.modulus;
-        // This is the bucket that is being split.
-        let split_bucket = (self.hdx_header.buckets() - (old_modulus / 2)) as u64;
-        self.hdx_header.inc_buckets();
-        // This is the newly created bucket that the items in split_bucket will possibly be moved into.
-        let new_bucket = self.hdx_header.buckets() as u64 - 1;
-        // Don't want buckets and modulus to be the same, so +1
-        self.modulus = (self.hdx_header.buckets() + 1).next_power_of_two();
-
-        let bucket_size = self.hdx_header.bucket_size() as usize;
-        let mut buffer = vec![0; bucket_size];
-        let mut buffer2 = vec![0; bucket_size];
-
-        let mut iter = bucket_iter!(self, split_bucket);
-        for (rec_hash, rec_pos) in &mut iter {
-            if rec_pos > 0 {
-                let bucket = self.get_bucket(rec_hash);
-                if bucket != split_bucket && bucket != new_bucket {
-                    panic!(
-                        "got bucket {}, expected {} or {}, mod {}",
-                        bucket,
-                        split_bucket,
-                        self.hdx_header.buckets() - 1,
-                        self.modulus
-                    );
-                }
-                if bucket == split_bucket {
-                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer)
-                        .map_err(|_| InsertError::IndexOverflow)?;
-                } else {
-                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer2)
-                        .map_err(|_| InsertError::IndexOverflow)?;
-                }
-            }
-        }
-        if iter.crc_failure() {
-            return Err(InsertError::IndexCrcError);
-        }
-        self.bucket_cache.insert(split_bucket, buffer);
-        self.bucket_cache.insert(new_bucket, buffer2);
-        Ok(())
-    }
-
     /// Add buckets to expand capacity.
     /// Capacity is number of elements per bucket * number of buckets.
     /// If current length >= capacity * load factor then split buckets until this is not true.
     fn expand_buckets(&mut self) -> Result<(), InsertError> {
-        if self.config.allow_bucket_expansion {
-            while self.len() >= (self.capacity as f32 * self.load_factor) as usize {
-                self.split_one_bucket()?;
-                self.capacity =
-                    self.hdx_header.buckets() as u64 * self.hdx_header.bucket_elements() as u64;
-            }
-        }
-        Ok(())
+        let unsafe_db: &mut DbInner<K, V, KSIZE, S> = unsafe {
+            (self as *mut DbInner<K, V, KSIZE, S>)
+                .as_mut()
+                .expect("this can't be null")
+        };
+        self.hdx_index
+            .expand_buckets(&mut |pos| unsafe_db.read_key(pos))
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     fn save_to_bucket(&mut self, key: &K, hash: u64, record_pos: u64) -> Result<(), InsertError> {
-        let bucket = self.get_bucket(hash);
-        let mut buffer = if let Some(buf) = self.bucket_cache.remove(&bucket) {
-            // Get the bucket from the bucket cache.
-            buf
-        } else {
-            // Read the bucket from the index and verify (crc32) it.
-            let bucket_size = self.hdx_header.bucket_size() as usize;
-            let mut buffer = vec![0; bucket_size];
-            let bucket_pos: u64 =
-                (self.hdx_header.header_size() + (bucket as usize * bucket_size)) as u64;
-            {
-                self.hdx_file
-                    .seek(SeekFrom::Start(bucket_pos))
-                    .map_err(|e| InsertError::KeyError(e.into()))?;
-                self.hdx_file
-                    .read_exact(&mut buffer)
-                    .map_err(|e| InsertError::KeyError(e.into()))?;
-                if !check_crc(&buffer) {
-                    return Err(InsertError::KeyError(ReadKeyError::CrcFailed));
-                }
-            }
-            buffer
+        // Make a self with a new lifetime so we can pass in the read_key closure.
+        // read_key should not mutate hdx_index so this should be fine.
+        let unsafe_db: &mut DbInner<K, V, KSIZE, S> = unsafe {
+            (self as *mut DbInner<K, V, KSIZE, S>)
+                .as_mut()
+                .expect("this can't be null")
         };
-
-        let result = self.save_to_bucket_buffer(Some(key), hash, record_pos, &mut buffer);
-        // Need to make sure the bucket goes into the cache even on error.
-        self.bucket_cache.insert(bucket, buffer);
-        result
-    }
-
-    /// Flush (save) the hash bucket cache to disk.
-    fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
-        let bucket_size = self.hdx_header.bucket_size() as usize;
-        for (bucket, mut buffer) in self.bucket_cache.drain() {
-            let bucket_pos: u64 =
-                (self.hdx_header.header_size() + (bucket as usize * bucket_size)) as u64;
-            add_crc32(&mut buffer);
-            // Seeking and writing past the file end seems to extend the file correctly.
-            self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-            self.hdx_file.write_all(&buffer)?;
-        }
-        Ok(())
-    }
-
-    /// Save the (hash, position, record_size) tuple to the bucket.  Handles overflow records.
-    /// If this produces and Error then buffer will contain the same data.
-    fn save_to_bucket_buffer(
-        &mut self,
-        key: Option<&K>,
-        hash: u64,
-        record_pos: u64,
-        buffer: &mut [u8],
-    ) -> Result<(), InsertError> {
-        let mut pos = 8; // Skip the overflow file pos.
-        for i in 0..self.hdx_header.bucket_elements() as u64 {
-            let mut buf64 = [0_u8; 8];
-            buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_hash = u64::from_le_bytes(buf64);
-            pos += 8;
-            buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_pos = u64::from_le_bytes(buf64);
-            pos += 8;
-            // Test rec_pos == 0 to handle degenerate case of a hash of 0.
-            // Find an empty element should indicate no more elements (so the key check below is ok).
-            if rec_hash == 0 && rec_pos == 0 {
-                // Seek to the element we found that was empty and write the hash and position into it.
-                let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
-                pos += 8;
-                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                return Ok(());
-            }
-            if rec_hash == hash {
-                if let Some(key) = key {
-                    if let Ok(rkey) = self.read_key(rec_pos) {
-                        if &rkey == key {
-                            if self.config.allow_duplicate_inserts {
-                                // Overwrite the old element with the new in the index. This will leave
-                                // garbage in the data file but lookups will work and be consistent.
-                                let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                                buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
-                                pos += 8;
-                                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                                return Ok(());
-                            } else {
-                                // Don't allow duplicates so error out (caller should roll back insert).
-                                return Err(InsertError::DuplicateKey);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // false, save bucket as an overflow record and add to the fresh bucket.
-        let overflow_pos = self
-            .odx_file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| InsertError::KeyError(e.into()))?;
-        add_crc32(buffer);
-        // Write the old buffer into the data file as an overflow record.
-        self.odx_file
-            .write_all(buffer)
-            .map_err(|e| InsertError::KeyError(e.into()))?;
-        // clear buffer and reset to 0.
-        buffer.fill(0);
-        // Copy the position of the overflow record into the first u64.
-        buffer[0..8].copy_from_slice(&overflow_pos.to_le_bytes());
-        // First element will be the hash and position being saved (rest of new bucket is empty).
-        buffer[8..16].copy_from_slice(&hash.to_le_bytes());
-        buffer[16..24].copy_from_slice(&record_pos.to_le_bytes());
-        Ok(())
+        self.hdx_index
+            .save_to_bucket(key, hash, record_pos, &mut |pos| unsafe_db.read_key(pos))
     }
 
     /// Read the record at position.

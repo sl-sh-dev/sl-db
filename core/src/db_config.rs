@@ -10,7 +10,7 @@ use std::hash::BuildHasher;
 use std::path::PathBuf;
 
 /// Contains the file names, paths etc for all the files in a DB.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DbFiles {
     /// The directory containing the DB.
     pub dir: PathBuf,
@@ -47,7 +47,7 @@ impl DbFiles {
 }
 
 /// Configuration for a database.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DbConfig {
     pub(crate) files: DbFiles,
     pub(crate) appnum: u64,
