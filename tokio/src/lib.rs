@@ -6,11 +6,12 @@ use sldb_core::db_key::DbKey;
 use sldb_core::db_raw_iter::DbRawIter;
 use sldb_core::error::flush::FlushError;
 use sldb_core::error::insert::InsertError;
-use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError};
+use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError, RenameError};
 use sldb_core::fxhasher::FxHasher;
 use std::error::Error;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fmt, io};
 use tokio::sync::*;
@@ -21,7 +22,7 @@ where
     V: Send + Sync + Debug + DbBytes<V> + Clone + 'static,
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
-    db_read: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+    db: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
     write_cache: Arc<DashMap<K, V>>,
     insert_tx: mpsc::Sender<InsertCommand<K, KSIZE>>,
     insert_thread: Option<std::thread::JoinHandle<()>>,
@@ -53,20 +54,16 @@ where
         let auto_commit = config.auto_flush();
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
         let (insert_tx, insert_rx) = mpsc::channel(100_000);
-        // Open the write db (passed to the insert thread).
-        let db = DbCore::open(config.clone())?;
-        // Open a read only DB for fetching, reduces locks.
-        let db_read = Arc::new(tokio::sync::Mutex::new(DbCore::open(
-            config.clone().read_only(),
-        )?));
+
+        let db = Arc::new(tokio::sync::Mutex::new(DbCore::open(config.clone())?));
         let write_cache: Arc<DashMap<K, V>> = Arc::new(DashMap::new());
         let write_cache_clone = write_cache.clone();
-        let db_read_clone = db_read.clone();
+        let db_clone = db.clone();
         let db_thread = std::thread::spawn(move || {
-            Self::insert_thread(db, db_read_clone, write_cache_clone, insert_rx, auto_commit)
+            Self::insert_thread(db_clone, write_cache_clone, insert_rx, auto_commit)
         });
         Ok(Self {
-            db_read,
+            db,
             write_cache,
             insert_tx,
             insert_thread: Some(db_thread),
@@ -84,9 +81,9 @@ where
         if let Some(val) = self.write_cache.get(&key) {
             Ok(val.clone())
         } else {
-            self.db_read.lock().await.fetch(&key)
-            //let db_read = self.db_read.clone();
-            //tokio::task::spawn_blocking(move || db_read.blocking_lock().fetch(&key)).await.unwrap()//.map_err(|_|FetchError::NotFound)
+            self.db.lock().await.fetch(&key)
+            //let db = self.db.clone();
+            //tokio::task::spawn_blocking(move || db.blocking_lock().fetch(&key)).await.unwrap()//.map_err(|_|FetchError::NotFound)
         }
     }
 
@@ -95,7 +92,7 @@ where
         if self.write_cache.contains_key(&key) {
             Ok(true)
         } else {
-            self.db_read.lock().await.contains_key(&key)
+            self.db.lock().await.contains_key(&key)
         }
     }
 
@@ -112,17 +109,16 @@ where
             let _ = self.insert_tx.send(InsertCommand::Insert(key)).await;
         }
     }
-    /*
+
     /// Return the number of records in Db.
-    pub fn len(&self) -> usize {
-        self.inner.borrow().len()
+    pub async fn len(&self) -> usize {
+        self.db.lock().await.len()
     }
 
     /// Is the DB empty?
-    pub fn is_empty(&self) -> bool {
-        self.inner.borrow().is_empty()
+    pub async fn is_empty(&self) -> bool {
+        self.db.lock().await.is_empty()
     }
-    */
 
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
@@ -149,34 +145,51 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     pub async fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE>, LoadHeaderError> {
-        self.db_read.lock().await.raw_iter()
+        self.db.lock().await.raw_iter()
+    }
+
+    /// Close the DB and delete the files.
+    pub async fn destroy(self) {
+        let db = self.db.clone();
+        drop(self);
+        // At this point this should be the only reference left to db.
+        if let Ok(db) = Arc::try_unwrap(db) {
+            let db = db.into_inner();
+            db.destroy();
+        }
+    }
+
+    /// Rename the database to new_name.
+    pub async fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> Result<(), RenameError> {
+        self.db.lock().await.rename(new_name)
     }
 
     fn commit_bg_thread(
-        db: &mut DbCore<K, V, KSIZE, S>,
-        db_read: &Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+        db: &Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
         write_cache: &DashMap<K, V>,
         inserts: &mut Vec<K>,
-    ) -> Result<(), CommitError> {
-        let mut db_read = db_read.blocking_lock();
-        let _ = db.flush();
-        db_read.refresh_index();
-        drop(db_read);
-        let res = db.commit();
+        result_tx: Option<oneshot::Sender<Result<(), CommitError>>>,
+    ) {
+        let res = db.blocking_lock().commit();
         match res {
             Ok(()) => {
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(Ok(()));
+                }
                 for key in inserts.drain(..) {
                     write_cache.remove(&key);
                 }
-                Ok(())
             }
-            Err(err) => Err(err.into()),
+            Err(err) => {
+                if let Some(tx) = result_tx {
+                    let _ = tx.send(Err(err.into()));
+                }
+            }
         }
     }
 
     fn insert_thread(
-        mut db: DbCore<K, V, KSIZE, S>,
-        db_read: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+        db: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
         write_cache: Arc<DashMap<K, V>>,
         mut insert_rx: mpsc::Receiver<InsertCommand<K, KSIZE>>,
         auto_commit: bool,
@@ -189,20 +202,19 @@ where
             match insert_rx.blocking_recv() {
                 Some(InsertCommand::Insert(key)) => {
                     if let Some(value) = write_cache.get(&key) {
-                        match db.insert(key.clone(), &value) {
+                        match db.blocking_lock().insert(key.clone(), &value) {
                             Err(InsertError::DuplicateKey) => {} // Silently ignore duplicate keys...
                             Err(err) => last_insert_error = Some(err),
                             Ok(_) => {}
                         }
+                        drop(value);
                         inserts.push(key);
-                        if auto_commit && insert_count >= 10_000 {
+                        if auto_commit {
                             insert_count += 1;
-                            let _ = Self::commit_bg_thread(
-                                &mut db,
-                                &db_read,
-                                &write_cache,
-                                &mut inserts,
-                            );
+                            if insert_count >= 10_000 {
+                                insert_count = 0;
+                                Self::commit_bg_thread(&db, &write_cache, &mut inserts, None);
+                            }
                         }
                     }
                 }
@@ -211,26 +223,11 @@ where
                         let _ = tx.send(Err(CommitError::PreviousInsertFailed(err)));
                         last_insert_error = None;
                     } else {
-                        let mut db_read = db_read.blocking_lock();
-                        let _ = db.flush();
-                        db_read.refresh_index();
-                        drop(db_read);
-                        let res = db.commit();
-                        match res {
-                            Ok(()) => {
-                                let _ = tx.send(Ok(()));
-                                for key in inserts.drain(..) {
-                                    write_cache.remove(&key);
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(Err(err.into()));
-                            }
-                        }
+                        Self::commit_bg_thread(&db, &write_cache, &mut inserts, Some(tx));
                     }
                 }
                 Some(InsertCommand::CommitBG) => {
-                    let _ = Self::commit_bg_thread(&mut db, &db_read, &write_cache, &mut inserts);
+                    Self::commit_bg_thread(&db, &write_cache, &mut inserts, None);
                 }
                 Some(InsertCommand::Done) => done = true,
                 None => done = true, // The sender has been closed or dropped so nothing left to do.
@@ -305,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn test_50k() {
         let config = DbConfig::new(".", "xxx50k", 1)
-            //.no_auto_flush()
+            .no_auto_flush()
             .create()
             //.set_bucket_elements(100)
             //.set_load_factor(0.6)

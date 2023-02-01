@@ -1113,6 +1113,8 @@ mod tests {
             .create()
             .truncate()
             .no_auto_flush()
+            .set_bucket_cache_size(0) //32 * 1024 * 1024)
+            .set_bucket_size(512)
             //.set_bucket_elements(25)
             //.set_load_factor(0.6)
             .build()

@@ -11,7 +11,7 @@ use crate::error::insert::InsertError;
 use crate::error::{CommitError, LoadHeaderError, ReadKeyError};
 use crate::fxhasher::{FxHashMap, FxHasher};
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -247,10 +247,12 @@ where
     config: DbConfig,
     modulus: u32,
     bucket_cache: FxHashMap<u64, Vec<u8>>,
+    dirty_bucket_cache: FxHashMap<u64, Vec<u8>>,
     hdx_file: File,
     // Note, if odx_file is ever replaced in HdxIndex then see bucket_iter for undefined behaviour.
     odx_file: File,
     capacity: u64,
+    cached_buckets: usize,
     _key: PhantomData<K>,
 }
 
@@ -320,14 +322,21 @@ where
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (header.buckets + 1).next_power_of_two();
         let capacity = header.buckets() as u64 * header.bucket_elements() as u64;
+        let cached_buckets = (config.bucket_cache_size / config.bucket_size as u32) as usize;
+        let bucket_cache = FxHashMap::with_capacity_and_hasher(
+            cached_buckets,
+            BuildHasherDefault::<FxHasher>::default(),
+        );
         Ok(Self {
             header,
             config,
             modulus,
-            bucket_cache: FxHashMap::default(),
+            bucket_cache,
+            dirty_bucket_cache: FxHashMap::default(),
             hdx_file,
             odx_file,
             capacity,
+            cached_buckets,
             _key: PhantomData,
         })
     }
@@ -387,11 +396,29 @@ where
         self.header.values()
     }
 
-    /// Read bucket from source.  Allways allocate the buffer, if in cache copy it.
+    /// Get a value from a cache, try the dirty buckets then the read cached buckets.
+    fn get_bucket_cache(&self, bucket: u64) -> Option<&Vec<u8>> {
+        if let Some(buffer) = self.dirty_bucket_cache.get(&bucket) {
+            Some(buffer)
+        } else {
+            self.bucket_cache.get(&bucket)
+        }
+    }
+
+    /// Remove a value from a cache, try the dirty buckets then the read cached buckets.
+    fn remove_bucket_cache(&mut self, bucket: u64) -> Option<Vec<u8>> {
+        if let Some(buffer) = self.dirty_bucket_cache.remove(&bucket) {
+            Some(buffer)
+        } else {
+            self.bucket_cache.remove(&bucket)
+        }
+    }
+
+    /// Read bucket from source.  Always allocate the buffer, if in cache copy it.
     /// If there is an IO error then return an empty buffer.
     pub fn get_bucket(&mut self, bucket: u64) -> Vec<u8> {
         let mut buffer = vec![0; self.header.bucket_size as usize];
-        if let Some(bucket) = self.bucket_cache.get(&bucket) {
+        if let Some(bucket) = self.get_bucket_cache(bucket) {
             buffer.copy_from_slice(bucket);
             // These cached buffers may be missing their crc32 so add it now.
             add_crc32(&mut buffer[..]);
@@ -401,6 +428,7 @@ where
                 (self.header.header_size() + (bucket as usize * bucket_size)) as u64;
             if self.hdx_file.seek(SeekFrom::Start(bucket_pos)).is_ok() {
                 let _ = self.hdx_file.read_exact(&mut buffer[..]);
+                self.bucket_cache.insert(bucket, buffer.clone());
             }
         }
         buffer
@@ -408,7 +436,7 @@ where
 
     /// Return the buffer for bucket, if found in cache then remove and return that buffer vs allocate.
     pub fn remove_bucket(&mut self, bucket: u64) -> Result<Vec<u8>, InsertError> {
-        if let Some(buf) = self.bucket_cache.remove(&bucket) {
+        if let Some(buf) = self.remove_bucket_cache(bucket) {
             // Get the bucket from the bucket cache.
             Ok(buf)
         } else {
@@ -441,12 +469,17 @@ where
     pub(crate) fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
         let bucket_size = self.header.bucket_size as usize;
         let header_size = self.header.header_size();
-        for (bucket, mut buffer) in self.bucket_cache.drain() {
+        if self.bucket_cache.len() > self.cached_buckets {
+            // Simple cache clear when it gets to large.
+            self.bucket_cache.clear();
+        }
+        for (bucket, mut buffer) in self.dirty_bucket_cache.drain() {
             let bucket_pos: u64 = (header_size + (bucket as usize * bucket_size)) as u64;
             add_crc32(&mut buffer[..]);
-            // Seeking and writing past the file end seems to extend the file correctly.
+            // Seeking and writing past the file end extends it.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer[..])?;
+            self.bucket_cache.insert(bucket, buffer);
         }
         Ok(())
     }
@@ -541,8 +574,8 @@ where
         if iter.crc_failure() {
             return Err(InsertError::IndexCrcError);
         }
-        self.bucket_cache.insert(split_bucket, buffer);
-        self.bucket_cache.insert(new_bucket, buffer2);
+        self.dirty_bucket_cache.insert(split_bucket, buffer);
+        self.dirty_bucket_cache.insert(new_bucket, buffer2);
         Ok(())
     }
 
@@ -560,11 +593,11 @@ where
         let result =
             self.save_to_bucket_buffer(Some(key), hash, record_pos, &mut buffer[..], read_key);
         // Need to make sure the bucket goes into the cache even on error.
-        self.bucket_cache.insert(bucket, buffer);
+        self.dirty_bucket_cache.insert(bucket, buffer);
         result
     }
 
-    /// Save the (hash, position, record_size) tuple to the bucket.  Handles overflow records.
+    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     /// If this produces and Error then buffer will contain the same data.
     fn save_to_bucket_buffer(
         &mut self,

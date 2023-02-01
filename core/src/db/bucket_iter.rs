@@ -55,7 +55,8 @@ impl<'src, R: Read + Seek + ?Sized> Iterator for &mut BucketIter<'src, R> {
                 buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
                 let rec_pos = u64::from_le_bytes(buf64);
                 if hash == 0 && rec_pos == 0 {
-                    self.bucket_pos += 1;
+                    //self.bucket_pos += 1;
+                    self.bucket_pos = self.elements as usize;
                 } else {
                     self.bucket_pos += 1;
                     return Some((hash, rec_pos));

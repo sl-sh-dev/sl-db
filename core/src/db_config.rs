@@ -64,6 +64,7 @@ pub struct DbConfig {
     pub(crate) auto_flush: bool,
     pub(crate) read_buffer_size: u32,
     pub(crate) write_buffer_size: u32,
+    pub(crate) bucket_cache_size: u32,
 }
 
 impl DbConfig {
@@ -87,14 +88,21 @@ impl DbConfig {
             allow_duplicate_inserts: false,
             cache_writes: true,
             auto_flush: true,
-            read_buffer_size: 8 * 1024,  // 8kb default.
-            write_buffer_size: 8 * 1024, // 8kb default.
+            read_buffer_size: 8 * 1024,          // 8kb default.
+            write_buffer_size: 8 * 1024,         // 8kb default.
+            bucket_cache_size: 32 * 1024 * 1024, // 32mb default.
         }
     }
 
     /// Returns a reference to the file names for this DB.
     pub fn files(&self) -> &DbFiles {
         &self.files
+    }
+
+    /// Set teh config files to files- do this before it is used or files will be ignored.
+    pub fn set_files(mut self, files: DbFiles) -> Self {
+        self.files = files;
+        self
     }
 
     /// Open the database as read-only.
@@ -153,6 +161,12 @@ impl DbConfig {
         }
         self.bucket_size = size;
         self.bucket_elements = (size - 12) / BUCKET_ELEMENT_SIZE as u16;
+        self
+    }
+
+    /// Set the size of the bucket cache.
+    pub fn set_bucket_cache_size(mut self, cache_bytes: u32) -> Self {
+        self.bucket_cache_size = cache_bytes;
         self
     }
 
