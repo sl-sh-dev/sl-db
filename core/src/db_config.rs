@@ -17,13 +17,11 @@ pub struct DbFiles {
     /// Base name (without directory) of the DB.
     pub base_name: PathBuf,
     /// The full path and name of the data file.
-    pub data_file: PathBuf,
+    pub(crate) data_file: PathBuf,
     /// The full path and name of the index file.
-    pub hdx_file: PathBuf,
+    pub(crate) hdx_file: PathBuf,
     /// The full path and name of the index overflow file.
-    pub odx_file: PathBuf,
-    /// Reserved for a future log file.
-    pub log_file: PathBuf,
+    pub(crate) odx_file: PathBuf,
 }
 
 impl DbFiles {
@@ -34,14 +32,12 @@ impl DbFiles {
         let data_file = dir.join(&base_name).with_extension("dat");
         let hdx_file = dir.join(&base_name).with_extension("hdx");
         let odx_file = dir.join(&base_name).with_extension("odx");
-        let log_file = dir.join(&base_name).with_extension("log");
         DbFiles {
             dir,
             base_name,
             data_file,
             hdx_file,
             odx_file,
-            log_file,
         }
     }
 }
@@ -99,10 +95,15 @@ impl DbConfig {
         &self.files
     }
 
-    /// Set teh config files to files- do this before it is used or files will be ignored.
+    /// Set the config files to files- do this before it is used or files will be ignored.
     pub fn set_files(mut self, files: DbFiles) -> Self {
         self.files = files;
         self
+    }
+
+    /// Replace the config files with files.
+    pub fn replace_files(&mut self, files: DbFiles) {
+        self.files = files;
     }
 
     /// Open the database as read-only.

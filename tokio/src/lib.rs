@@ -3,18 +3,20 @@ use sldb_core::db::DbCore;
 use sldb_core::db_bytes::DbBytes;
 use sldb_core::db_config::{DbConfig, DbFiles};
 use sldb_core::db_key::DbKey;
-use sldb_core::db_raw_iter::DbRawIter;
 use sldb_core::error::flush::FlushError;
 use sldb_core::error::insert::InsertError;
-use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError, RenameError};
+use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError};
 use sldb_core::fxhasher::FxHasher;
 use std::error::Error;
 use std::fmt::Debug;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{fmt, io};
+use std::{fmt, fs, io};
 use tokio::sync::*;
+
+const SHARD_BITS: usize = 3;
+const SHARDS: usize = 1 << SHARD_BITS;
 
 pub struct AsyncDb<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
@@ -22,11 +24,12 @@ where
     V: Send + Sync + Debug + DbBytes<V> + Clone + 'static,
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
-    db: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+    db_shards: Vec<Arc<Mutex<DbCore<K, V, KSIZE, S>>>>,
     write_cache: Arc<DashMap<K, V>>,
-    insert_tx: mpsc::Sender<InsertCommand<K, KSIZE>>,
-    insert_thread: Option<std::thread::JoinHandle<()>>,
+    insert_txs: Vec<mpsc::Sender<InsertCommand<K, KSIZE>>>,
+    insert_threads: Option<Vec<std::thread::JoinHandle<()>>>,
     config: DbConfig,
+    hasher: S,
 }
 
 impl<K, V, const KSIZE: u16, S> Drop for AsyncDb<K, V, KSIZE, S>
@@ -36,9 +39,13 @@ where
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
     fn drop(&mut self) {
-        let _ = self.insert_tx.try_send(InsertCommand::Done);
-        if let Some(db_thread) = self.insert_thread.take() {
-            let _ = db_thread.join();
+        for insert_tx in &self.insert_txs {
+            let _ = insert_tx.try_send(InsertCommand::Done);
+        }
+        if let Some(mut db_threads) = self.insert_threads.take() {
+            for db_thread in db_threads.drain(..) {
+                let _ = db_thread.join();
+            }
         }
     }
 }
@@ -51,23 +58,37 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
-        let auto_commit = config.auto_flush();
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
-        let (insert_tx, insert_rx) = mpsc::channel(100_000);
 
-        let db = Arc::new(tokio::sync::Mutex::new(DbCore::open(config.clone())?));
+        let base_dir = config.files().dir.join(&config.files().base_name);
+        let mut db_shards = Vec::with_capacity(SHARDS);
+        for i in 0..SHARDS {
+            let db_config = config
+                .clone()
+                .set_files(DbFiles::new(base_dir.clone(), format!("shard_{i}")));
+            let db = DbCore::open(db_config)?;
+            db_shards.push(Arc::new(Mutex::new(db)));
+        }
+        let mut insert_txs = Vec::with_capacity(SHARDS);
+        let mut db_threads = Vec::with_capacity(SHARDS);
         let write_cache: Arc<DashMap<K, V>> = Arc::new(DashMap::new());
-        let write_cache_clone = write_cache.clone();
-        let db_clone = db.clone();
-        let db_thread = std::thread::spawn(move || {
-            Self::insert_thread(db_clone, write_cache_clone, insert_rx, auto_commit)
-        });
+        for db in &db_shards {
+            let (insert_tx, insert_rx) = mpsc::channel(10_000);
+            let write_cache_clone = write_cache.clone();
+            let db_clone = db.clone();
+            let db_thread = std::thread::spawn(move || {
+                Self::insert_thread(db_clone, write_cache_clone, insert_rx)
+            });
+            db_threads.push(db_thread);
+            insert_txs.push(insert_tx);
+        }
         Ok(Self {
-            db,
+            db_shards,
             write_cache,
-            insert_tx,
-            insert_thread: Some(db_thread),
+            insert_txs,
+            insert_threads: Some(db_threads),
             config,
+            hasher: S::default(),
         })
     }
 
@@ -81,7 +102,8 @@ where
         if let Some(val) = self.write_cache.get(&key) {
             Ok(val.clone())
         } else {
-            self.db.lock().await.fetch(&key)
+            let db = &self.db_shards[Self::shard(&self.hasher, &key)];
+            db.lock().await.fetch(&key)
             //let db = self.db.clone();
             //tokio::task::spawn_blocking(move || db.blocking_lock().fetch(&key)).await.unwrap()//.map_err(|_|FetchError::NotFound)
         }
@@ -92,7 +114,8 @@ where
         if self.write_cache.contains_key(&key) {
             Ok(true)
         } else {
-            self.db.lock().await.contains_key(&key)
+            let db = &self.db_shards[Self::shard(&self.hasher, &key)];
+            db.lock().await.contains_key(&key)
         }
     }
 
@@ -106,66 +129,106 @@ where
         if !self.write_cache.contains_key(&key) {
             self.write_cache.insert(key.clone(), value);
             // An error here indicates the receiver in the insert thread was closed/dropped.
-            let _ = self.insert_tx.send(InsertCommand::Insert(key)).await;
+            let shard = Self::shard(&self.hasher, &key);
+            let _ = self.insert_txs[shard]
+                .send(InsertCommand::Insert(key))
+                .await;
         }
     }
 
     /// Return the number of records in Db.
+    /// It is possible for len() to lag a bit if records are in flight to the DB
+    /// (cached but not written).
     pub async fn len(&self) -> usize {
-        self.db.lock().await.len()
+        let mut length = 0;
+        for db in &self.db_shards {
+            length += db.lock().await.len();
+        }
+        length
     }
 
     /// Is the DB empty?
     pub async fn is_empty(&self) -> bool {
-        self.db.lock().await.is_empty()
+        self.len().await == 0
     }
 
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
     pub async fn commit(&self) -> Result<(), CommitError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        // If we can't send then do something drastic (?).
-        if self.insert_tx.send(InsertCommand::Commit(tx)).await.is_ok() {
-            match rx.await {
-                Ok(r) => r,
-                Err(_err) => Err(CommitError::ReceiveFailed),
+        let mut result = Ok(());
+        let mut rxs = Vec::with_capacity(SHARDS);
+        for insert_tx in &self.insert_txs {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // If we can't send then do something drastic (?).
+            if insert_tx.send(InsertCommand::Commit(tx)).await.is_ok() {
+                rxs.push(rx);
+            } else {
+                // An error here means the receiver in the insert thread was dropped/closed.
+                result = Err(CommitError::SendChannelClosed);
             }
-        } else {
-            // An error here means the receiver in the insert thread was dropped/closed.
-            Err(CommitError::SendChannelClosed)
         }
+        for rx in rxs.drain(..) {
+            match rx.await {
+                Ok(r) => match r {
+                    Ok(()) => {}
+                    Err(err) => result = Err(err),
+                },
+                Err(_err) => result = Err(CommitError::ReceiveFailed),
+            }
+        }
+        result
     }
 
     /// Schedule a commit but don't wait for it to complete.
     pub async fn commit_bg(&self) {
-        // An error here indicates the receiver in the insert thread was closed/dropped.
-        let _ = self.insert_tx.send(InsertCommand::CommitBG).await;
+        for insert_tx in &self.insert_txs {
+            // An error here indicates the receiver in the insert thread was closed/dropped.
+            let _ = insert_tx.send(InsertCommand::CommitBG).await;
+        }
     }
 
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
-    pub async fn raw_iter(&self) -> Result<DbRawIter<K, V, KSIZE>, LoadHeaderError> {
-        self.db.lock().await.raw_iter()
+    pub async fn raw_iter(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<(K, V), FetchError>>, LoadHeaderError> {
+        let mut iters = Vec::with_capacity(SHARDS);
+        for i in 0..SHARDS {
+            iters.push(self.db_shards[i].lock().await.raw_iter()?);
+        }
+        Ok(iters.into_iter().flatten())
     }
 
     /// Close the DB and delete the files.
-    pub async fn destroy(self) {
-        let db = self.db.clone();
-        drop(self);
-        // At this point this should be the only reference left to db.
-        if let Ok(db) = Arc::try_unwrap(db) {
-            let db = db.into_inner();
-            db.destroy();
+    pub async fn destroy(mut self) -> io::Result<()> {
+        let mut dbs = Vec::with_capacity(SHARDS);
+        for db in self.db_shards.drain(..) {
+            dbs.push(db);
         }
+        let dir = self.files().dir.join(&self.files().base_name);
+        drop(self);
+        for db in dbs.drain(..) {
+            // At this point this should be the only reference left to db.
+            if let Ok(db) = Arc::try_unwrap(db) {
+                let db = db.into_inner();
+                db.destroy();
+            }
+        }
+        std::fs::remove_dir_all(&dir)
     }
 
     /// Rename the database to new_name.
-    pub async fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> Result<(), RenameError> {
-        self.db.lock().await.rename(new_name)
+    pub async fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> io::Result<()> {
+        let new_name: PathBuf = new_name.into();
+        let old_dir = self.files().dir.join(&self.files().base_name);
+        let new_dir = self.files().dir.join(&new_name);
+        let new_files = DbFiles::new(&self.files().dir, new_name);
+        self.config.replace_files(new_files);
+        fs::rename(&old_dir, &new_dir)
     }
 
     fn commit_bg_thread(
-        db: &Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+        db: &Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
         write_cache: &DashMap<K, V>,
         inserts: &mut Vec<K>,
         result_tx: Option<oneshot::Sender<Result<(), CommitError>>>,
@@ -188,16 +251,22 @@ where
         }
     }
 
+    /// Return the shard for a key.
+    fn shard(hasher: &S, key: &K) -> usize {
+        let mut hasher = hasher.build_hasher();
+        key.hash(&mut hasher);
+        // Use the top bits for shard that should not overlap with buckets.
+        hasher.finish() as usize >> (64 - SHARD_BITS)
+    }
+
     fn insert_thread(
-        db: Arc<tokio::sync::Mutex<DbCore<K, V, KSIZE, S>>>,
+        db: Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
         write_cache: Arc<DashMap<K, V>>,
         mut insert_rx: mpsc::Receiver<InsertCommand<K, KSIZE>>,
-        auto_commit: bool,
     ) {
         let mut inserts = Vec::new();
         let mut done = false;
         let mut last_insert_error: Option<InsertError> = None;
-        let mut insert_count: u32 = 0;
         while !done {
             match insert_rx.blocking_recv() {
                 Some(InsertCommand::Insert(key)) => {
@@ -209,13 +278,6 @@ where
                         }
                         drop(value);
                         inserts.push(key);
-                        if auto_commit {
-                            insert_count += 1;
-                            if insert_count >= 10_000 {
-                                insert_count = 0;
-                                Self::commit_bg_thread(&db, &write_cache, &mut inserts, None);
-                            }
-                        }
                     }
                 }
                 Some(InsertCommand::Commit(tx)) => {
@@ -308,6 +370,7 @@ mod tests {
             //.set_load_factor(0.6)
             .truncate(); //.no_write_cache();
         let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config).unwrap());
+        assert!(db.is_empty().await);
         assert!(!db.contains_key(0).await.unwrap());
         assert!(!db.contains_key(10).await.unwrap());
         assert!(!db.contains_key(35_000).await.unwrap());
@@ -350,12 +413,14 @@ mod tests {
         let start = time::Instant::now();
         db.commit().await.unwrap();
         println!("XXXX TOK commit time {}", start.elapsed().as_secs_f64());
+        assert_eq!(db.len().await, max as usize);
+        assert!(!db.is_empty().await);
         let start = time::Instant::now();
-        let vals: Vec<String> = db.raw_iter().await.unwrap().map(|r| r.unwrap().1).collect();
-        assert_eq!(vals.len(), max as usize);
-        for (i, v) in vals.iter().enumerate() {
-            assert_eq!(v, &format!("Value {}", i));
-        }
+        let vals = db.raw_iter().await.unwrap().map(|r| r.unwrap().1);
+        assert_eq!(vals.count(), max as usize);
+        //for (i, v) in vals.iter().enumerate() {
+        //    assert_eq!(v, &format!("Value {}", i));
+        //}
         println!("XXXX TOK iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
         //let mut fetch_set = JoinSet::new();
