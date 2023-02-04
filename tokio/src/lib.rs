@@ -263,8 +263,20 @@ where
 
     /// Rename the database to new_name.
     pub async fn rename<Q: Into<String>>(&self, new_name: Q) -> io::Result<()> {
-        let new_name: String = new_name.into();
         let mut config = self.config.lock().await;
+        self.rename_inner(&mut config, new_name)
+    }
+
+    /// Rename the database to new_name.
+    /// Use this version outside a tokio runtime, will panic if called within a runtime (use
+    /// rename() within a runtime).
+    pub fn sync_rename<Q: Into<String>>(&self, new_name: Q) -> io::Result<()> {
+        let mut config = self.config.blocking_lock();
+        self.rename_inner(&mut config, new_name)
+    }
+
+    fn rename_inner<Q: Into<String>>(&self, config: &mut DbConfig, new_name: Q) -> io::Result<()> {
+        let new_name: String = new_name.into();
         if let Some(dir) = config.files().dir() {
             let old_dir = dir.join(config.files().name());
             let new_dir = dir.join(&new_name);
