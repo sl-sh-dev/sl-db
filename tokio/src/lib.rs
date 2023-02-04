@@ -1,7 +1,13 @@
+#![deny(missing_docs)]
+
+//! Provide a tokio async wrapper around DbCore.  This is tokio specific but should be easily
+//! adaptable to other runtimes.
+
 use dashmap::DashMap;
 use sldb_core::db::DbCore;
 use sldb_core::db_bytes::DbBytes;
-use sldb_core::db_config::{DbConfig, DbFiles};
+use sldb_core::db_config::DbConfig;
+use sldb_core::db_files::DbFiles;
 use sldb_core::db_key::DbKey;
 use sldb_core::error::flush::FlushError;
 use sldb_core::error::insert::InsertError;
@@ -10,6 +16,7 @@ use sldb_core::fxhasher::FxHasher;
 use std::error::Error;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fmt, fs, io};
 use tokio::sync::*;
@@ -17,6 +24,16 @@ use tokio::sync::*;
 const SHARD_BITS: usize = 3;
 const SHARDS: usize = 1 << SHARD_BITS;
 
+/// This provides an async wrapper around DbCore.
+/// It will shard the DB into multiple DbCore instances to increase performance.  It is also
+/// multi-thread safe and takes immutable self references for ease of use.
+/// The fetch operation uses synchronous reads once it grabs the shard lock.  This is because the
+/// current methods to make this async (thread pool, channels, etc) are extremely slow compared to
+/// just making the blocking read.  Note that the read will not wait for data and so it should not
+/// be a big deal however be aware that fetch will make a standard sync read call at some point to
+/// maintain performance.  Inserts and commits do not have this issue, each shard has a write thread
+/// these are offloaded onto- this is fine for writes since the write can return fast after
+/// offloading the work.
 pub struct AsyncDb<K, V, const KSIZE: u16, S = BuildHasherDefault<FxHasher>>
 where
     K: Send + Sync + Eq + Hash + DbKey<KSIZE> + DbBytes<K> + Clone + 'static,
@@ -56,19 +73,31 @@ where
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
     /// Open a new or reopen an existing database.
+    /// The config must not contain explicit file paths, this will return an InvalidFiles error.
+    /// This restriction is because it shards the DB into multiple sub-DBs.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
 
-        let base_dir = config
-            .files()
-            .dir()
-            .expect("AsyncDb currently does not support explicit file paths!")
-            .join(config.files().name());
+        // Make sure we were not given explicit file paths, that won't work with sharding.
+        // Also create a template DbFiles for each shard DB (must set a valid name).
+        let shard_files = if let Some(dir) = config.files().dir() {
+            if let Some(index_dir) = config.files().index_dir() {
+                DbFiles::with_data_index(
+                    dir.join(config.files().name()),
+                    index_dir.join(config.files().name()),
+                    "".to_string(),
+                )
+            } else {
+                DbFiles::with_data(dir.join(config.files().name()), "".to_string())
+            }
+        } else {
+            return Err(OpenError::InvalidFiles);
+        };
         let mut db_shards = Vec::with_capacity(SHARDS);
         for i in 0..SHARDS {
-            let db_config = config
-                .clone()
-                .set_files(DbFiles::new(base_dir.clone(), format!("shard_{i}")));
+            let mut files = shard_files.clone();
+            files.set_name(format!("shard_{i}"));
+            let db_config = config.clone().set_files(files);
             let db = DbCore::open(db_config)?;
             db_shards.push(Arc::new(Mutex::new(db)));
         }
@@ -98,6 +127,18 @@ where
     /// Return the backing files object for this DB.
     pub fn files(&self) -> DbFiles {
         self.config.blocking_lock().files().clone()
+    }
+
+    /// Root directory for this DB.
+    /// The actual DB shards will be stored in dir/name.
+    pub async fn dir(&self) -> PathBuf {
+        self.config
+            .lock()
+            .await
+            .files()
+            .dir()
+            .expect("AsyncDb requires a directory")
+            .to_path_buf()
     }
 
     /// Name of this DB.
@@ -227,6 +268,9 @@ where
         if let Some(dir) = config.files().dir() {
             let old_dir = dir.join(config.files().name());
             let new_dir = dir.join(&new_name);
+            // If the new dir exists and is empty then remove it.
+            // If dir does not exist or is not empty this should do nothing.
+            let _ = fs::remove_dir(&new_dir);
             let res = fs::rename(&old_dir, &new_dir);
             if res.is_ok() {
                 config.set_name(new_name);
@@ -374,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_50k() {
-        let config = DbConfig::new(".", "xxx50k", 1)
+        let config = DbConfig::with_data_path(".", "xxx50k", 1)
             .no_auto_flush()
             .create()
             //.set_bucket_elements(100)
@@ -459,7 +503,7 @@ mod tests {
         let max = 1_000;
         let val = vec![0_u8; 512];
         {
-            let config = DbConfig::new("db_tests", "xxx_rename1", 1)
+            let config = DbConfig::with_data_path("db_tests", "xxx_rename1", 1)
                 .no_auto_flush()
                 .create()
                 .truncate();
@@ -486,10 +530,10 @@ mod tests {
             assert_eq!(&db.name().await, "xxx_rename2");
         }
         {
-            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
             let _db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config.create()).unwrap();
         }
-        let config = DbConfig::new("db_tests", "xxx_rename2", 1);
+        let config = DbConfig::with_data_path("db_tests", "xxx_rename2", 1);
         let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
         assert_eq!(db.len().await, max as usize);
         for i in 0..max {
@@ -502,7 +546,7 @@ mod tests {
         db.destroy().await.unwrap();
         {
             // Clean up db files.
-            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
             let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
             assert_eq!(&db.name().await, "xxx_rename3");
             db.destroy().await.unwrap();

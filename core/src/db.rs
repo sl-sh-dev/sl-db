@@ -4,13 +4,14 @@ use crate::crc::add_crc32;
 use crate::db::data_header::DataHeader;
 use crate::db::hdx_index::HdxIndex;
 use crate::db_bytes::DbBytes;
-use crate::db_config::{DbConfig, DbFiles};
+use crate::db_config::DbConfig;
+use crate::db_files::{DbFiles, RenameError};
 use crate::db_key::DbKey;
 use crate::db_raw_iter::DbRawIter;
 use crate::error::flush::FlushError;
 use crate::error::insert::InsertError;
+use crate::error::ReadKeyError;
 use crate::error::{CommitError, FetchError, LoadHeaderError, OpenError};
-use crate::error::{ReadKeyError, RenameError};
 use crate::fxhasher::FxHasher;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
@@ -66,6 +67,7 @@ where
     }
 
     /// Rename the database to new_name.
+    /// This will return an error if using explicit filenames instead or directory based DbFiles.
     pub fn rename<Q: Into<String>>(&mut self, new_name: Q) -> Result<(), RenameError> {
         self.inner.rename(new_name)
     }
@@ -319,42 +321,14 @@ where
     /// If it can not remove a file it will silently ignore this.
     pub fn destroy(self) {
         let files = self.config.files.clone();
-        let root_dir = if self.config.files().dir().is_some() {
-            Some(self.config.files().data_dir())
-        } else {
-            None
-        };
         drop(self);
-        let _ = fs::remove_file(&files.data_path());
-        let _ = fs::remove_file(&files.hdx_path());
-        let _ = fs::remove_file(&files.odx_path());
-        // If not using explicit files then delete the directory made for the db.
-        if let Some(dir) = root_dir {
-            let _ = fs::remove_dir(dir);
-        }
+        files.delete();
     }
 
     /// Rename the database to name.
-    /// If the paths to files were not explicitly set then rename on the filesystem if not only
-    /// change the recorded DB name leaving the explicit file names alone.
+    /// This will return an error if using explicit filenames instead or directory based DbFiles.
     pub fn rename<Q: Into<String>>(&mut self, name: Q) -> Result<(), RenameError> {
-        let name: String = name.into();
-        if let Some(dir) = self.config.files().dir() {
-            let old_dir = dir.join(self.config.files().name());
-            let new_dir = dir.join(&name);
-            if new_dir.exists() {
-                Err(RenameError::FilesExist)
-            } else {
-                let res = fs::rename(&old_dir, &new_dir);
-                if res.is_ok() {
-                    self.config.set_name(name);
-                }
-                res.map_err(RenameError::DataFileRename)
-            }
-        } else {
-            self.config.files.set_name(name);
-            Ok(())
-        }
+        self.config.files.rename(name)
     }
 
     /// Returns a reference to the file names for this DB.
@@ -782,7 +756,7 @@ mod tests {
     #[test]
     fn test_one() {
         {
-            let mut db: TestDb = DbConfig::new("db_tests", "xxx1", 2)
+            let mut db: TestDb = DbConfig::with_data_path("db_tests", "xxx1", 2)
                 .create()
                 .truncate()
                 .build()
@@ -828,7 +802,9 @@ mod tests {
             assert!(iter.next().is_none());
             assert_eq!(db.len(), 5);
         }
-        let mut db: TestDb = DbConfig::new("db_tests", "xxx1", 2).build().unwrap();
+        let mut db: TestDb = DbConfig::with_data_path("db_tests", "xxx1", 2)
+            .build()
+            .unwrap();
         let key = Key([6_u8; 32]);
         db.insert(key, &"Value One2".to_string()).unwrap();
         let key = Key([7_u8; 32]);
@@ -846,7 +822,9 @@ mod tests {
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value Three2");
         drop(db);
-        let mut db: TestDb = DbConfig::new("db_tests", "xxx1", 2).build().unwrap();
+        let mut db: TestDb = DbConfig::with_data_path("db_tests", "xxx1", 2)
+            .build()
+            .unwrap();
         let key = Key([6_u8; 32]);
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value One2");
@@ -878,7 +856,9 @@ mod tests {
         let key = Key([8_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value Three2".to_string()));
 
-        let db: TestDb = DbConfig::new("db_tests", "xxx1", 2).build().unwrap();
+        let db: TestDb = DbConfig::with_data_path("db_tests", "xxx1", 2)
+            .build()
+            .unwrap();
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let key = Key([1_u8; 32]);
         assert_eq!(iter.next().unwrap(), (key, "Value One".to_string()));
@@ -901,7 +881,7 @@ mod tests {
 
     #[test]
     fn test_vec_val() {
-        let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_vec", 1)
+        let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::with_data_path("db_tests", "xxx_vec", 1)
             .create()
             .truncate()
             .no_auto_flush()
@@ -957,11 +937,12 @@ mod tests {
         let max = 10_000;
         let val = vec![0_u8; 512];
         {
-            let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_reindex", 1)
-                .create()
-                .truncate()
-                .build()
-                .unwrap();
+            let mut db: DbCore<u64, Vec<u8>, 8> =
+                DbConfig::with_data_path("db_tests", "xxx_reindex", 1)
+                    .create()
+                    .truncate()
+                    .build()
+                    .unwrap();
             for i in 0_u64..max {
                 db.insert(i, &val).unwrap();
             }
@@ -980,7 +961,7 @@ mod tests {
                 assert_eq!(&item.unwrap(), &val);
             }
         }
-        let config = DbConfig::new("db_tests", "xxx_reindex", 1);
+        let config = DbConfig::with_data_path("db_tests", "xxx_reindex", 1);
         {
             let mut db = DbCore::<u64, Vec<u8>, 8>::reindex(config.clone()).unwrap();
             assert_eq!(db.len(), max as usize);
@@ -1014,11 +995,12 @@ mod tests {
         let max = 1_000;
         let val = vec![0_u8; 512];
         {
-            let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_destroy", 1)
-                .create()
-                .truncate()
-                .build()
-                .unwrap();
+            let mut db: DbCore<u64, Vec<u8>, 8> =
+                DbConfig::with_data_path("db_tests", "xxx_destroy", 1)
+                    .create()
+                    .truncate()
+                    .build()
+                    .unwrap();
             for i in 0_u64..max {
                 db.insert(i, &val).unwrap();
             }
@@ -1037,7 +1019,7 @@ mod tests {
                 assert_eq!(&item.unwrap(), &val);
             }
         }
-        let config = DbConfig::new("db_tests", "xxx_destroy", 1);
+        let config = DbConfig::with_data_path("db_tests", "xxx_destroy", 1);
         {
             let mut db = DbCore::<u64, Vec<u8>, 8>::open(config.clone().create()).unwrap();
             assert_eq!(db.len(), max as usize);
@@ -1059,11 +1041,12 @@ mod tests {
         let max = 1_000;
         let val = vec![0_u8; 512];
         {
-            let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::new("db_tests", "xxx_rename", 1)
-                .create()
-                .truncate()
-                .build()
-                .unwrap();
+            let mut db: DbCore<u64, Vec<u8>, 8> =
+                DbConfig::with_data_path("db_tests", "xxx_rename", 1)
+                    .create()
+                    .truncate()
+                    .build()
+                    .unwrap();
             for i in 0_u64..max {
                 db.insert(i, &val).unwrap();
             }
@@ -1084,10 +1067,10 @@ mod tests {
             db.rename("xxx_rename2").unwrap();
         }
         {
-            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
             DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
         }
-        let config = DbConfig::new("db_tests", "xxx_rename2", 1);
+        let config = DbConfig::with_data_path("db_tests", "xxx_rename2", 1);
         let mut db = DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
         assert_eq!(db.len(), max as usize);
         for i in 0..max {
@@ -1102,7 +1085,7 @@ mod tests {
         db.destroy();
         {
             // Clean up db files.
-            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
             let db = DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
             db.destroy();
         }
@@ -1118,7 +1101,7 @@ mod tests {
             println!("XXXX {:?}", e);
         }
         println!("{}", err_info!());*/
-        let mut db: DbCore<u64, String, 8> = DbConfig::new("db_tests", "xxx50k", 10)
+        let mut db: DbCore<u64, String, 8> = DbConfig::with_data_path("db_tests", "xxx50k", 10)
             .create()
             .truncate()
             .no_auto_flush()
@@ -1213,11 +1196,12 @@ mod tests {
 
     #[test]
     fn test_x50k_str() {
-        let mut db: DbCore<String, String, 0> = DbConfig::new("db_tests", "xxx50k_str", 1)
-            .create()
-            .truncate()
-            .build()
-            .unwrap();
+        let mut db: DbCore<String, String, 0> =
+            DbConfig::with_data_path("db_tests", "xxx50k_str", 1)
+                .create()
+                .truncate()
+                .build()
+                .unwrap();
         for i in 0..50_000 {
             db.insert(format!("key {i}"), &format!("Value {}", i))
                 .unwrap();
@@ -1243,7 +1227,7 @@ mod tests {
     #[test]
     fn test_duplicates() {
         {
-            let mut db: DbCore<u64, u64, 8> = DbConfig::new("db_tests", "xxxDupTest", 1)
+            let mut db: DbCore<u64, u64, 8> = DbConfig::with_data_path("db_tests", "xxxDupTest", 1)
                 .create()
                 .truncate()
                 .build()
@@ -1266,7 +1250,7 @@ mod tests {
             assert_eq!(4, db.fetch(&4).unwrap());
             assert_eq!(5, db.fetch(&5).unwrap());
         }
-        let mut db: DbCore<u64, u64, 8> = DbConfig::new("db_tests", "xxxDupTest", 1)
+        let mut db: DbCore<u64, u64, 8> = DbConfig::with_data_path("db_tests", "xxxDupTest", 1)
             .allow_duplicate_inserts()
             .build()
             .unwrap();
