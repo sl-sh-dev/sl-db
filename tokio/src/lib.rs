@@ -95,6 +95,11 @@ where
         })
     }
 
+    /// Return the backing files object for this DB.
+    pub fn files(&self) -> DbFiles {
+        self.config.blocking_lock().files().clone()
+    }
+
     /// Name of this DB.
     pub async fn name(&self) -> String {
         self.config.lock().await.files().name().to_string()
