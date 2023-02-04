@@ -17,7 +17,6 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
-use std::path::PathBuf;
 use std::{fs, io};
 
 mod bucket_iter;
@@ -67,7 +66,7 @@ where
     }
 
     /// Rename the database to new_name.
-    pub fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> Result<(), RenameError> {
+    pub fn rename<Q: Into<String>>(&mut self, new_name: Q) -> Result<(), RenameError> {
         self.inner.rename(new_name)
     }
 
@@ -215,7 +214,9 @@ where
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         if config.create {
             // Best effort to create the dir if asked to create the DB.
-            let _ = fs::create_dir_all(&config.files.dir);
+            let _ = fs::create_dir_all(&config.files.data_dir());
+            let _ = fs::create_dir_all(&config.files.hdx_dir());
+            let _ = fs::create_dir_all(&config.files.odx_dir());
         }
         let hasher = S::default();
         let (mut data_file, header) =
@@ -275,8 +276,8 @@ where
     /// (they will be garbage in the data file but won't be indexed).
     pub fn reindex(config: DbConfig) -> Result<Self, OpenError> {
         let config = config.create();
-        let _ = fs::remove_file(&config.files.hdx_file);
-        let _ = fs::remove_file(&config.files.odx_file);
+        let _ = fs::remove_file(&config.files.hdx_path());
+        let _ = fs::remove_file(&config.files.odx_path());
 
         let mut db = Self::open(config)?;
 
@@ -318,32 +319,40 @@ where
     /// If it can not remove a file it will silently ignore this.
     pub fn destroy(self) {
         let files = self.config.files.clone();
+        let root_dir = if self.config.files().dir().is_some() {
+            Some(self.config.files().data_dir())
+        } else {
+            None
+        };
         drop(self);
-        let _ = fs::remove_file(&files.data_file);
-        let _ = fs::remove_file(&files.hdx_file);
-        let _ = fs::remove_file(&files.odx_file);
+        let _ = fs::remove_file(&files.data_path());
+        let _ = fs::remove_file(&files.hdx_path());
+        let _ = fs::remove_file(&files.odx_path());
+        // If not using explicit files then delete the directory made for the db.
+        if let Some(dir) = root_dir {
+            let _ = fs::remove_dir(dir);
+        }
     }
 
-    /// Rename the database to new_name.
-    pub fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> Result<(), RenameError> {
-        let new_name: PathBuf = new_name.into();
-        let new_files = DbFiles::new(&self.config.files.dir, new_name);
-        if new_files.data_file.exists()
-            || new_files.hdx_file.exists()
-            || new_files.odx_file.exists()
-        {
-            Err(RenameError::FilesExist)
-        } else if let Err(e) = fs::rename(&self.config.files.data_file, &new_files.data_file) {
-            Err(RenameError::DataFileRename(e))
-        } else if let Err(e) = fs::rename(&self.config.files.hdx_file, &new_files.hdx_file) {
-            let _ = fs::rename(&new_files.data_file, &self.config.files.data_file);
-            Err(RenameError::HdxFileRename(e))
-        } else if let Err(e) = fs::rename(&self.config.files.odx_file, &new_files.odx_file) {
-            let _ = fs::rename(&new_files.data_file, &self.config.files.data_file);
-            let _ = fs::rename(&new_files.hdx_file, &self.config.files.hdx_file);
-            Err(RenameError::OdxFileRename(e))
+    /// Rename the database to name.
+    /// If the paths to files were not explicitly set then rename on the filesystem if not only
+    /// change the recorded DB name leaving the explicit file names alone.
+    pub fn rename<Q: Into<String>>(&mut self, name: Q) -> Result<(), RenameError> {
+        let name: String = name.into();
+        if let Some(dir) = self.config.files().dir() {
+            let old_dir = dir.join(self.config.files().name());
+            let new_dir = dir.join(&name);
+            if new_dir.exists() {
+                Err(RenameError::FilesExist)
+            } else {
+                let res = fs::rename(&old_dir, &new_dir);
+                if res.is_ok() {
+                    self.config.set_name(name);
+                }
+                res.map_err(RenameError::DataFileRename)
+            }
         } else {
-            self.config.files = new_files;
+            self.config.files.set_name(name);
             Ok(())
         }
     }
@@ -576,13 +585,13 @@ where
                 .write(true)
                 .create(config.create)
                 .truncate(true)
-                .open(&config.files.data_file)?;
+                .open(&config.files.data_path())?;
         }
         let mut file = OpenOptions::new()
             .read(true)
             .append(config.write)
             .create(config.create && config.write)
-            .open(&config.files.data_file)?;
+            .open(&config.files.data_path())?;
         file.seek(SeekFrom::End(0))?;
         let file_end = file.seek(SeekFrom::Current(0))?;
 
@@ -984,7 +993,7 @@ mod tests {
         {
             let mut data_file = OpenOptions::new()
                 .write(true)
-                .open(&config.files.data_file)
+                .open(&config.files.data_path())
                 .unwrap();
             let data_len = data_file.seek(SeekFrom::End(0)).unwrap();
             data_file.set_len(data_len - 16).unwrap(); // Truncate the file making the last record corrupt.

@@ -276,7 +276,7 @@ where
             .write(config.write)
             .create(config.create && config.write)
             .truncate(config.truncate && config.write)
-            .open(&config.files.hdx_file)?;
+            .open(&config.files.hdx_path())?;
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {

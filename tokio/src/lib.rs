@@ -10,7 +10,6 @@ use sldb_core::fxhasher::FxHasher;
 use std::error::Error;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fmt, fs, io};
 use tokio::sync::*;
@@ -28,7 +27,7 @@ where
     write_cache: Arc<DashMap<K, V>>,
     insert_txs: Vec<mpsc::Sender<InsertCommand<K, KSIZE>>>,
     insert_threads: Option<Vec<std::thread::JoinHandle<()>>>,
-    config: DbConfig,
+    config: Mutex<DbConfig>,
     hasher: S,
 }
 
@@ -60,7 +59,11 @@ where
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
 
-        let base_dir = config.files().dir.join(&config.files().base_name);
+        let base_dir = config
+            .files()
+            .dir()
+            .expect("AsyncDb currently does not support explicit file paths!")
+            .join(config.files().name());
         let mut db_shards = Vec::with_capacity(SHARDS);
         for i in 0..SHARDS {
             let db_config = config
@@ -87,14 +90,14 @@ where
             write_cache,
             insert_txs,
             insert_threads: Some(db_threads),
-            config,
+            config: Mutex::new(config),
             hasher: S::default(),
         })
     }
 
-    /// Returns a reference to the file names for this DB.
-    pub fn files(&self) -> &DbFiles {
-        self.config.files()
+    /// Name of this DB.
+    pub async fn name(&self) -> String {
+        self.config.lock().await.files().name().to_string()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
@@ -200,31 +203,34 @@ where
     }
 
     /// Close the DB and delete the files.
-    pub async fn destroy(mut self) -> io::Result<()> {
-        let mut dbs = Vec::with_capacity(SHARDS);
-        for db in self.db_shards.drain(..) {
-            dbs.push(db);
-        }
-        let dir = self.files().dir.join(&self.files().base_name);
+    pub async fn destroy(self) -> io::Result<()> {
+        let config = self.config.lock().await;
+        let dir = config
+            .files()
+            .dir()
+            .expect("AsyncDb currently does not support explicit file paths!")
+            .join(config.files().name());
+        drop(config);
         drop(self);
-        for db in dbs.drain(..) {
-            // At this point this should be the only reference left to db.
-            if let Ok(db) = Arc::try_unwrap(db) {
-                let db = db.into_inner();
-                db.destroy();
-            }
-        }
         std::fs::remove_dir_all(&dir)
     }
 
     /// Rename the database to new_name.
-    pub async fn rename<P: Into<PathBuf>>(&mut self, new_name: P) -> io::Result<()> {
-        let new_name: PathBuf = new_name.into();
-        let old_dir = self.files().dir.join(&self.files().base_name);
-        let new_dir = self.files().dir.join(&new_name);
-        let new_files = DbFiles::new(&self.files().dir, new_name);
-        self.config.replace_files(new_files);
-        fs::rename(&old_dir, &new_dir)
+    pub async fn rename<Q: Into<String>>(&self, new_name: Q) -> io::Result<()> {
+        let new_name: String = new_name.into();
+        let mut config = self.config.lock().await;
+        if let Some(dir) = config.files().dir() {
+            let old_dir = dir.join(config.files().name());
+            let new_dir = dir.join(&new_name);
+            let res = fs::rename(&old_dir, &new_dir);
+            if res.is_ok() {
+                config.set_name(new_name);
+            }
+            res
+        } else {
+            config.set_name(new_name);
+            Ok(())
+        }
     }
 
     fn commit_bg_thread(
@@ -441,5 +447,60 @@ mod tests {
             max,
             start.elapsed().as_secs_f64()
         );
+    }
+
+    #[tokio::test]
+    async fn test_async_rename() {
+        let max = 1_000;
+        let val = vec![0_u8; 512];
+        {
+            let config = DbConfig::new("db_tests", "xxx_rename1", 1)
+                .no_auto_flush()
+                .create()
+                .truncate();
+            let db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config).unwrap();
+            assert_eq!(&db.name().await, "xxx_rename1");
+            for i in 0_u64..max {
+                db.insert(i, val.clone()).await;
+            }
+
+            for i in 0..max {
+                let item = db.fetch(i as u64).await;
+                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                assert_eq!(&item.unwrap(), &val);
+            }
+
+            db.commit().await.unwrap();
+            assert_eq!(db.len().await, max as usize);
+            for i in 0..max {
+                let item = db.fetch(i as u64).await;
+                assert!(item.is_ok(), "Failed on item {}", i);
+                assert_eq!(&item.unwrap(), &val);
+            }
+            db.rename("xxx_rename2").await.unwrap();
+            assert_eq!(&db.name().await, "xxx_rename2");
+        }
+        {
+            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let _db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config.create()).unwrap();
+        }
+        let config = DbConfig::new("db_tests", "xxx_rename2", 1);
+        let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+        assert_eq!(db.len().await, max as usize);
+        for i in 0..max {
+            let item = db.fetch(i as u64).await;
+            assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+            assert_eq!(&item.unwrap(), &val);
+        }
+        assert!(db.rename("xxx_rename3").await.is_err());
+        assert_eq!(&db.name().await, "xxx_rename2");
+        db.destroy().await.unwrap();
+        {
+            // Clean up db files.
+            let config = DbConfig::new("db_tests", "xxx_rename3", 1);
+            let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+            assert_eq!(&db.name().await, "xxx_rename3");
+            db.destroy().await.unwrap();
+        }
     }
 }

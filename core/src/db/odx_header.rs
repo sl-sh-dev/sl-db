@@ -37,13 +37,13 @@ impl OdxHeader {
                 .write(true)
                 .create(config.create)
                 .truncate(true)
-                .open(&config.files.odx_file)?;
+                .open(&config.files.odx_path())?;
         }
         let mut file = OpenOptions::new()
             .read(true)
             .append(config.write)
             .create(config.create && config.write)
-            .open(&config.files.odx_file)?;
+            .open(&config.files.odx_path())?;
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
