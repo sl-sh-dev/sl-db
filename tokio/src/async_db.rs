@@ -67,11 +67,11 @@ where
     /// Open a new or reopen an existing database.
     /// The config must not contain explicit file paths, this will return an InvalidFiles error.
     /// This restriction is because it shards the DB into multiple sub-DBs.
-    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+    pub fn open(config: DbConfig, channel_depth: usize) -> Result<Self, OpenError> {
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
 
         let db = Arc::new(Mutex::new(DbCore::open(config.clone())?));
-        let (insert_tx, insert_rx) = mpsc::channel(10_000);
+        let (insert_tx, insert_rx) = mpsc::channel(channel_depth);
         let write_cache = Arc::new(DashMap::with_hasher(S::default()));
         let write_cache_clone = write_cache.clone();
         let db_clone = db.clone();
@@ -108,8 +108,6 @@ where
             Ok(val.clone())
         } else {
             self.db.lock().await.fetch(&key)
-            //let db = self.db.clone();
-            //tokio::task::spawn_blocking(move || db.blocking_lock().fetch(&key)).await.unwrap()//.map_err(|_|FetchError::NotFound)
         }
     }
 
@@ -209,7 +207,7 @@ mod tests {
             //.set_bucket_elements(100)
             //.set_load_factor(0.6)
             .truncate(); //.no_write_cache();
-        let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config).unwrap());
+        let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config, 100_000).unwrap());
         assert!(db.is_empty().await);
         assert!(!db.contains_key(0).await.unwrap());
         assert!(!db.contains_key(10).await.unwrap());
@@ -292,7 +290,7 @@ mod tests {
                 .no_auto_flush()
                 .create()
                 .truncate();
-            let db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config).unwrap();
+            let db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config, 1000).unwrap();
             assert_eq!(&db.name(), "xxx_rename1");
             for i in 0_u64..max {
                 db.insert(i, val.clone()).await;
@@ -316,10 +314,10 @@ mod tests {
         }
         {
             let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
-            let _db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config.create()).unwrap();
+            let _db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config.create(), 1000).unwrap();
         }
         let config = DbConfig::with_data_path("db_tests", "xxx_rename2", 1);
-        let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+        let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create(), 1000).unwrap();
         assert_eq!(db.len().await, max as usize);
         for i in 0..max {
             let item = db.fetch(i as u64).await;
@@ -332,7 +330,7 @@ mod tests {
         {
             // Clean up db files.
             let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
-            let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+            let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create(), 1000).unwrap();
             assert_eq!(&db.name(), "xxx_rename3");
             db.destroy();
         }

@@ -76,7 +76,11 @@ where
     /// Open a new or reopen an existing database.
     /// The config must not contain explicit file paths, this will return an InvalidFiles error.
     /// This restriction is because it shards the DB into multiple sub-DBs.
-    pub fn open(config: DbConfig, shard_bits: usize) -> Result<Self, OpenError> {
+    pub fn open(
+        config: DbConfig,
+        shard_bits: usize,
+        channel_depth: usize,
+    ) -> Result<Self, OpenError> {
         let shards: usize = 1 << shard_bits;
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
 
@@ -108,7 +112,7 @@ where
         let mut insert_txs = Vec::with_capacity(shards);
         let mut db_threads = Vec::with_capacity(shards);
         for (db, write_cache) in db_shards.iter().zip(write_caches.iter()) {
-            let (insert_tx, insert_rx) = mpsc::channel(10_000);
+            let (insert_tx, insert_rx) = mpsc::channel(channel_depth);
             let write_cache_clone = write_cache.clone();
             let db_clone = db.clone();
             let db_thread =
@@ -326,7 +330,7 @@ mod tests {
             //.set_load_factor(0.6)
             .truncate(); //.no_write_cache();
         let db: Arc<ShardedDb<u64, String, 8>> =
-            Arc::new(ShardedDb::open(config, shard_bits).unwrap());
+            Arc::new(ShardedDb::open(config, shard_bits, 10_000).unwrap());
         assert!(db.is_empty().await);
         assert!(!db.contains_key(0).await.unwrap());
         assert!(!db.contains_key(10).await.unwrap());
@@ -413,7 +417,7 @@ mod tests {
                 .no_auto_flush()
                 .create()
                 .truncate();
-            let db: ShardedDb<u64, Vec<u8>, 8> = ShardedDb::open(config, shard_bits).unwrap();
+            let db: ShardedDb<u64, Vec<u8>, 8> = ShardedDb::open(config, shard_bits, 1000).unwrap();
             assert_eq!(&db.name(), "xxx_rename1");
             for i in 0_u64..max {
                 db.insert(i, val.clone()).await;
@@ -438,10 +442,10 @@ mod tests {
         {
             let config = DbConfig::with_data_path("shard_tests", "xxx_rename3", 1);
             let _db: ShardedDb<u64, Vec<u8>, 8> =
-                ShardedDb::open(config.create(), shard_bits).unwrap();
+                ShardedDb::open(config.create(), shard_bits, 1000).unwrap();
         }
         let config = DbConfig::with_data_path("shard_tests", "xxx_rename2", 1);
-        let db = ShardedDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits).unwrap();
+        let db = ShardedDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits, 1000).unwrap();
         assert_eq!(db.len().await, max as usize);
         for i in 0..max {
             let item = db.fetch(i as u64).await;
@@ -454,7 +458,7 @@ mod tests {
         {
             // Clean up db files.
             let config = DbConfig::with_data_path("shard_tests", "xxx_rename3", 1);
-            let db = ShardedDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits).unwrap();
+            let db = ShardedDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits, 1000).unwrap();
             assert_eq!(&db.name(), "xxx_rename3");
             db.destroy().unwrap();
         }
