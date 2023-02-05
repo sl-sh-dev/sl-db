@@ -228,6 +228,10 @@ impl DbFiles {
     /// It is an error to try to rename if file paths were manually set.
     pub fn rename<Q: Into<String>>(&mut self, name: Q) -> Result<(), RenameError> {
         let name: String = name.into();
+        if self.name == name {
+            // Changing name to itself, nothing to do.
+            return Ok(());
+        }
         match (&self.dir, &self.index_dir) {
             (Some(dir), Some(index_dir)) => {
                 let old_dir = dir.join(&self.name);

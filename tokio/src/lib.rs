@@ -270,6 +270,9 @@ where
         new_name: Q,
     ) -> Result<(), RenameError> {
         let new_name: String = new_name.into();
+        if config.files().name() == new_name {
+            return Ok(());
+        }
         if let Some(dir) = config.files().dir() {
             let old_dir = dir.join(config.files().name());
             let new_dir = dir.join(&new_name);
