@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::{fmt, fs, io};
 use tokio::sync::*;
 
-const SHARD_BITS: usize = 0;
+const SHARD_BITS: usize = 1;
 const SHARDS: usize = 1 << SHARD_BITS;
 
 /// This provides an async wrapper around DbCore.
@@ -341,8 +341,9 @@ where
         while !done {
             match insert_rx.blocking_recv() {
                 Some(InsertCommand::Insert(key)) => {
+                    let mut db = db.blocking_lock();
                     if let Some(value) = write_cache.get(&key) {
-                        match db.blocking_lock().insert(key.clone(), &value) {
+                        match db.insert(key.clone(), &value) {
                             Err(InsertError::DuplicateKey) => {} // Silently ignore duplicate keys...
                             Err(err) => last_insert_error = Some(err),
                             Ok(_) => {}
