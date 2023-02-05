@@ -363,7 +363,6 @@ where
                 None => done = true, // The sender has been closed or dropped so nothing left to do.
             }
         }
-        println!("XXXX Ending db thread");
     }
 }
 
