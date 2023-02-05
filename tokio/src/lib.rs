@@ -44,7 +44,9 @@ where
     write_cache: Arc<DashMap<K, V>>,
     insert_txs: Vec<mpsc::Sender<InsertCommand<K, KSIZE>>>,
     insert_threads: Option<Vec<std::thread::JoinHandle<()>>>,
-    config: Mutex<DbConfig>,
+    // There should be little to no contention for this and using async can be inconvenient but
+    // using blocking_lock() if a tokio runtime is use will panic.
+    config: parking_lot::Mutex<DbConfig>,
     hasher: S,
 }
 
@@ -119,22 +121,21 @@ where
             write_cache,
             insert_txs,
             insert_threads: Some(db_threads),
-            config: Mutex::new(config),
+            config: parking_lot::Mutex::new(config),
             hasher: S::default(),
         })
     }
 
     /// Return the backing files object for this DB.
     pub fn files(&self) -> DbFiles {
-        self.config.blocking_lock().files().clone()
+        self.config.lock().files().clone()
     }
 
     /// Root directory for this DB.
     /// The actual DB shards will be stored in dir/name.
-    pub async fn dir(&self) -> PathBuf {
+    pub fn dir(&self) -> PathBuf {
         self.config
             .lock()
-            .await
             .files()
             .dir()
             .expect("AsyncDb requires a directory")
@@ -142,8 +143,8 @@ where
     }
 
     /// Name of this DB.
-    pub async fn name(&self) -> String {
-        self.config.lock().await.files().name().to_string()
+    pub fn name(&self) -> String {
+        self.config.lock().files().name().to_string()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
@@ -249,8 +250,8 @@ where
     }
 
     /// Close the DB and delete the files.
-    pub async fn destroy(self) -> io::Result<()> {
-        let config = self.config.lock().await;
+    pub fn destroy(self) -> io::Result<()> {
+        let config = self.config.lock();
         let dir = config
             .files()
             .dir()
@@ -262,16 +263,8 @@ where
     }
 
     /// Rename the database to new_name.
-    pub async fn rename<Q: Into<String>>(&self, new_name: Q) -> Result<(), RenameError> {
-        let mut config = self.config.lock().await;
-        self.rename_inner(&mut config, new_name)
-    }
-
-    /// Rename the database to new_name.
-    /// Use this version outside a tokio runtime, will panic if called within a runtime (use
-    /// rename() within a runtime).
-    pub fn sync_rename<Q: Into<String>>(&self, new_name: Q) -> Result<(), RenameError> {
-        let mut config = self.config.blocking_lock();
+    pub fn rename<Q: Into<String>>(&self, new_name: Q) -> Result<(), RenameError> {
+        let mut config = self.config.lock();
         self.rename_inner(&mut config, new_name)
     }
 
@@ -528,7 +521,7 @@ mod tests {
                 .create()
                 .truncate();
             let db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config).unwrap();
-            assert_eq!(&db.name().await, "xxx_rename1");
+            assert_eq!(&db.name(), "xxx_rename1");
             for i in 0_u64..max {
                 db.insert(i, val.clone()).await;
             }
@@ -546,8 +539,8 @@ mod tests {
                 assert!(item.is_ok(), "Failed on item {}", i);
                 assert_eq!(&item.unwrap(), &val);
             }
-            db.rename("xxx_rename2").await.unwrap();
-            assert_eq!(&db.name().await, "xxx_rename2");
+            db.rename("xxx_rename2").unwrap();
+            assert_eq!(&db.name(), "xxx_rename2");
         }
         {
             let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
@@ -561,15 +554,15 @@ mod tests {
             assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
             assert_eq!(&item.unwrap(), &val);
         }
-        assert!(db.rename("xxx_rename3").await.is_err());
-        assert_eq!(&db.name().await, "xxx_rename2");
-        db.destroy().await.unwrap();
+        assert!(db.rename("xxx_rename3").is_err());
+        assert_eq!(&db.name(), "xxx_rename2");
+        db.destroy().unwrap();
         {
             // Clean up db files.
             let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
             let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
-            assert_eq!(&db.name().await, "xxx_rename3");
-            db.destroy().await.unwrap();
+            assert_eq!(&db.name(), "xxx_rename3");
+            db.destroy().unwrap();
         }
     }
 }

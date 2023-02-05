@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["sync"] }
 dashmap = "5.4.0"
+parking_lot = "0.12.1"
 sldb_core = { path = "../core" }
 
 [dev-dependencies]
