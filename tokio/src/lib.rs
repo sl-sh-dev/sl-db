@@ -126,11 +126,6 @@ where
         })
     }
 
-    /// Return the backing files object for this DB.
-    pub fn files(&self) -> DbFiles {
-        self.config.lock().files().clone()
-    }
-
     /// Root directory for this DB.
     /// The actual DB shards will be stored in dir/name.
     pub fn dir(&self) -> PathBuf {
