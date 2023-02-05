@@ -21,9 +21,6 @@ use std::sync::Arc;
 use std::{fmt, fs, io};
 use tokio::sync::*;
 
-const SHARD_BITS: usize = 0;
-const SHARDS: usize = 1 << SHARD_BITS;
-
 /// This provides an async wrapper around DbCore.
 /// It will shard the DB into multiple DbCore instances to increase performance.  It is also
 /// multi-thread safe and takes immutable self references for ease of use.
@@ -41,13 +38,16 @@ where
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
     db_shards: Vec<Arc<Mutex<DbCore<K, V, KSIZE, S>>>>,
-    write_cache: Arc<DashMap<K, V>>,
+    //write_cache: Arc<DashMap<K, V, S>>,
+    write_caches: Vec<Arc<DashMap<K, V, S>>>,
     insert_txs: Vec<mpsc::Sender<InsertCommand<K, KSIZE>>>,
     insert_threads: Option<Vec<std::thread::JoinHandle<()>>>,
     // There should be little to no contention for this and using async can be inconvenient but
     // using blocking_lock() if a tokio runtime is use will panic.
     config: parking_lot::Mutex<DbConfig>,
     hasher: S,
+    shard_bits: usize,
+    shards: usize,
 }
 
 impl<K, V, const KSIZE: u16, S> Drop for AsyncDb<K, V, KSIZE, S>
@@ -77,7 +77,8 @@ where
     /// Open a new or reopen an existing database.
     /// The config must not contain explicit file paths, this will return an InvalidFiles error.
     /// This restriction is because it shards the DB into multiple sub-DBs.
-    pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+    pub fn open(config: DbConfig, shard_bits: usize) -> Result<Self, OpenError> {
+        let shards: usize = 1 << shard_bits;
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
 
         // Make sure we were not given explicit file paths, that won't work with sharding.
@@ -95,18 +96,19 @@ where
         } else {
             return Err(OpenError::InvalidFiles);
         };
-        let mut db_shards = Vec::with_capacity(SHARDS);
-        for i in 0..SHARDS {
+        let mut db_shards = Vec::with_capacity(shards);
+        let mut write_caches = Vec::with_capacity(shards);
+        for i in 0..shards {
             let mut files = shard_files.clone();
             files.set_name(format!("shard_{i}"));
             let db_config = config.clone().set_files(files);
             let db = DbCore::open(db_config)?;
             db_shards.push(Arc::new(Mutex::new(db)));
+            write_caches.push(Arc::new(DashMap::with_hasher(S::default())));
         }
-        let mut insert_txs = Vec::with_capacity(SHARDS);
-        let mut db_threads = Vec::with_capacity(SHARDS);
-        let write_cache: Arc<DashMap<K, V>> = Arc::new(DashMap::new());
-        for db in &db_shards {
+        let mut insert_txs = Vec::with_capacity(shards);
+        let mut db_threads = Vec::with_capacity(shards);
+        for (db, write_cache) in db_shards.iter().zip(write_caches.iter()) {
             let (insert_tx, insert_rx) = mpsc::channel(10_000);
             let write_cache_clone = write_cache.clone();
             let db_clone = db.clone();
@@ -118,11 +120,13 @@ where
         }
         Ok(Self {
             db_shards,
-            write_cache,
+            write_caches,
             insert_txs,
             insert_threads: Some(db_threads),
             config: parking_lot::Mutex::new(config),
             hasher: S::default(),
+            shard_bits,
+            shards,
         })
     }
 
@@ -144,10 +148,11 @@ where
 
     /// Fetch the value stored at key.  Will return an error if not found.
     pub async fn fetch(&self, key: K) -> Result<V, FetchError> {
-        if let Some(val) = self.write_cache.get(&key) {
+        let shard = self.shard(&key);
+        if let Some(val) = self.write_caches[shard].get(&key) {
             Ok(val.clone())
         } else {
-            let db = &self.db_shards[Self::shard(&self.hasher, &key)];
+            let db = &self.db_shards[shard];
             db.lock().await.fetch(&key)
             //let db = self.db.clone();
             //tokio::task::spawn_blocking(move || db.blocking_lock().fetch(&key)).await.unwrap()//.map_err(|_|FetchError::NotFound)
@@ -156,10 +161,11 @@ where
 
     /// True if the database contains key.
     pub async fn contains_key(&self, key: K) -> Result<bool, ReadKeyError> {
-        if self.write_cache.contains_key(&key) {
+        let shard = self.shard(&key);
+        if self.write_caches[shard].contains_key(&key) {
             Ok(true)
         } else {
-            let db = &self.db_shards[Self::shard(&self.hasher, &key)];
+            let db = &self.db_shards[shard];
             db.lock().await.contains_key(&key)
         }
     }
@@ -171,10 +177,10 @@ where
     ///   - key data
     ///   - value data
     pub async fn insert(&self, key: K, value: V) {
-        if !self.write_cache.contains_key(&key) {
-            self.write_cache.insert(key.clone(), value);
+        let shard = self.shard(&key);
+        if !self.write_caches[shard].contains_key(&key) {
+            self.write_caches[shard].insert(key.clone(), value);
             // An error here indicates the receiver in the insert thread was closed/dropped.
-            let shard = Self::shard(&self.hasher, &key);
             let _ = self.insert_txs[shard]
                 .send(InsertCommand::Insert(key))
                 .await;
@@ -201,7 +207,7 @@ where
     /// All data should be safely on disk if this call succeeds.
     pub async fn commit(&self) -> Result<(), CommitError> {
         let mut result = Ok(());
-        let mut rxs = Vec::with_capacity(SHARDS);
+        let mut rxs = Vec::with_capacity(self.shards);
         for insert_tx in &self.insert_txs {
             let (tx, rx) = tokio::sync::oneshot::channel();
             // If we can't send then do something drastic (?).
@@ -237,8 +243,8 @@ where
     pub async fn raw_iter(
         &self,
     ) -> Result<impl Iterator<Item = Result<(K, V), FetchError>>, LoadHeaderError> {
-        let mut iters = Vec::with_capacity(SHARDS);
-        for i in 0..SHARDS {
+        let mut iters = Vec::with_capacity(self.shards);
+        for i in 0..self.shards {
             iters.push(self.db_shards[i].lock().await.raw_iter()?);
         }
         Ok(iters.into_iter().flatten())
@@ -295,7 +301,7 @@ where
 
     fn commit_bg_thread(
         db: &Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
-        write_cache: &DashMap<K, V>,
+        write_cache: &DashMap<K, V, S>,
         inserts: &mut Vec<K>,
         result_tx: Option<oneshot::Sender<Result<(), CommitError>>>,
     ) {
@@ -318,21 +324,21 @@ where
     }
 
     /// Return the shard for a key.
-    #[allow(arithmetic_overflow)]
-    fn shard(hasher: &S, key: &K) -> usize {
-        if SHARD_BITS == 0 {
+    //#[allow(arithmetic_overflow)]
+    fn shard(&self, key: &K) -> usize {
+        if self.shard_bits == 0 {
             0
         } else {
-            let mut hasher = hasher.build_hasher();
+            let mut hasher = self.hasher.build_hasher();
             key.hash(&mut hasher);
             // Use the top bits for shard that should not overlap with buckets.
-            hasher.finish() as usize >> (64 - SHARD_BITS)
+            hasher.finish() as usize >> (64 - self.shard_bits)
         }
     }
 
     fn insert_thread(
         db: Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
-        write_cache: Arc<DashMap<K, V>>,
+        write_cache: Arc<DashMap<K, V, S>>,
         mut insert_rx: mpsc::Receiver<InsertCommand<K, KSIZE>>,
     ) {
         let mut inserts = Vec::new();
@@ -349,6 +355,7 @@ where
                             Ok(_) => {}
                         }
                         drop(value);
+                        drop(db);
                         inserts.push(key);
                     }
                 }
@@ -434,13 +441,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_50k() {
+        let shard_bits = 2;
         let config = DbConfig::with_data_path(".", "xxx50k", 1)
             .no_auto_flush()
             .create()
             //.set_bucket_elements(100)
             //.set_load_factor(0.6)
             .truncate(); //.no_write_cache();
-        let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config).unwrap());
+        let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config, shard_bits).unwrap());
         assert!(db.is_empty().await);
         assert!(!db.contains_key(0).await.unwrap());
         assert!(!db.contains_key(10).await.unwrap());
@@ -518,12 +526,13 @@ mod tests {
     async fn test_async_rename() {
         let max = 1_000;
         let val = vec![0_u8; 512];
+        let shard_bits = 2;
         {
             let config = DbConfig::with_data_path("db_tests", "xxx_rename1", 1)
                 .no_auto_flush()
                 .create()
                 .truncate();
-            let db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config).unwrap();
+            let db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config, shard_bits).unwrap();
             assert_eq!(&db.name(), "xxx_rename1");
             for i in 0_u64..max {
                 db.insert(i, val.clone()).await;
@@ -547,10 +556,10 @@ mod tests {
         }
         {
             let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
-            let _db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config.create()).unwrap();
+            let _db: AsyncDb<u64, Vec<u8>, 8> = AsyncDb::open(config.create(), shard_bits).unwrap();
         }
         let config = DbConfig::with_data_path("db_tests", "xxx_rename2", 1);
-        let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+        let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits).unwrap();
         assert_eq!(db.len().await, max as usize);
         for i in 0..max {
             let item = db.fetch(i as u64).await;
@@ -563,7 +572,7 @@ mod tests {
         {
             // Clean up db files.
             let config = DbConfig::with_data_path("db_tests", "xxx_rename3", 1);
-            let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
+            let db = AsyncDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits).unwrap();
             assert_eq!(&db.name(), "xxx_rename3");
             db.destroy().unwrap();
         }
