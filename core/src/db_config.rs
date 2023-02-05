@@ -83,6 +83,11 @@ impl DbConfig {
         &self.files
     }
 
+    /// Returns a mutable reference to the file names for this DB.
+    pub fn files_mut(&mut self) -> &mut DbFiles {
+        &mut self.files
+    }
+
     /// Set the config files to files- do this before it is used or files will be ignored.
     pub fn set_files(mut self, files: DbFiles) -> Self {
         self.files = files;
