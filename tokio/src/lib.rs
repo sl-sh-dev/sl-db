@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use sldb_core::db::DbCore;
 use sldb_core::db_bytes::DbBytes;
 use sldb_core::db_config::DbConfig;
-use sldb_core::db_files::DbFiles;
+use sldb_core::db_files::{DbFiles, RenameError};
 use sldb_core::db_key::DbKey;
 use sldb_core::error::flush::FlushError;
 use sldb_core::error::insert::InsertError;
@@ -262,7 +262,7 @@ where
     }
 
     /// Rename the database to new_name.
-    pub async fn rename<Q: Into<String>>(&self, new_name: Q) -> io::Result<()> {
+    pub async fn rename<Q: Into<String>>(&self, new_name: Q) -> Result<(), RenameError> {
         let mut config = self.config.lock().await;
         self.rename_inner(&mut config, new_name)
     }
@@ -270,12 +270,17 @@ where
     /// Rename the database to new_name.
     /// Use this version outside a tokio runtime, will panic if called within a runtime (use
     /// rename() within a runtime).
-    pub fn sync_rename<Q: Into<String>>(&self, new_name: Q) -> io::Result<()> {
+    pub fn sync_rename<Q: Into<String>>(&self, new_name: Q) -> Result<(), RenameError> {
         let mut config = self.config.blocking_lock();
         self.rename_inner(&mut config, new_name)
     }
 
-    fn rename_inner<Q: Into<String>>(&self, config: &mut DbConfig, new_name: Q) -> io::Result<()> {
+    /// Private implementation of rename.
+    fn rename_inner<Q: Into<String>>(
+        &self,
+        config: &mut DbConfig,
+        new_name: Q,
+    ) -> Result<(), RenameError> {
         let new_name: String = new_name.into();
         if let Some(dir) = config.files().dir() {
             let old_dir = dir.join(config.files().name());
@@ -283,14 +288,17 @@ where
             // If the new dir exists and is empty then remove it.
             // If dir does not exist or is not empty this should do nothing.
             let _ = fs::remove_dir(&new_dir);
-            let res = fs::rename(&old_dir, &new_dir);
-            if res.is_ok() {
-                config.set_name(new_name);
+            if new_dir.exists() {
+                Err(RenameError::FilesExist)
+            } else {
+                let res = fs::rename(&old_dir, &new_dir);
+                if res.is_ok() {
+                    config.set_name(new_name);
+                }
+                res.map_err(RenameError::RenameIO)
             }
-            res
         } else {
-            config.set_name(new_name);
-            Ok(())
+            Err(RenameError::CanNotRename)
         }
     }
 
