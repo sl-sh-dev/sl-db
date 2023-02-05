@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::{fmt, fs, io};
 use tokio::sync::*;
 
-const SHARD_BITS: usize = 1;
+const SHARD_BITS: usize = 0;
 const SHARDS: usize = 1 << SHARD_BITS;
 
 /// This provides an async wrapper around DbCore.
