@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::{fmt, fs, io};
 use tokio::sync::*;
 
-const SHARD_BITS: usize = 3;
+const SHARD_BITS: usize = 0;
 const SHARDS: usize = 1 << SHARD_BITS;
 
 /// This provides an async wrapper around DbCore.
@@ -318,11 +318,16 @@ where
     }
 
     /// Return the shard for a key.
+    #[allow(arithmetic_overflow)]
     fn shard(hasher: &S, key: &K) -> usize {
-        let mut hasher = hasher.build_hasher();
-        key.hash(&mut hasher);
-        // Use the top bits for shard that should not overlap with buckets.
-        hasher.finish() as usize >> (64 - SHARD_BITS)
+        if SHARD_BITS == 0 {
+            0
+        } else {
+            let mut hasher = hasher.build_hasher();
+            key.hash(&mut hasher);
+            // Use the top bits for shard that should not overlap with buckets.
+            hasher.finish() as usize >> (64 - SHARD_BITS)
+        }
     }
 
     fn insert_thread(
