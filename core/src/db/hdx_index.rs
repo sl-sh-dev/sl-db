@@ -500,6 +500,8 @@ where
         if let Ok(header) = HdxHeader::load_header(self.header.bucket_size, &mut self.hdx_file) {
             self.header = header;
             self.modulus = (self.header.buckets() + 1).next_power_of_two();
+            self.bucket_cache.clear();
+            self.dirty_bucket_cache.clear();
         }
     }
 

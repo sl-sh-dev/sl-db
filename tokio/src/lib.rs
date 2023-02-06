@@ -7,6 +7,9 @@
 pub mod async_db;
 pub use async_db::AsyncDb;
 
+pub mod async_alt_db;
+pub use async_alt_db::AsyncAltDb;
+
 pub mod sharded_db;
 pub use sharded_db::ShardedDb;
 

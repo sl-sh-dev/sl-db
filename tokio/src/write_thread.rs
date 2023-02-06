@@ -21,6 +21,7 @@ where
     Done,
 }
 
+/// Do a commit for teh background thread.
 fn commit_bg_thread<K, V, const KSIZE: u16, S>(
     db: &Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
     write_cache: &DashMap<K, V, S>,
