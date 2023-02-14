@@ -27,11 +27,11 @@ impl Error for FlushError {}
 impl fmt::Display for FlushError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::WriteData(e) => write!(f, "write data: {}", e),
-            Self::ExpandBuckets(e) => write!(f, "expand buckets: {}", e),
-            Self::SaveToBucket(e) => write!(f, "save bucket: {}", e),
-            Self::IndexHeader(e) => write!(f, "write index header: {}", e),
-            Self::WriteIndexData(e) => write!(f, "write index data: {}", e),
+            Self::WriteData(e) => write!(f, "write data: {e}"),
+            Self::ExpandBuckets(e) => write!(f, "expand buckets: {e}"),
+            Self::SaveToBucket(e) => write!(f, "save bucket: {e}"),
+            Self::IndexHeader(e) => write!(f, "write index header: {e}"),
+            Self::WriteIndexData(e) => write!(f, "write index data: {e}"),
             Self::ReadOnly => write!(f, "read only"),
         }
     }

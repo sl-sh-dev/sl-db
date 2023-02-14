@@ -34,14 +34,14 @@ impl fmt::Display for InsertError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
             Self::DuplicateKey => write!(f, "key is already in database"),
-            Self::SerializeKey(e) => write!(f, "key serialization: {}", e),
-            Self::SerializeValue(e) => write!(f, "value serialization: {}", e),
+            Self::SerializeKey(e) => write!(f, "key serialization: {e}"),
+            Self::SerializeValue(e) => write!(f, "value serialization: {e}"),
             Self::InvalidKeyLength => write!(f, "invalid key length"),
-            Self::KeyError(e) => write!(f, "key access: {}", e),
+            Self::KeyError(e) => write!(f, "key access: {e}"),
             Self::ReadOnly => write!(f, "read only"),
             Self::IndexCrcError => write!(f, "index crc32 failed"),
             Self::IndexOverflow => write!(f, "index overflow failed"),
-            Self::WriteDataError(e) => write!(f, "write data failed: {}", e),
+            Self::WriteDataError(e) => write!(f, "write data failed: {e}"),
         }
     }
 }

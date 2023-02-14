@@ -210,15 +210,15 @@ impl DbFiles {
     /// Delete the referenced DB files and directories if empty.
     /// If it can not remove a file it will silently ignore this.
     pub fn delete(self) {
-        let _ = fs::remove_file(&self.data_path());
-        let _ = fs::remove_file(&self.hdx_path());
-        let _ = fs::remove_file(&self.odx_path());
+        let _ = fs::remove_file(self.data_path());
+        let _ = fs::remove_file(self.hdx_path());
+        let _ = fs::remove_file(self.odx_path());
         if let Some(dir) = &self.index_dir {
-            let _ = fs::remove_dir(&dir.join(&self.name));
+            let _ = fs::remove_dir(dir.join(&self.name));
             let _ = fs::remove_dir(dir);
         }
         if let Some(dir) = &self.dir {
-            let _ = fs::remove_dir(&dir.join(&self.name));
+            let _ = fs::remove_dir(dir.join(&self.name));
             let _ = fs::remove_dir(dir);
         }
     }
@@ -246,7 +246,7 @@ impl DbFiles {
                 } else {
                     let mut res = fs::rename(&old_index_dir, &new_index_dir);
                     if res.is_ok() {
-                        res = fs::rename(&old_dir, &new_dir);
+                        res = fs::rename(old_dir, &new_dir);
                         if res.is_ok() {
                             self.name = name;
                         } else {
@@ -266,7 +266,7 @@ impl DbFiles {
                 if new_dir.exists() {
                     Err(RenameError::FilesExist)
                 } else {
-                    let res = fs::rename(&old_dir, &new_dir);
+                    let res = fs::rename(old_dir, &new_dir);
                     if res.is_ok() {
                         self.name = name;
                     }
@@ -316,7 +316,7 @@ impl fmt::Display for RenameError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
             Self::FilesExist => write!(f, "target directory for rename already exist"),
-            Self::RenameIO(e) => write!(f, "rename failed: {}", e),
+            Self::RenameIO(e) => write!(f, "rename failed: {e}"),
             Self::CanNotRename => write!(f, "rename not supported for manually set file paths"),
         }
     }

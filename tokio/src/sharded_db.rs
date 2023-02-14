@@ -262,7 +262,7 @@ where
             .join(config.files().name());
         drop(config);
         drop(self);
-        std::fs::remove_dir_all(&dir)
+        std::fs::remove_dir_all(dir)
     }
 
     /// Rename the database to new_name.
@@ -290,7 +290,7 @@ where
             if new_dir.exists() {
                 Err(RenameError::FilesExist)
             } else {
-                let res = fs::rename(&old_dir, &new_dir);
+                let res = fs::rename(old_dir, &new_dir);
                 if res.is_ok() {
                     config.set_name(new_name);
                 }
@@ -341,7 +341,7 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0_u64..max {
-            db.insert(i, format!("Value {}", i)).await;
+            db.insert(i, format!("Value {i}")).await;
             if i % 100_000 == 0 {
                 db.commit_bg().await; //.unwrap();
                                       //db.commit().await.unwrap();
@@ -361,9 +361,9 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(i).await;
+            assert!(item.is_ok(), "Failed on item {i}, {item:?}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
         }
         println!(
             "XXXX TOK SHARD fetch ({}) (pre commit) time {}",
@@ -389,9 +389,9 @@ mod tests {
         let start = time::Instant::now();
         //let mut fetch_set = JoinSet::new();
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(i).await;
+            assert!(item.is_ok(), "Failed on item {i}, {item:?}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
             //let db_clone = db.clone();
             //fetch_set.spawn(async move {
             //    let item = db_clone.fetch(i as u64).await;
@@ -424,16 +424,16 @@ mod tests {
             }
 
             for i in 0..max {
-                let item = db.fetch(i as u64).await;
-                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                let item = db.fetch(i).await;
+                assert!(item.is_ok(), "Failed on item {i}, {item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
 
             db.commit().await.unwrap();
             assert_eq!(db.len().await, max as usize);
             for i in 0..max {
-                let item = db.fetch(i as u64).await;
-                assert!(item.is_ok(), "Failed on item {}", i);
+                let item = db.fetch(i).await;
+                assert!(item.is_ok(), "Failed on item {i}");
                 assert_eq!(&item.unwrap(), &val);
             }
             db.rename("xxx_rename2").unwrap();
@@ -448,8 +448,8 @@ mod tests {
         let db = ShardedDb::<u64, Vec<u8>, 8>::open(config.create(), shard_bits, 1000).unwrap();
         assert_eq!(db.len().await, max as usize);
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+            let item = db.fetch(i).await;
+            assert!(item.is_ok(), "Failed on item {i}/{item:?}");
             assert_eq!(&item.unwrap(), &val);
         }
         assert!(db.rename("xxx_rename3").is_err());

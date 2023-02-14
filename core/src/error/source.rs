@@ -19,7 +19,7 @@ impl fmt::Display for SourceError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.0 {
             None => write!(f, "no error set"),
-            Some(e) => write!(f, "{}", e),
+            Some(e) => write!(f, "{e}"),
         }
     }
 }

@@ -50,6 +50,14 @@ where
         })
     }
 
+    /// Open a new or reopen an existing database.
+    /// If a problem is detected try a reindex to recover if possible.
+    pub fn open_with_recover(config: DbConfig) -> Result<Self, OpenError> {
+        Ok(Self {
+            inner: DbInner::open_with_recover(config)?,
+        })
+    }
+
     /// Will destroy the existing index for DB and rebuild it based on the data file.
     /// This will also verify the integrity of the data file.  If only the final record is corrupt
     /// then the file will be truncated to leave a valid DB.  Other corrupt records will be ignored
@@ -214,18 +222,43 @@ where
 {
     /// Open a new or reopen an existing database.
     pub fn open(config: DbConfig) -> Result<Self, OpenError> {
+        Self::open_internal(config, true, false)
+    }
+
+    /// Open a new or reopen an existing database.
+    /// If a problem is detected try a reindex to recover if possible.
+    pub fn open_with_recover(config: DbConfig) -> Result<Self, OpenError> {
+        Self::open_internal(config, true, true)
+    }
+
+    /// Open a new or reopen an existing database.
+    /// ATakes a flag (require_hdx_check) that will skip the clean shutdown check.
+    /// If auto_recover is true and a there is a non-data file issue then try to reindex to recover.
+    fn open_internal(
+        config: DbConfig,
+        require_hdx_check: bool,
+        auto_recover: bool,
+    ) -> Result<Self, OpenError> {
         if config.create {
             // Best effort to create the dir if asked to create the DB.
-            let _ = fs::create_dir_all(&config.files.data_dir());
-            let _ = fs::create_dir_all(&config.files.hdx_dir());
-            let _ = fs::create_dir_all(&config.files.odx_dir());
+            let _ = fs::create_dir_all(config.files.data_dir());
+            let _ = fs::create_dir_all(config.files.hdx_dir());
+            let _ = fs::create_dir_all(config.files.odx_dir());
         }
         let hasher = S::default();
         let (mut data_file, header) =
             Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
-        let hdx_index = HdxIndex::open_hdx_file(&header, config.clone(), &hasher)
-            .map_err(OpenError::IndexFileOpen)?;
+        let hdx_index = match HdxIndex::open_hdx_file(&header, config.clone(), &hasher) {
+            Ok(index) => index,
+            Err(err) => {
+                return if auto_recover {
+                    Self::reindex(config)
+                } else {
+                    Err(OpenError::IndexFileOpen(err))
+                };
+            }
+        };
         let write_buffer = if config.write {
             Vec::with_capacity(config.write_buffer_size as usize)
         } else {
@@ -236,9 +269,7 @@ where
         // Prime the read buffer so we don't have to check if it is empty, etc.
         let mut read_buffer_len = 0_usize;
         if data_file_end > 0 {
-            data_file
-                .seek(SeekFrom::Start(0))
-                .map_err(OpenError::Seek)?;
+            data_file.rewind().map_err(OpenError::Seek)?;
             if data_file_end < config.read_buffer_size as u64 {
                 data_file
                     .read_exact(&mut read_buffer[..data_file_end as usize])
@@ -251,25 +282,32 @@ where
                 read_buffer_len = config.read_buffer_size as usize;
             }
         }
-        // TODO, crosscheck all the headers and make sure everything checks out.
-        Ok(Self {
-            header,
-            data_file,
-            data_file_end,
-            hasher,
-            hdx_index,
-            key_buffer: Vec::new(),
-            value_buffer: Vec::new(),
-            write_buffer,
-            read_buffer,
-            read_buffer_start: 0,
-            read_buffer_len,
-            seek_pos: 0,
-            config,
-            failed: false,
-            _key: PhantomData,
-            _value: PhantomData,
-        })
+        if require_hdx_check && data_file_end != hdx_index.header().data_file_length() {
+            if auto_recover {
+                Self::reindex(config)
+            } else {
+                Err(OpenError::InvalidShutdown)
+            }
+        } else {
+            Ok(Self {
+                header,
+                data_file,
+                data_file_end,
+                hasher,
+                hdx_index,
+                key_buffer: Vec::new(),
+                value_buffer: Vec::new(),
+                write_buffer,
+                read_buffer,
+                read_buffer_start: 0,
+                read_buffer_len,
+                seek_pos: 0,
+                config,
+                failed: false,
+                _key: PhantomData,
+                _value: PhantomData,
+            })
+        }
     }
 
     /// Will destroy the existing index for DB and rebuild it based on the data file.
@@ -281,7 +319,7 @@ where
         let _ = fs::remove_file(&config.files.hdx_path());
         let _ = fs::remove_file(&config.files.odx_path());
 
-        let mut db = Self::open(config)?;
+        let mut db = Self::open_internal(config, false, false)?;
 
         let mut iter = db.raw_iter().map_err(OpenError::DataFileOpen)?;
         let mut record_pos = iter.position().map_err(OpenError::Seek)?;
@@ -309,6 +347,7 @@ where
             db.data_file
                 .set_len(prev_record_pos)
                 .map_err(OpenError::Seek)?;
+            db.data_file_end = prev_record_pos;
             let config = db.config.clone();
             // Need to drop and reopen after a truncate or the write position will be past the end.
             drop(db);
@@ -559,15 +598,15 @@ where
                 .write(true)
                 .create(config.create)
                 .truncate(true)
-                .open(&config.files.data_path())?;
+                .open(config.files.data_path())?;
         }
         let mut file = OpenOptions::new()
             .read(true)
             .append(config.write)
             .create(config.create && config.write)
-            .open(&config.files.data_path())?;
+            .open(config.files.data_path())?;
         file.seek(SeekFrom::End(0))?;
-        let file_end = file.seek(SeekFrom::Current(0))?;
+        let file_end = file.stream_position()?;
 
         let header = if file_end == 0 {
             let header = DataHeader::new(config);
@@ -647,7 +686,7 @@ where
         reader.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
-        self.key_buffer.resize(key_size as usize, 0);
+        self.key_buffer.resize(key_size, 0);
         reader.read_exact(&mut self.key_buffer[..])?;
         crc32_hasher.update(&self.key_buffer);
         let key = K::deserialize(&self.key_buffer[..]).map_err(FetchError::DeserializeKey)?;
@@ -903,8 +942,8 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0..max {
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+            let item = db.fetch(&i);
+            assert!(item.is_ok(), "Failed on item {i}, {item:?}");
             assert_eq!(&item.unwrap(), &val);
         }
         println!(
@@ -925,8 +964,8 @@ mod tests {
         println!("XXXX iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
         for i in 0..max {
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}", i);
+            let item = db.fetch(&i);
+            assert!(item.is_ok(), "Failed on item {i}");
             assert_eq!(&item.unwrap(), &val);
         }
         println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
@@ -949,15 +988,15 @@ mod tests {
             assert_eq!(db.len(), max as usize);
 
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}, {item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
 
             db.commit().unwrap();
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}", i);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}");
                 assert_eq!(&item.unwrap(), &val);
             }
         }
@@ -966,8 +1005,8 @@ mod tests {
             let mut db = DbCore::<u64, Vec<u8>, 8>::reindex(config.clone()).unwrap();
             assert_eq!(db.len(), max as usize);
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}/{item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
         }
@@ -979,7 +1018,7 @@ mod tests {
             let data_len = data_file.seek(SeekFrom::End(0)).unwrap();
             data_file.set_len(data_len - 16).unwrap(); // Truncate the file making the last record corrupt.
         }
-        let db = DbCore::<u64, Vec<u8>, 8>::reindex(config).unwrap();
+        let db = DbCore::<u64, Vec<u8>, 8>::open_with_recover(config).unwrap();
         assert_eq!(db.len(), max as usize - 1);
         let vals: Vec<Vec<u8>> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
         // Make sure the last record was removed (corrupted).
@@ -1007,15 +1046,15 @@ mod tests {
             assert_eq!(db.len(), max as usize);
 
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}, {item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
 
             db.commit().unwrap();
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}", i);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}");
                 assert_eq!(&item.unwrap(), &val);
             }
         }
@@ -1024,8 +1063,8 @@ mod tests {
             let mut db = DbCore::<u64, Vec<u8>, 8>::open(config.clone().create()).unwrap();
             assert_eq!(db.len(), max as usize);
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}/{item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
             db.destroy();
@@ -1053,15 +1092,15 @@ mod tests {
             assert_eq!(db.len(), max as usize);
 
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}, {item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
 
             db.commit().unwrap();
             for i in 0..max {
-                let item = db.fetch(&(i as u64));
-                assert!(item.is_ok(), "Failed on item {}", i);
+                let item = db.fetch(&i);
+                assert!(item.is_ok(), "Failed on item {i}");
                 assert_eq!(&item.unwrap(), &val);
             }
             db.rename("xxx_rename2").unwrap();
@@ -1074,8 +1113,8 @@ mod tests {
         let mut db = DbCore::<u64, Vec<u8>, 8>::open(config.create()).unwrap();
         assert_eq!(db.len(), max as usize);
         for i in 0..max {
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+            let item = db.fetch(&i);
+            assert!(item.is_ok(), "Failed on item {i}/{item:?}");
             assert_eq!(&item.unwrap(), &val);
         }
         assert!(matches!(
@@ -1124,7 +1163,7 @@ mod tests {
         let max = 1_000_000;
         let start = time::Instant::now();
         for i in 0_u64..max {
-            db.insert(i, &format!("Value {}", i)).unwrap();
+            db.insert(i, &format!("Value {i}")).unwrap();
             if i % 100_000 == 0 {
                 db.commit().unwrap();
             }
@@ -1139,9 +1178,9 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0..max {
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(&(i));
+            assert!(item.is_ok(), "Failed on item {i}, {item:?}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
         }
         println!(
             "XXXX fetch (pre commit) time {}",
@@ -1156,15 +1195,15 @@ mod tests {
         let vals: Vec<String> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
         assert_eq!(vals.len(), max as usize);
         for (i, v) in vals.iter().enumerate() {
-            assert_eq!(v, &format!("Value {}", i));
+            assert_eq!(v, &format!("Value {i}"));
         }
         println!("XXXX iter time {}", start.elapsed().as_secs_f64());
         let start = time::Instant::now();
         //assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
         for i in 0..max {
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}", i);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(&i);
+            assert!(item.is_ok(), "Failed on item {i}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
         }
         println!("XXXX fetch time {}", start.elapsed().as_secs_f64());
 
@@ -1172,7 +1211,7 @@ mod tests {
         //assert_eq!(&db.fetch(&35_000).unwrap(), "Value 35000");
         for i in 1..=max {
             //if i % 10_000 == 0 {println!("XXXXX fetching {}", max - i as u64); }
-            let item = db.fetch(&(max - i as u64));
+            let item = db.fetch(&(max - i));
             assert!(item.is_ok(), "Failed on item {}", max - i);
             assert_eq!(&item.unwrap(), &format!("Value {}", max - i));
         }
@@ -1183,11 +1222,11 @@ mod tests {
         let max_val = max - 1;
         for i in 0..(max / 2) {
             //if i % 10_000 == 0 {println!("XXXXX fetching {}", max - i as u64); }
-            let item = db.fetch(&(i as u64));
-            assert!(item.is_ok(), "Failed on item {}", i);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(&(i));
+            assert!(item.is_ok(), "Failed on item {i}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
 
-            let item = db.fetch(&(max_val - i as u64));
+            let item = db.fetch(&(max_val - i));
             assert!(item.is_ok(), "Failed on item {}", max_val - i);
             assert_eq!(&item.unwrap(), &format!("Value {}", max_val - i));
         }
@@ -1203,7 +1242,7 @@ mod tests {
                 .build()
                 .unwrap();
         for i in 0..50_000 {
-            db.insert(format!("key {i}"), &format!("Value {}", i))
+            db.insert(format!("key {i}"), &format!("Value {i}"))
                 .unwrap();
         }
         assert_eq!(db.len(), 50_000);
@@ -1211,14 +1250,14 @@ mod tests {
         let vals: Vec<String> = db.raw_iter().unwrap().map(|r| r.unwrap().1).collect();
         assert_eq!(vals.len(), 50_000);
         for (i, v) in vals.iter().enumerate() {
-            assert_eq!(v, &format!("Value {}", i));
+            assert_eq!(v, &format!("Value {i}"));
         }
         assert_eq!(&db.fetch(&"key 35000".to_string()).unwrap(), "Value 35000");
         for i in 0..50_000 {
             assert_eq!(
                 &db.fetch(&format!("key {i}"))
-                    .unwrap_or_else(|e| panic!("Failed to read item {}, {}", i, e)),
-                &format!("Value {}", i)
+                    .unwrap_or_else(|e| panic!("Failed to read item {i}, {e}")),
+                &format!("Value {i}")
             );
         }
         db.destroy();

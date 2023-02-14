@@ -72,7 +72,7 @@ impl HdxHeader {
         } else {
             header_size as usize
         };
-        hdx_file.seek(SeekFrom::Start(0))?;
+        hdx_file.rewind()?;
         let mut buffer = vec![0_u8; header_size];
         let mut buf16 = [0_u8; 2];
         let mut buf32 = [0_u8; 4];
@@ -139,7 +139,7 @@ impl HdxHeader {
 
     /// Write this header to sync at current seek position.
     fn write_header(&mut self, hdx_file: &mut File) -> Result<(), io::Error> {
-        hdx_file.seek(SeekFrom::Start(0))?;
+        hdx_file.rewind()?;
         let header_size = self.header_size();
         let mut buffer = vec![0_u8; header_size];
         let mut pos = 0;
@@ -231,10 +231,11 @@ impl HdxHeader {
     }
 
     /// How long this index thinks the data file is.
-    pub fn _data_file_length(&self) -> u64 {
+    pub fn data_file_length(&self) -> u64 {
         self.data_file_length
     }
 }
+
 /// Header for an hdx (index) file.  This contains the hash buckets for lookups.
 /// This file is not a log file and the header and buckets will change in place over time.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
@@ -349,10 +350,7 @@ where
     /// can also lead to undefined behaviour if an iterator is in use (odx_file is never recreated at
     /// time of writing).  In short use these iterators locally and let them go- never save or return
     /// them to a public API.
-    pub(crate) unsafe fn bucket_iter<'a, 'b>(
-        &'a mut self,
-        bucket: u64,
-    ) -> BucketIter<'b, dyn ReadSeek> {
+    pub(crate) unsafe fn bucket_iter<'b>(&mut self, bucket: u64) -> BucketIter<'b, dyn ReadSeek> {
         // Turn odx_file into a reference to a Read + Seek trait.
         // Need this to break away the odx file lifetime to use in the iter.
         // The ODX file should not change under the iterator and is therefore safe.

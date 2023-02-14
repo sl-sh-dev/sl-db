@@ -29,10 +29,10 @@ impl Error for CommitError {}
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::Flush(e) => write!(f, "flush: {}", e),
-            Self::DataFileSync(io_err) => write!(f, "data sync: {}", io_err),
-            Self::IndexFileSync(io_err) => write!(f, "index sync: {}", io_err),
-            Self::PreviousInsertFailed(err) => write!(f, "insert failed: {}", err),
+            Self::Flush(e) => write!(f, "flush: {e}"),
+            Self::DataFileSync(io_err) => write!(f, "data sync: {io_err}"),
+            Self::IndexFileSync(io_err) => write!(f, "index sync: {io_err}"),
+            Self::PreviousInsertFailed(err) => write!(f, "insert failed: {err}"),
             Self::SendChannelClosed => write!(f, "send channel closed"),
             Self::ReceiveFailed => write!(f, "receive failed"),
             Self::ReadOnly => write!(f, "receive failed"),

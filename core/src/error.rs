@@ -94,8 +94,8 @@ impl Error for ReadKeyError {}
 impl fmt::Display for ReadKeyError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::IO(io_err) => write!(f, "io: {}", io_err),
-            Self::DeserializeKey(msg) => write!(f, "deserialize key: {}", msg),
+            Self::IO(io_err) => write!(f, "io: {io_err}"),
+            Self::DeserializeKey(msg) => write!(f, "deserialize key: {msg}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
         }
     }
@@ -131,9 +131,9 @@ impl Error for CommitError {}
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::Flush(e) => write!(f, "flush: {}", e),
-            Self::DataFileSync(io_err) => write!(f, "data sync: {}", io_err),
-            Self::IndexFileSync(io_err) => write!(f, "index sync: {}", io_err),
+            Self::Flush(e) => write!(f, "flush: {e}"),
+            Self::DataFileSync(io_err) => write!(f, "data sync: {io_err}"),
+            Self::IndexFileSync(io_err) => write!(f, "index sync: {io_err}"),
             Self::ReadOnly => write!(f, "read only"),
         }
     }
@@ -174,7 +174,7 @@ impl fmt::Display for LoadHeaderError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
             Self::InvalidType => write!(f, "invalid type id"),
-            Self::IO(e) => write!(f, "io: {}", e),
+            Self::IO(e) => write!(f, "io: {e}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
             Self::InvalidVersion => write!(f, "invalid version (should be 0)"),
             Self::InvalidAppNum => write!(f, "invalid appnum"),
@@ -210,6 +210,8 @@ pub enum OpenError {
     RebuildIndex(InsertError),
     /// Tried to open using files that were invalid for some reason.
     InvalidFiles,
+    /// DB was not closed cleanly (data file length and index record mismatch).
+    InvalidShutdown,
 }
 
 impl Error for OpenError {}
@@ -217,12 +219,13 @@ impl Error for OpenError {}
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::DataFileOpen(e) => write!(f, "data open failed: {}", e),
-            Self::DataReadError(e) => write!(f, "data read failed: {}", e),
-            Self::IndexFileOpen(e) => write!(f, "index open failed: {}", e),
-            Self::Seek(e) => write!(f, "seek: {}", e),
-            Self::RebuildIndex(e) => write!(f, "rebuild index: {}", e),
+            Self::DataFileOpen(e) => write!(f, "data open failed: {e}"),
+            Self::DataReadError(e) => write!(f, "data read failed: {e}"),
+            Self::IndexFileOpen(e) => write!(f, "index open failed: {e}"),
+            Self::Seek(e) => write!(f, "seek: {e}"),
+            Self::RebuildIndex(e) => write!(f, "rebuild index: {e}"),
             Self::InvalidFiles => write!(f, "invalid files"),
+            Self::InvalidShutdown => write!(f, "invalid shutdown"),
         }
     }
 }
@@ -247,9 +250,9 @@ impl Error for FetchError {}
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self {
-            Self::DeserializeKey(e) => write!(f, "deserialize key: {}", e),
-            Self::DeserializeValue(e) => write!(f, "deserialize value: {}", e),
-            Self::IO(e) => write!(f, "io: {}", e),
+            Self::DeserializeKey(e) => write!(f, "deserialize key: {e}"),
+            Self::DeserializeValue(e) => write!(f, "deserialize value: {e}"),
+            Self::IO(e) => write!(f, "io: {e}"),
             Self::NotFound => write!(f, "not found"),
             Self::CrcFailed => write!(f, "crc32 mismatch"),
         }

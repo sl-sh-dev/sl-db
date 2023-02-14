@@ -5,7 +5,7 @@ use crate::db_config::DbConfig;
 use crate::error::LoadHeaderError;
 use crate::fxhasher::FxHasher;
 use std::hash::Hasher;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::time::UNIX_EPOCH;
 use std::{io, time};
 
@@ -51,7 +51,7 @@ impl DataHeader {
 
     /// Load a DataHeader from source.
     pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
-        source.seek(SeekFrom::Start(0))?;
+        source.rewind()?;
         let mut buffer = [0_u8; DATA_HEADER_BYTES];
         let mut buf16 = [0_u8; 2];
         let mut buf32 = [0_u8; 4];

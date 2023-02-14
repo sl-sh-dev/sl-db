@@ -9,7 +9,7 @@ use crate::error::LoadHeaderError;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek};
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -71,7 +71,7 @@ where
 
     /// Return the current position of the data file.
     pub fn position(&mut self) -> io::Result<u64> {
-        self.file.seek(SeekFrom::Current(0))
+        self.file.stream_position()
     }
 
     /// Read the next record or return an error if an overflow bucket.
@@ -110,7 +110,7 @@ where
         }
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
-        buffer.resize(key_size as usize, 0);
+        buffer.resize(key_size, 0);
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
         let key = K::deserialize(&buffer[..]).map_err(FetchError::DeserializeKey)?;

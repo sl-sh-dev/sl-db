@@ -68,10 +68,11 @@ where
     /// Open a new or reopen an existing database.
     /// The config must not contain explicit file paths, this will return an InvalidFiles error.
     /// This restriction is because it shards the DB into multiple sub-DBs.
+    /// Will attempt to recover a DB with a damaged index (will reindex).
     pub fn open(config: DbConfig, channel_depth: usize) -> Result<Self, OpenError> {
         let config = config.no_auto_flush(); // Wrapper needs to control commit.
 
-        let db = DbCore::open(config.clone())?;
+        let db = DbCore::open_with_recover(config.clone())?;
         let read_db = Arc::new(Mutex::new(DbCore::open(config.clone().read_only())?));
         let (insert_tx, insert_rx) = mpsc::channel(channel_depth);
         let write_cache = Arc::new(DashMap::with_hasher(S::default()));
@@ -298,7 +299,7 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0_u64..max {
-            db.insert(i, format!("Value {}", i)).await;
+            db.insert(i, format!("Value {i}")).await;
             if i % 100_000 == 0 {
                 db.commit_bg().await; //.unwrap();
                                       //db.commit().await.unwrap();
@@ -318,13 +319,12 @@ mod tests {
 
         let start = time::Instant::now();
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(i).await;
+            assert!(item.is_ok(), "Failed on item {i}, {item:?}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
         }
         println!(
-            "XXXX TOK ALT fetch ({}) (pre commit) time {}",
-            max,
+            "XXXX TOK ALT fetch ({max}) (pre commit) time {}",
             start.elapsed().as_secs_f64()
         );
 
@@ -343,9 +343,9 @@ mod tests {
         let start = time::Instant::now();
         //let mut fetch_set = JoinSet::new();
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
-            assert_eq!(&item.unwrap(), &format!("Value {}", i));
+            let item = db.fetch(i).await;
+            assert!(item.is_ok(), "Failed on item {i}, {item:?}");
+            assert_eq!(&item.unwrap(), &format!("Value {i}"));
             //let db_clone = db.clone();
             //fetch_set.spawn(async move {
             //    let item = db_clone.fetch(i as u64).await;
@@ -377,16 +377,16 @@ mod tests {
             }
 
             for i in 0..max {
-                let item = db.fetch(i as u64).await;
-                assert!(item.is_ok(), "Failed on item {}, {:?}", i, item);
+                let item = db.fetch(i).await;
+                assert!(item.is_ok(), "Failed on item {i}, {item:?}");
                 assert_eq!(&item.unwrap(), &val);
             }
 
             db.commit().await.unwrap();
             assert_eq!(db.len().await, max as usize);
             for i in 0..max {
-                let item = db.fetch(i as u64).await;
-                assert!(item.is_ok(), "Failed on item {}", i);
+                let item = db.fetch(i).await;
+                assert!(item.is_ok(), "Failed on item {i}");
                 assert_eq!(&item.unwrap(), &val);
             }
             db.rename("xxx_rename2").unwrap();
@@ -400,8 +400,8 @@ mod tests {
         let db = AsyncAltDb::<u64, Vec<u8>, 8>::open(config.create(), 1000).unwrap();
         assert_eq!(db.len().await, max as usize);
         for i in 0..max {
-            let item = db.fetch(i as u64).await;
-            assert!(item.is_ok(), "Failed on item {}/{:?}", i, item);
+            let item = db.fetch(i).await;
+            assert!(item.is_ok(), "Failed on item {i}/{item:?}");
             assert_eq!(&item.unwrap(), &val);
         }
         assert!(db.rename("xxx_rename3").is_err());

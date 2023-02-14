@@ -37,13 +37,13 @@ impl OdxHeader {
                 .write(true)
                 .create(config.create)
                 .truncate(true)
-                .open(&config.files.odx_path())?;
+                .open(config.files.odx_path())?;
         }
         let mut file = OpenOptions::new()
             .read(true)
             .append(config.write)
             .create(config.create && config.write)
-            .open(&config.files.odx_path())?;
+            .open(config.files.odx_path())?;
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
@@ -95,7 +95,7 @@ impl OdxHeader {
         } else {
             bucket_size as usize
         };
-        source.seek(SeekFrom::Start(0))?;
+        source.rewind()?;
         let mut buffer = vec![0_u8; header_size];
         let mut buf16 = [0_u8; 2];
         let mut buf64 = [0_u8; 8];
