@@ -504,10 +504,10 @@ where
     }
 
     pub fn sync(&mut self) -> Result<(), CommitError> {
-        self.hdx_file
+        self.odx_file
             .sync_all()
             .map_err(CommitError::IndexFileSync)?;
-        self.odx_file
+        self.hdx_file
             .sync_all()
             .map_err(CommitError::IndexFileSync)?;
         Ok(())
@@ -516,13 +516,10 @@ where
     /// Add buckets to expand capacity.
     /// Capacity is number of elements per bucket * number of buckets.
     /// If current length >= capacity * load factor then split buckets until this is not true.
-    pub fn expand_buckets(
-        &mut self,
-        read_key: &mut dyn FnMut(u64) -> Result<K, ReadKeyError>,
-    ) -> Result<(), InsertError> {
+    pub fn expand_buckets(&mut self) -> Result<(), InsertError> {
         if self.config.allow_bucket_expansion {
             while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
-                self.split_one_bucket(read_key)?;
+                self.split_one_bucket()?;
                 self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
             }
         }
@@ -532,10 +529,7 @@ where
     /// Add one new bucket to the hash index.
     /// Buckets are split "in order" determined by the current modulus not based on how full any
     /// bucket is.
-    fn split_one_bucket(
-        &mut self,
-        read_key: &mut dyn FnMut(u64) -> Result<K, ReadKeyError>,
-    ) -> Result<(), InsertError> {
+    fn split_one_bucket(&mut self) -> Result<(), InsertError> {
         let old_modulus = self.modulus;
         // This is the bucket that is being split.
         let split_bucket = (self.buckets() - (old_modulus / 2)) as u64;
@@ -563,10 +557,10 @@ where
                     );
                 }
                 if bucket == split_bucket {
-                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer, read_key)
+                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer, None)
                         .map_err(|_| InsertError::IndexOverflow)?;
                 } else {
-                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer2, read_key)
+                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer2, None)
                         .map_err(|_| InsertError::IndexOverflow)?;
                 }
             }
@@ -590,8 +584,13 @@ where
         let bucket = self.hash_to_bucket(hash);
         let mut buffer = self.remove_bucket(bucket)?;
 
-        let result =
-            self.save_to_bucket_buffer(Some(key), hash, record_pos, &mut buffer[..], read_key);
+        let result = self.save_to_bucket_buffer(
+            Some(key),
+            hash,
+            record_pos,
+            &mut buffer[..],
+            Some(read_key),
+        );
         // Need to make sure the bucket goes into the cache even on error.
         self.dirty_bucket_cache.insert(bucket, buffer);
         result
@@ -605,7 +604,7 @@ where
         hash: u64,
         record_pos: u64,
         buffer: &mut [u8],
-        read_key: &mut dyn FnMut(u64) -> Result<K, ReadKeyError>,
+        mut read_key: Option<&mut dyn FnMut(u64) -> Result<K, ReadKeyError>>,
     ) -> Result<(), InsertError> {
         let mut pos = 8; // Skip the overflow file pos.
         for i in 0..self.header.bucket_elements() as u64 {
@@ -627,7 +626,7 @@ where
                 return Ok(());
             }
             if rec_hash == hash {
-                if let Some(key) = key {
+                if let (Some(key), Some(read_key)) = (key, &mut read_key) {
                     if let Ok(rkey) = read_key(rec_pos) {
                         if &rkey == key {
                             if self.config.allow_duplicate_inserts {

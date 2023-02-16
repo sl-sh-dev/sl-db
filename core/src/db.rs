@@ -188,6 +188,7 @@ where
     data_file_end: u64,
     hasher: S,
     key_buffer: Vec<u8>,
+    key_buffer_read: Vec<u8>,
     value_buffer: Vec<u8>,
     write_buffer: Vec<u8>,
     read_buffer: Vec<u8>,
@@ -296,6 +297,7 @@ where
                 hasher,
                 hdx_index,
                 key_buffer: Vec::new(),
+                key_buffer_read: Vec::new(),
                 value_buffer: Vec::new(),
                 write_buffer,
                 read_buffer,
@@ -434,7 +436,6 @@ where
     fn insert_inner(&mut self, key: K, value: &V) -> Result<(), InsertError> {
         let record_pos = self.data_file_end + self.write_buffer.len() as u64;
         let hash = self.hash(&key);
-        let mut crc32_hasher = crc32fast::Hasher::new();
 
         // Try to serialize the key and value and error out before saving anything if that fails.
         key.serialize(&mut self.key_buffer)
@@ -446,6 +447,14 @@ where
         // Go ahead and expand the index if needed and return an error before we save anything.
         self.expand_buckets()?;
 
+        // Save the key to the index, do this now so the data file will not have been written if the
+        // index update fails.
+        self.save_to_bucket(&key, hash, record_pos)?;
+        // Since the inserted data will still be "available" even after an error after this point go
+        // ahead and increment the values.
+        self.hdx_index.inc_values();
+
+        let mut crc32_hasher = crc32fast::Hasher::new();
         // If we have a variable sized key write it's size otherwise no need.
         if K::is_variable_key_size() {
             let key_size = (self.key_buffer.len() as u16).to_le_bytes();
@@ -481,13 +490,6 @@ where
         let crc32 = crc32_hasher.finalize();
         self.write_all(&crc32.to_le_bytes())?;
 
-        // Save the key to the index, do this now so the data file will not have been written if the
-        // index update fails.
-        self.save_to_bucket(&key, hash, record_pos)?;
-
-        // Since the inserted data will still be "available" even after an error after this point go
-        // ahead and increment the values.
-        self.hdx_index.inc_values();
         Ok(())
     }
 
@@ -636,13 +638,7 @@ where
     /// Capacity is number of elements per bucket * number of buckets.
     /// If current length >= capacity * load factor then split buckets until this is not true.
     fn expand_buckets(&mut self) -> Result<(), InsertError> {
-        let unsafe_db: &mut DbInner<K, V, KSIZE, S> = unsafe {
-            (self as *mut DbInner<K, V, KSIZE, S>)
-                .as_mut()
-                .expect("this can't be null")
-        };
-        self.hdx_index
-            .expand_buckets(&mut |pos| unsafe_db.read_key(pos))
+        self.hdx_index.expand_buckets()
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
@@ -686,10 +682,10 @@ where
         reader.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
-        self.key_buffer.resize(key_size, 0);
-        reader.read_exact(&mut self.key_buffer[..])?;
-        crc32_hasher.update(&self.key_buffer);
-        let key = K::deserialize(&self.key_buffer[..]).map_err(FetchError::DeserializeKey)?;
+        self.key_buffer_read.resize(key_size, 0);
+        reader.read_exact(&mut self.key_buffer_read[..])?;
+        crc32_hasher.update(&self.key_buffer_read);
+        let key = K::deserialize(&self.key_buffer_read[..]).map_err(FetchError::DeserializeKey)?;
         self.value_buffer.resize(val_size as usize, 0);
         reader.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);
@@ -727,11 +723,11 @@ where
         } else {
             K::KEY_SIZE as usize
         };
-        self.key_buffer.resize(key_size, 0);
-        self.seek(SeekFrom::Current(4))?;
-        reader.read_exact(&mut self.key_buffer[..])?;
+        self.key_buffer_read.resize(key_size, 0);
         // Skip the value size and read the key.
-        let key = K::deserialize(&self.key_buffer[..])?;
+        self.seek(SeekFrom::Current(4))?;
+        reader.read_exact(&mut self.key_buffer_read[..])?;
+        let key = K::deserialize(&self.key_buffer_read[..])?;
 
         Ok(key)
     }
