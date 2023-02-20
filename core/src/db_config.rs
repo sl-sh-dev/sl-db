@@ -172,7 +172,7 @@ impl DbConfig {
     }
 
     /// Sets the elements in each bucket to bucket_elements.  Will set bucket_size to
-    /// 8 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements).
+    /// 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements).
     /// Calling this will overwrite values set by set_bucket_size, and vice-versa.
     pub fn set_bucket_elements(mut self, bucket_elements: u16) -> Self {
         self.bucket_elements = bucket_elements;

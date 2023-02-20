@@ -1,6 +1,6 @@
 //! Implemts the iterator for a buckets elements.  This also handles overflow buckets and allows
-//! buckets to accessed without worring about underlying structure or files.
-//! NOTE: This is ONLY appropropriate for the core DB.
+//! buckets to accessed without worrying about underlying structure or files.
+//! NOTE: This is ONLY appropriate for the core DB.
 
 use crate::crc::check_crc;
 use crate::db::data_header::BUCKET_ELEMENT_SIZE;
@@ -12,15 +12,18 @@ pub(crate) struct BucketIter<'src, R: Read + Seek + ?Sized> {
     buffer: Vec<u8>,
     bucket_pos: usize,
     overflow_pos: u64,
-    elements: u16,
+    elements: u32,
     crc_failure: bool,
 }
 
 impl<'src, R: Read + Seek + ?Sized> BucketIter<'src, R> {
-    pub(super) fn new(odx_file: &'src mut R, buffer: Vec<u8>, elements: u16) -> Self {
+    pub(super) fn new(odx_file: &'src mut R, buffer: Vec<u8>) -> Self {
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
         let overflow_pos = u64::from_le_bytes(buf);
+        let mut buf = [0_u8; 4]; // buffer for converting to u32s (needs an array)
+        buf.copy_from_slice(&buffer[8..12]);
+        let elements = u32::from_le_bytes(buf);
         let crc_failure = !check_crc(&buffer);
         Self {
             odx_file,
@@ -48,19 +51,15 @@ impl<'src, R: Read + Seek + ?Sized> Iterator for &mut BucketIter<'src, R> {
         let mut buf64 = [0_u8; 8];
         loop {
             if self.bucket_pos < self.elements as usize {
-                let mut pos = 8 + (self.bucket_pos * BUCKET_ELEMENT_SIZE);
+                // 12- 8 bytes for overflow position and 4 for the elements in the bucket.
+                let mut pos = 12 + (self.bucket_pos * BUCKET_ELEMENT_SIZE);
                 buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
                 let hash = u64::from_le_bytes(buf64);
                 pos += 8;
                 buf64.copy_from_slice(&self.buffer[pos..(pos + 8)]);
                 let rec_pos = u64::from_le_bytes(buf64);
-                if hash == 0 && rec_pos == 0 {
-                    //self.bucket_pos += 1;
-                    self.bucket_pos = self.elements as usize;
-                } else {
-                    self.bucket_pos += 1;
-                    return Some((hash, rec_pos));
-                }
+                self.bucket_pos += 1;
+                return Some((hash, rec_pos));
             } else if self.overflow_pos > 0 {
                 // We have an overflow bucket to search as well.
                 self.odx_file
@@ -74,6 +73,9 @@ impl<'src, R: Read + Seek + ?Sized> Iterator for &mut BucketIter<'src, R> {
                 self.bucket_pos = 0;
                 buf64.copy_from_slice(&self.buffer[0..8]);
                 self.overflow_pos = u64::from_le_bytes(buf64);
+                let mut buf = [0_u8; 4];
+                buf.copy_from_slice(&self.buffer[8..12]);
+                self.elements = u32::from_le_bytes(buf);
             } else {
                 return None;
             }

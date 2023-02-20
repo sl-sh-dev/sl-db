@@ -384,8 +384,7 @@ where
 
         let mut iter = unsafe { self.hdx_index.bucket_iter(bucket) };
         for (rec_hash, rec_pos) in &mut iter {
-            // rec_pos > 0 handles degenerate case of a 0 hash.
-            if hash == rec_hash && rec_pos > 0 {
+            if hash == rec_hash {
                 let (rkey, val) = self.read_record(rec_pos)?;
                 if &rkey == key {
                     return Ok(val);

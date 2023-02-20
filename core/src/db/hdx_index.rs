@@ -343,7 +343,7 @@ where
     }
 
     /// Return an iterator over a buckets elements.
-    /// This is for use within DB functions ONLY.  This provides an iterator with it;s own lifetime
+    /// This is for use within DB functions ONLY.  This provides an iterator with it's own lifetime
     /// to allow it to be used in DbInner without borrowing issues.
     /// Safety: The returned iterator has a reference into self that has a separate lifetime.  This
     /// means that is can not outlive the HdxIndex that created it.  If odx_file is ever recreated that
@@ -361,7 +361,7 @@ where
         };
         // Note, maybe investigate a try_clone on odx_file to get rid of some of the unsafety.
         let buffer = self.get_bucket(bucket);
-        BucketIter::new(odx_reader, buffer, self.header().bucket_elements())
+        BucketIter::new(odx_reader, buffer)
     }
 
     /// Set the data_file_length field.
@@ -597,7 +597,7 @@ where
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    /// If this produces and Error then buffer will contain the same data.
+    /// If this produces an Error then buffer will contain the same data.
     fn save_to_bucket_buffer(
         &mut self,
         key: Option<&K>,
@@ -606,63 +606,101 @@ where
         buffer: &mut [u8],
         mut read_key: Option<&mut dyn FnMut(u64) -> Result<K, ReadKeyError>>,
     ) -> Result<(), InsertError> {
-        let mut pos = 8; // Skip the overflow file pos.
-        for i in 0..self.header.bucket_elements() as u64 {
+        fn read_u64(buffer: &[u8], pos: &mut usize) -> u64 {
             let mut buf64 = [0_u8; 8];
-            buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_hash = u64::from_le_bytes(buf64);
-            pos += 8;
-            buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-            let rec_pos = u64::from_le_bytes(buf64);
-            pos += 8;
-            // Test rec_pos == 0 to handle degenerate case of a hash of 0.
-            // Find an empty element should indicate no more elements (so the key check below is ok).
-            if rec_hash == 0 && rec_pos == 0 {
-                // Seek to the element we found that was empty and write the hash and position into it.
-                let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
-                pos += 8;
-                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                return Ok(());
-            }
-            if rec_hash == hash {
-                if let (Some(key), Some(read_key)) = (key, &mut read_key) {
-                    if let Ok(rkey) = read_key(rec_pos) {
-                        if &rkey == key {
-                            if self.config.allow_duplicate_inserts {
-                                // Overwrite the old element with the new in the index. This will leave
-                                // garbage in the data file but lookups will work and be consistent.
-                                let mut pos = 8 + (i as usize * BUCKET_ELEMENT_SIZE);
-                                buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
-                                pos += 8;
-                                buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                                return Ok(());
-                            } else {
-                                // Don't allow duplicates so error out (caller should roll back insert).
-                                return Err(InsertError::DuplicateKey);
+            buf64.copy_from_slice(&buffer[*pos..(*pos + 8)]);
+            *pos += 8;
+            u64::from_le_bytes(buf64)
+        }
+        fn read_u32(buffer: &[u8], pos: &mut usize) -> u32 {
+            let mut buf32 = [0_u8; 4];
+            buf32.copy_from_slice(&buffer[*pos..(*pos + 4)]);
+            *pos += 4;
+            u32::from_le_bytes(buf32)
+        }
+
+        let mut pos = 8; // Skip the overflow file pos.
+        let elements = read_u32(buffer, &mut pos);
+        // TODO- if not allowing dups then have to check overflow buckets for dups...
+        if elements >= self.header.bucket_elements() as u32 {
+            // Current bucket is full so overflow.
+            // First, save bucket as an overflow record and add to the fresh bucket.
+            let overflow_pos = self
+                .odx_file
+                .seek(SeekFrom::End(0))
+                .map_err(|e| InsertError::KeyError(e.into()))?;
+            add_crc32(buffer);
+            // Write the old buffer into the data file as an overflow record.
+            self.odx_file
+                .write_all(buffer)
+                .map_err(|e| InsertError::KeyError(e.into()))?;
+            // clear buffer and reset to 0.
+            buffer.fill(0);
+            // Copy the position of the overflow record into the first u64.
+            buffer[0..8].copy_from_slice(&overflow_pos.to_le_bytes());
+            buffer[8..12].copy_from_slice(&1_u32.to_le_bytes());
+            // First element will be the hash and position being saved (rest of new bucket is empty).
+            buffer[12..20].copy_from_slice(&hash.to_le_bytes());
+            buffer[20..28].copy_from_slice(&record_pos.to_le_bytes());
+            Ok(())
+        } else if elements == 0 {
+            // Empty bucket, add first element.
+            buffer[8..12].copy_from_slice(&1_u32.to_le_bytes());
+            buffer[12..20].copy_from_slice(&hash.to_le_bytes());
+            buffer[20..28].copy_from_slice(&record_pos.to_le_bytes());
+            Ok(())
+        } else {
+            for i in 0..elements as u64 {
+                let rec_hash = read_u64(buffer, &mut pos);
+                let rec_pos = read_u64(buffer, &mut pos);
+                // Insertion sort to keep the hashes within the bucket sorted for faster searches.
+                // Buckets will likely be have a many elements so this should be a win vs linear
+                // searching.
+                if hash > rec_hash {
+                    // Bump the elements in the bucket buffer.
+                    let new_elements: u32 = elements + 1;
+                    buffer[8..12].copy_from_slice(&new_elements.to_le_bytes());
+                    // Seek to the element we found, insert has and position into it.
+                    let mut pos = 12 + (i as usize * BUCKET_ELEMENT_SIZE);
+                    buffer.copy_within(
+                        pos..(12 + (elements as usize * BUCKET_ELEMENT_SIZE)),
+                        pos + BUCKET_ELEMENT_SIZE,
+                    );
+                    buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
+                    pos += 8;
+                    buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+                    return Ok(());
+                }
+                if rec_hash == hash {
+                    if let (Some(key), Some(read_key)) = (key, &mut read_key) {
+                        if let Ok(rkey) = read_key(rec_pos) {
+                            if &rkey == key {
+                                if self.config.allow_duplicate_inserts {
+                                    // Overwrite the old element with the new in the index. This will leave
+                                    // garbage in the data file but lookups will work and be consistent.
+                                    let mut pos = 12 + (i as usize * BUCKET_ELEMENT_SIZE);
+                                    buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
+                                    pos += 8;
+                                    buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+                                    return Ok(());
+                                } else {
+                                    // Don't allow duplicates so error out (caller should roll back insert).
+                                    return Err(InsertError::DuplicateKey);
+                                }
                             }
                         }
                     }
                 }
             }
+            // Ran out of elements and hash the greatest, so write to end.
+            let new_elements: u32 = elements + 1;
+            buffer[8..12].copy_from_slice(&new_elements.to_le_bytes());
+            // Seek to the element we found, insert has and position into it.
+            let mut pos = 12 + (elements as usize * BUCKET_ELEMENT_SIZE);
+            buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
+            pos += 8;
+            buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+            Ok(())
         }
-        // false, save bucket as an overflow record and add to the fresh bucket.
-        let overflow_pos = self
-            .odx_file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| InsertError::KeyError(e.into()))?;
-        add_crc32(buffer);
-        // Write the old buffer into the data file as an overflow record.
-        self.odx_file
-            .write_all(buffer)
-            .map_err(|e| InsertError::KeyError(e.into()))?;
-        // clear buffer and reset to 0.
-        buffer.fill(0);
-        // Copy the position of the overflow record into the first u64.
-        buffer[0..8].copy_from_slice(&overflow_pos.to_le_bytes());
-        // First element will be the hash and position being saved (rest of new bucket is empty).
-        buffer[8..16].copy_from_slice(&hash.to_le_bytes());
-        buffer[16..24].copy_from_slice(&record_pos.to_le_bytes());
-        Ok(())
     }
 }
