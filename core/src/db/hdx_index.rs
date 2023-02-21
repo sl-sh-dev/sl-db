@@ -350,7 +350,11 @@ where
     /// can also lead to undefined behaviour if an iterator is in use (odx_file is never recreated at
     /// time of writing).  In short use these iterators locally and let them go- never save or return
     /// them to a public API.
-    pub(crate) unsafe fn bucket_iter<'b>(&mut self, bucket: u64) -> BucketIter<'b, dyn ReadSeek> {
+    pub(crate) unsafe fn bucket_iter<'b>(
+        &mut self,
+        bucket: u64,
+        hash: Option<u64>,
+    ) -> BucketIter<'b, dyn ReadSeek> {
         // Turn odx_file into a reference to a Read + Seek trait.
         // Need this to break away the odx file lifetime to use in the iter.
         // The ODX file should not change under the iterator and is therefore safe.
@@ -361,7 +365,7 @@ where
         };
         // Note, maybe investigate a try_clone on odx_file to get rid of some of the unsafety.
         let buffer = self.get_bucket(bucket);
-        BucketIter::new(odx_reader, buffer)
+        BucketIter::new(odx_reader, buffer, hash)
     }
 
     /// Set the data_file_length field.
@@ -433,7 +437,7 @@ where
     }
 
     /// Return the buffer for bucket, if found in cache then remove and return that buffer vs allocate.
-    pub fn remove_bucket(&mut self, bucket: u64) -> Result<Vec<u8>, InsertError> {
+    fn remove_bucket(&mut self, bucket: u64) -> Result<Vec<u8>, InsertError> {
         if let Some(buf) = self.remove_bucket_cache(bucket) {
             // Get the bucket from the bucket cache.
             Ok(buf)
@@ -543,7 +547,7 @@ where
         let mut buffer = vec![0; bucket_size];
         let mut buffer2 = vec![0; bucket_size];
 
-        let mut iter = unsafe { self.bucket_iter(split_bucket) };
+        let mut iter = unsafe { self.bucket_iter(split_bucket, None) };
         for (rec_hash, rec_pos) in &mut iter {
             if rec_pos > 0 {
                 let bucket = self.hash_to_bucket(rec_hash);
@@ -653,24 +657,6 @@ where
             for i in 0..elements as u64 {
                 let rec_hash = read_u64(buffer, &mut pos);
                 let rec_pos = read_u64(buffer, &mut pos);
-                // Insertion sort to keep the hashes within the bucket sorted for faster searches.
-                // Buckets will likely be have a many elements so this should be a win vs linear
-                // searching.
-                if hash > rec_hash {
-                    // Bump the elements in the bucket buffer.
-                    let new_elements: u32 = elements + 1;
-                    buffer[8..12].copy_from_slice(&new_elements.to_le_bytes());
-                    // Seek to the element we found, insert has and position into it.
-                    let mut pos = 12 + (i as usize * BUCKET_ELEMENT_SIZE);
-                    buffer.copy_within(
-                        pos..(12 + (elements as usize * BUCKET_ELEMENT_SIZE)),
-                        pos + BUCKET_ELEMENT_SIZE,
-                    );
-                    buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
-                    pos += 8;
-                    buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-                    return Ok(());
-                }
                 if rec_hash == hash {
                     if let (Some(key), Some(read_key)) = (key, &mut read_key) {
                         if let Ok(rkey) = read_key(rec_pos) {
@@ -690,6 +676,24 @@ where
                             }
                         }
                     }
+                }
+                // Insertion sort to keep the hashes within the bucket sorted for faster searches.
+                // Buckets will likely be have a many elements so this should be a win vs linear
+                // searching.
+                if hash < rec_hash {
+                    // Bump the elements in the bucket buffer.
+                    let new_elements: u32 = elements + 1;
+                    buffer[8..12].copy_from_slice(&new_elements.to_le_bytes());
+                    // Seek to the element we found, insert has and position into it.
+                    let mut pos = 12 + (i as usize * BUCKET_ELEMENT_SIZE);
+                    buffer.copy_within(
+                        pos..(12 + (elements as usize * BUCKET_ELEMENT_SIZE)),
+                        pos + BUCKET_ELEMENT_SIZE,
+                    );
+                    buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
+                    pos += 8;
+                    buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+                    return Ok(());
                 }
             }
             // Ran out of elements and hash the greatest, so write to end.

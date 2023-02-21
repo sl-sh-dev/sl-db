@@ -382,13 +382,15 @@ where
         let hash = self.hash(key);
         let bucket = self.hdx_index.hash_to_bucket(hash);
 
-        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket) };
+        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket, Some(hash)) };
         for (rec_hash, rec_pos) in &mut iter {
             if hash == rec_hash {
                 let (rkey, val) = self.read_record(rec_pos)?;
                 if &rkey == key {
                     return Ok(val);
                 }
+            } else {
+                panic!("bucket_iter with a hash should only return those hashes")
             }
         }
         if iter.crc_failure() {
@@ -402,7 +404,7 @@ where
     pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
         let hash = self.hash(key);
         let bucket = self.hdx_index.hash_to_bucket(hash);
-        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket) };
+        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket, Some(hash)) };
         for (rec_hash, rec_pos) in &mut iter {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
@@ -1126,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn test_50k() {
+    fn test_50kx() {
         /*let e: Box<dyn std::error::Error + Send + Sync> =
             std::io::Error::new(ErrorKind::Other, "XXX".to_string()).into();
         let e: SourceError = e.into();
@@ -1139,8 +1141,8 @@ mod tests {
             .create()
             .truncate()
             .no_auto_flush()
-            .set_bucket_cache_size(0) //32 * 1024 * 1024)
-            .set_bucket_size(512)
+            //.set_bucket_cache_size(32 * 1024 * 1024)
+            .set_bucket_size(512) //4096)
             //.set_bucket_elements(25)
             //.set_load_factor(0.6)
             .build()

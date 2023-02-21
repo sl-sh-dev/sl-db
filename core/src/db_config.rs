@@ -34,9 +34,10 @@ pub struct DbConfig {
 impl DbConfig {
     /// Create a new config.  Uses the supplied files for name/storage.
     pub fn with_files(files: DbFiles, appnum: u64) -> Self {
-        let initial_buckets = 128;
-        let bucket_size = 512; //12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
-        let bucket_elements = (bucket_size - 12) / BUCKET_ELEMENT_SIZE as u16;
+        let initial_buckets = 32; //128;
+        let bucket_size = 512;
+        // 16- 8 for the overflow position, 4 for the elements and 4 on the end for the crc.
+        let bucket_elements = (bucket_size - 16) / BUCKET_ELEMENT_SIZE as u16;
         Self {
             files,
             appnum,
@@ -51,8 +52,8 @@ impl DbConfig {
             allow_duplicate_inserts: false,
             cache_writes: true,
             auto_flush: true,
-            read_buffer_size: 8 * 1024,          // 8kb default.
-            write_buffer_size: 8 * 1024,         // 8kb default.
+            read_buffer_size: 16 * 1024,         // 16kb default.
+            write_buffer_size: 16 * 1024,        // 16kb default.
             bucket_cache_size: 32 * 1024 * 1024, // 32mb default.
         }
     }
@@ -154,14 +155,15 @@ impl DbConfig {
     /// Calling this will overwrite values set by set_bucket_elements, and vice-versa.
     /// Panics if size is less than 8 + BUCKET_ELEMENT_SIZE.
     pub fn set_bucket_size(mut self, size: u16) -> Self {
-        if size < 12 + BUCKET_ELEMENT_SIZE as u16 {
+        // 16- 8 for the overflow position, 4 for the elements and 4 on the end for the crc.
+        if size < 16 + BUCKET_ELEMENT_SIZE as u16 {
             panic!(
                 "Invalid bucket size, must be at least {}",
-                12 + BUCKET_ELEMENT_SIZE
+                16 + BUCKET_ELEMENT_SIZE
             );
         }
         self.bucket_size = size;
-        self.bucket_elements = (size - 12) / BUCKET_ELEMENT_SIZE as u16;
+        self.bucket_elements = (size - 16) / BUCKET_ELEMENT_SIZE as u16;
         self
     }
 
@@ -172,11 +174,12 @@ impl DbConfig {
     }
 
     /// Sets the elements in each bucket to bucket_elements.  Will set bucket_size to
-    /// 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements).
+    /// 16 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements).
     /// Calling this will overwrite values set by set_bucket_size, and vice-versa.
     pub fn set_bucket_elements(mut self, bucket_elements: u16) -> Self {
         self.bucket_elements = bucket_elements;
-        self.bucket_size = 12 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
+        // 16- 8 for the overflow position, 4 for the elements and 4 on the end for the crc.
+        self.bucket_size = 16 + (BUCKET_ELEMENT_SIZE as u16 * bucket_elements);
         self
     }
 
