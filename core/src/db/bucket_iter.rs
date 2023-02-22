@@ -4,14 +4,18 @@
 
 use crate::crc::check_crc;
 use crate::db::data_header::BUCKET_ELEMENT_SIZE;
+use crate::db::hdx_index::HdxIndex;
+use crate::db_bytes::DbBytes;
+use crate::db_key::DbKey;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Iterates over the (hash, record_position) values contained in a bucket.
-/// If supplied with a hash will only return the has/positions that match hash.
+/// If supplied with a hash will only return the hash/positions that match hash (i.e. hash will always be the same).
 /// Uses a binary search of buckets when given a hash.
-pub(crate) struct BucketIter<'src, R: Read + Seek + ?Sized> {
-    odx_file: &'src mut R,
-    buffer: Vec<u8>,
+pub(crate) struct BucketIter {
+    buffer: &'static Vec<u8>,
+    overflow_buffer: Vec<u8>,
     bucket_pos: usize,
     start_pos: usize,
     end_pos: usize,
@@ -22,8 +26,8 @@ pub(crate) struct BucketIter<'src, R: Read + Seek + ?Sized> {
     crc_failure: bool,
 }
 
-impl<'src, R: Read + Seek + ?Sized> BucketIter<'src, R> {
-    pub(super) fn new(odx_file: &'src mut R, buffer: Vec<u8>, hash: Option<u64>) -> Self {
+impl BucketIter {
+    pub(super) fn new(buffer: &'static Vec<u8>, hash: Option<u64>) -> Self {
         let mut buf = [0_u8; 8]; // buffer for converting to u64s (needs an array)
         buf.copy_from_slice(&buffer[0..8]);
         let overflow_pos = u64::from_le_bytes(buf);
@@ -33,10 +37,9 @@ impl<'src, R: Read + Seek + ?Sized> BucketIter<'src, R> {
         let start_pos = 0;
         let end_pos = elements as usize;
         let bucket_pos = if hash.is_some() { end_pos / 2 } else { 0 };
-        let crc_failure = !check_crc(&buffer);
         Self {
-            odx_file,
             buffer,
+            overflow_buffer: vec![],
             bucket_pos,
             start_pos,
             end_pos,
@@ -44,7 +47,33 @@ impl<'src, R: Read + Seek + ?Sized> BucketIter<'src, R> {
             elements,
             hash,
             hash_found: false,
-            crc_failure,
+            crc_failure: false, // Assume the initial bucket we are provided is valid.
+        }
+    }
+
+    pub(super) fn new_empty() -> Self {
+        let overflow_pos = 0;
+        let elements = 0;
+        let start_pos = 0;
+        let end_pos = elements as usize;
+        let bucket_pos = 0;
+        let overflow_buffer = vec![];
+        let buffer = unsafe {
+            (&overflow_buffer as *const Vec<u8>)
+                .as_ref()
+                .expect("this can't be null")
+        };
+        Self {
+            buffer,
+            overflow_buffer,
+            bucket_pos,
+            start_pos,
+            end_pos,
+            overflow_pos,
+            elements,
+            hash: None,
+            hash_found: false,
+            crc_failure: true, // Force next to always return None.
         }
     }
 
@@ -64,21 +93,20 @@ impl<'src, R: Read + Seek + ?Sized> BucketIter<'src, R> {
         (hash, rec_pos)
     }
 
-    fn reset_next_overflow(&mut self) -> Option<()> {
+    fn reset_next_overflow(&mut self, odx_file: &mut File) -> Option<()> {
+        self.overflow_buffer.resize(self.buffer.len(), 0);
         // For reading u64 values, needs an array.
         let mut buf64 = [0_u8; 8];
-        self.odx_file
-            .seek(SeekFrom::Start(self.overflow_pos))
-            .ok()?;
-        self.odx_file.read_exact(&mut self.buffer[..]).ok()?;
-        if !check_crc(&self.buffer) {
+        odx_file.seek(SeekFrom::Start(self.overflow_pos)).ok()?;
+        odx_file.read_exact(&mut self.overflow_buffer[..]).ok()?;
+        if !check_crc(&self.overflow_buffer) {
             self.crc_failure = true;
             return None;
         }
-        buf64.copy_from_slice(&self.buffer[0..8]);
+        buf64.copy_from_slice(&self.overflow_buffer[0..8]);
         self.overflow_pos = u64::from_le_bytes(buf64);
         let mut buf = [0_u8; 4];
-        buf.copy_from_slice(&self.buffer[8..12]);
+        buf.copy_from_slice(&self.overflow_buffer[8..12]);
         self.hash_found = false;
         self.elements = u32::from_le_bytes(buf);
         self.start_pos = 0;
@@ -88,41 +116,51 @@ impl<'src, R: Read + Seek + ?Sized> BucketIter<'src, R> {
         } else {
             0
         };
+        let buffer = unsafe {
+            (&self.overflow_buffer as *const Vec<u8>)
+                .as_ref()
+                .expect("this can't be null")
+        };
+        self.buffer = buffer;
         Some(())
     }
 }
 
-impl<'src, R: Read + Seek + ?Sized> Iterator for &mut BucketIter<'src, R> {
-    type Item = (u64, u64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.crc_failure {
+impl<K, const KSIZE: u16> HdxIndex<K, KSIZE>
+where
+    K: DbKey<KSIZE> + DbBytes<K>,
+{
+    /// Advance and return the next hash/position for the bucket defined by BucketIter.
+    /// Setup and get a BucketIter with a call to bucket_iter().  If the BucketIter is given a hash
+    /// then all returned hash values will match it (will return the elements that have that hash).
+    pub fn next_bucket_element(&mut self, iter: &mut BucketIter) -> Option<(u64, u64)> {
+        if iter.crc_failure {
             return None;
         }
         loop {
-            if self.elements == 0 {
-                if self.overflow_pos > 0 {
-                    self.reset_next_overflow()?;
+            if iter.elements == 0 {
+                if iter.overflow_pos > 0 {
+                    iter.reset_next_overflow(&mut self.odx_file)?;
                     continue;
                 }
                 return None;
             }
-            if let Some(hash) = self.hash {
-                if self.bucket_pos >= self.elements as usize || self.bucket_pos >= self.end_pos {
-                    if self.overflow_pos > 0 {
-                        self.reset_next_overflow()?;
+            if let Some(hash) = iter.hash {
+                if iter.bucket_pos >= iter.elements as usize || iter.bucket_pos >= iter.end_pos {
+                    if iter.overflow_pos > 0 {
+                        iter.reset_next_overflow(&mut self.odx_file)?;
                         continue;
                     }
                     return None;
                 }
-                let (rec_hash, rec_pos) = self.get_element(self.bucket_pos);
-                if self.hash_found {
+                let (rec_hash, rec_pos) = iter.get_element(iter.bucket_pos);
+                if iter.hash_found {
                     return if rec_hash == hash {
-                        self.bucket_pos += 1;
+                        iter.bucket_pos += 1;
                         Some((rec_hash, rec_pos))
                     } else {
-                        if self.overflow_pos > 0 {
-                            self.reset_next_overflow()?;
+                        if iter.overflow_pos > 0 {
+                            iter.reset_next_overflow(&mut self.odx_file)?;
                             continue;
                         }
                         None
@@ -132,41 +170,41 @@ impl<'src, R: Read + Seek + ?Sized> Iterator for &mut BucketIter<'src, R> {
                     // We might have a run of the same hash so back up to the first one and setup to
                     // produce them all.
                     let (mut rec_hash, mut rec_pos) = (rec_hash, rec_pos);
-                    while self.bucket_pos > 0 && self.bucket_pos >= self.start_pos {
-                        self.bucket_pos -= 1;
-                        let (prev_rec_hash, prev_rec_pos) = self.get_element(self.bucket_pos);
+                    while iter.bucket_pos > 0 && iter.bucket_pos >= iter.start_pos {
+                        iter.bucket_pos -= 1;
+                        let (prev_rec_hash, prev_rec_pos) = iter.get_element(iter.bucket_pos);
                         if prev_rec_hash != hash {
-                            self.bucket_pos += 1;
+                            iter.bucket_pos += 1;
                             break;
                         }
                         (rec_hash, rec_pos) = (prev_rec_hash, prev_rec_pos);
                     }
-                    self.hash_found = true;
-                    self.bucket_pos += 1;
+                    iter.hash_found = true;
+                    iter.bucket_pos += 1;
                     return Some((rec_hash, rec_pos));
                 }
-                if self.start_pos >= self.end_pos {
-                    if self.overflow_pos > 0 {
-                        self.reset_next_overflow()?;
+                if iter.start_pos >= iter.end_pos {
+                    if iter.overflow_pos > 0 {
+                        iter.reset_next_overflow(&mut self.odx_file)?;
                         continue;
                     }
                     return None;
                 } else if hash < rec_hash {
-                    self.end_pos = self.bucket_pos;
-                } else if self.start_pos < self.bucket_pos {
-                    self.start_pos = self.bucket_pos;
+                    iter.end_pos = iter.bucket_pos;
+                } else if iter.start_pos < iter.bucket_pos {
+                    iter.start_pos = iter.bucket_pos;
                 } else {
-                    self.start_pos = self.bucket_pos + 1;
+                    iter.start_pos = iter.bucket_pos + 1;
                 }
-                self.bucket_pos = self.start_pos + ((self.end_pos - self.start_pos) / 2);
+                iter.bucket_pos = iter.start_pos + ((iter.end_pos - iter.start_pos) / 2);
                 continue;
-            } else if self.bucket_pos < self.elements as usize {
-                let (rec_hash, rec_pos) = self.get_element(self.bucket_pos);
-                self.bucket_pos += 1;
+            } else if iter.bucket_pos < iter.elements as usize {
+                let (rec_hash, rec_pos) = iter.get_element(iter.bucket_pos);
+                iter.bucket_pos += 1;
                 return Some((rec_hash, rec_pos));
-            } else if self.overflow_pos > 0 {
+            } else if iter.overflow_pos > 0 {
                 // We have an overflow bucket to search as well.
-                self.reset_next_overflow()?;
+                iter.reset_next_overflow(&mut self.odx_file)?;
             } else {
                 return None;
             }

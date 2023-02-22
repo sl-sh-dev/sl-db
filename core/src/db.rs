@@ -1,6 +1,7 @@
 //! Main module for the SLDB core.  This implements the core sync single threaded access to the DB.
 
 use crate::crc::add_crc32;
+use crate::db::data_file::DataFile;
 use crate::db::data_header::DataHeader;
 use crate::db::hdx_index::HdxIndex;
 use crate::db_bytes::DbBytes;
@@ -14,14 +15,13 @@ use crate::error::ReadKeyError;
 use crate::error::{CommitError, FetchError, LoadHeaderError, OpenError};
 use crate::fxhasher::FxHasher;
 use std::fmt::Debug;
-use std::fs::{File, OpenOptions};
+use std::fs;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
-use std::{fs, io};
 
 mod bucket_iter;
-mod core_io_traits;
+mod data_file;
 pub mod data_header;
 pub mod hdx_index;
 pub mod odx_header;
@@ -184,18 +184,12 @@ where
     S: BuildHasher + Default,
 {
     header: DataHeader,
-    data_file: File,
-    data_file_end: u64,
+    data_file: DataFile,
     hasher: S,
     key_buffer: Vec<u8>,
     key_buffer_read: Vec<u8>,
     value_buffer: Vec<u8>,
-    write_buffer: Vec<u8>,
-    read_buffer: Vec<u8>,
-    read_buffer_start: usize,
-    read_buffer_len: usize,
     hdx_index: HdxIndex<K, KSIZE>,
-    seek_pos: u64,
     config: DbConfig,
     failed: bool,
     _key: PhantomData<K>,
@@ -247,9 +241,7 @@ where
             let _ = fs::create_dir_all(config.files.odx_dir());
         }
         let hasher = S::default();
-        let (mut data_file, header) =
-            Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
-        let data_file_end = data_file.seek(SeekFrom::End(0)).map_err(OpenError::Seek)?;
+        let (data_file, header) = Self::open_data_file(&config).map_err(OpenError::DataFileOpen)?;
         let hdx_index = match HdxIndex::open_hdx_file(&header, config.clone(), &hasher) {
             Ok(index) => index,
             Err(err) => {
@@ -260,30 +252,7 @@ where
                 };
             }
         };
-        let write_buffer = if config.write {
-            Vec::with_capacity(config.write_buffer_size as usize)
-        } else {
-            // If opening read only wont need capacity.
-            Vec::new()
-        };
-        let mut read_buffer = vec![0; config.read_buffer_size as usize];
-        // Prime the read buffer so we don't have to check if it is empty, etc.
-        let mut read_buffer_len = 0_usize;
-        if data_file_end > 0 {
-            data_file.rewind().map_err(OpenError::Seek)?;
-            if data_file_end < config.read_buffer_size as u64 {
-                data_file
-                    .read_exact(&mut read_buffer[..data_file_end as usize])
-                    .map_err(OpenError::DataReadError)?;
-                read_buffer_len = data_file_end as usize;
-            } else {
-                data_file
-                    .read_exact(&mut read_buffer[..])
-                    .map_err(OpenError::DataReadError)?;
-                read_buffer_len = config.read_buffer_size as usize;
-            }
-        }
-        if require_hdx_check && data_file_end != hdx_index.header().data_file_length() {
+        if require_hdx_check && data_file.data_file_end() != hdx_index.header().data_file_length() {
             if auto_recover {
                 Self::reindex(config)
             } else {
@@ -293,17 +262,11 @@ where
             Ok(Self {
                 header,
                 data_file,
-                data_file_end,
                 hasher,
                 hdx_index,
                 key_buffer: Vec::new(),
                 key_buffer_read: Vec::new(),
                 value_buffer: Vec::new(),
-                write_buffer,
-                read_buffer,
-                read_buffer_start: 0,
-                read_buffer_len,
-                seek_pos: 0,
                 config,
                 failed: false,
                 _key: PhantomData,
@@ -349,7 +312,6 @@ where
             db.data_file
                 .set_len(prev_record_pos)
                 .map_err(OpenError::Seek)?;
-            db.data_file_end = prev_record_pos;
             let config = db.config.clone();
             // Need to drop and reopen after a truncate or the write position will be past the end.
             drop(db);
@@ -383,7 +345,7 @@ where
         let bucket = self.hdx_index.hash_to_bucket(hash);
 
         let mut iter = unsafe { self.hdx_index.bucket_iter(bucket, Some(hash)) };
-        for (rec_hash, rec_pos) in &mut iter {
+        while let Some((rec_hash, rec_pos)) = self.hdx_index.next_bucket_element(&mut iter) {
             if hash == rec_hash {
                 let (rkey, val) = self.read_record(rec_pos)?;
                 if &rkey == key {
@@ -405,7 +367,7 @@ where
         let hash = self.hash(key);
         let bucket = self.hdx_index.hash_to_bucket(hash);
         let mut iter = unsafe { self.hdx_index.bucket_iter(bucket, Some(hash)) };
-        for (rec_hash, rec_pos) in &mut iter {
+        while let Some((rec_hash, rec_pos)) = self.hdx_index.next_bucket_element(&mut iter) {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
                 let rkey = self.read_key(rec_pos)?;
@@ -426,16 +388,13 @@ where
     pub fn refresh_index(&mut self) {
         if !self.config.write {
             self.hdx_index.reload_header();
-            self.data_file_end = self
-                .data_file
-                .seek(SeekFrom::End(0))
-                .unwrap_or(self.data_file_end);
+            self.data_file.refresh_data_file_end();
         }
     }
 
     /// Do the actual insert so the public function can rollback easily on an error.
     fn insert_inner(&mut self, key: K, value: &V) -> Result<(), InsertError> {
-        let record_pos = self.data_file_end + self.write_buffer.len() as u64;
+        let record_pos = self.data_file.len();
         let hash = self.hash(&key);
 
         // Try to serialize the key and value and error out before saving anything if that fails.
@@ -460,7 +419,7 @@ where
         if K::is_variable_key_size() {
             let key_size = (self.key_buffer.len() as u16).to_le_bytes();
             // We have to write the key size when variable.
-            self.write_all(&key_size)?;
+            self.data_file.write_all(&key_size)?;
             crc32_hasher.update(&key_size);
         } else if K::KEY_SIZE as usize != self.key_buffer.len() {
             return Err(InsertError::InvalidKeyLength);
@@ -468,28 +427,21 @@ where
         // Once we have written to write_buffer, it needs to be rolled back before returning an error.
         // Space for the value length.
         let value_size = (self.value_buffer.len() as u32).to_le_bytes();
-        self.write_all(&value_size)?;
+        self.data_file.write_all(&value_size)?;
         crc32_hasher.update(&value_size);
 
         {
-            // Turn self into a reference to a Write trait.
-            // Need this to write buffers owned by self.
-            let writer: &mut dyn Write = unsafe {
-                (self as *mut dyn Write)
-                    .as_mut()
-                    .expect("this can't be null")
-            };
             // Write the key to the buffer.
-            writer.write_all(&self.key_buffer)?;
+            self.data_file.write_all(&self.key_buffer)?;
             crc32_hasher.update(&self.key_buffer);
 
             // Save current pos, then jump back to the value size and write that then finally write
             // the value into the saved position.
-            writer.write_all(&self.value_buffer)?;
+            self.data_file.write_all(&self.value_buffer)?;
             crc32_hasher.update(&self.value_buffer);
         }
         let crc32 = crc32_hasher.finalize();
-        self.write_all(&crc32.to_le_bytes())?;
+        self.data_file.write_all(&crc32.to_le_bytes())?;
 
         Ok(())
     }
@@ -583,40 +535,28 @@ where
         if !self.config.write || self.failed {
             return Err(FlushError::ReadOnly);
         }
-        Write::flush(self).map_err(FlushError::WriteData)?;
+        self.data_file.flush().map_err(FlushError::WriteData)?;
         self.hdx_index
             .save_bucket_cache()
             .map_err(FlushError::WriteIndexData)?;
-        self.hdx_index.set_data_file_length(self.data_file_end);
+        self.hdx_index
+            .set_data_file_length(self.data_file.data_file_end());
         self.hdx_index
             .write_header()
             .map_err(FlushError::IndexHeader)?;
         Ok(())
     }
 
-    fn open_data_file(config: &DbConfig) -> Result<(File, DataHeader), LoadHeaderError> {
-        if config.truncate && config.write {
-            // truncate is incompatible with append so truncate then open for append.
-            OpenOptions::new()
-                .write(true)
-                .create(config.create)
-                .truncate(true)
-                .open(config.files.data_path())?;
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(config.write)
-            .create(config.create && config.write)
-            .open(config.files.data_path())?;
-        file.seek(SeekFrom::End(0))?;
-        let file_end = file.stream_position()?;
+    fn open_data_file(config: &DbConfig) -> Result<(DataFile, DataHeader), LoadHeaderError> {
+        let mut data_file = DataFile::open(config)?;
+        let file_end = data_file.data_file_end();
 
         let header = if file_end == 0 {
             let header = DataHeader::new(config);
-            header.write_header(&mut file)?;
+            header.write_header(&mut data_file)?;
             header
         } else {
-            let header = DataHeader::load_header(&mut file)?;
+            let header = DataHeader::load_header(&mut data_file)?;
             if header.version() != 0 {
                 return Err(LoadHeaderError::InvalidVersion);
             }
@@ -625,7 +565,8 @@ where
             }
             header
         };
-        Ok((file, header))
+        data_file.flush()?;
+        Ok((data_file, header))
     }
 
     /// Return the u64 hash of key.
@@ -659,20 +600,11 @@ where
     /// Returns the (key, value) tuple
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
     fn read_record(&mut self, position: u64) -> Result<(K, V), FetchError> {
-        // Turn self into a reference to a Read trait with it's own lifetime.
-        // This is so we can call read_exact with a buffer owned by self.  There will not be any
-        // overlap doing this so should be safe, restricting the reference to the Read trait to help
-        // enforce this.
-        let reader: &mut dyn Read = unsafe {
-            (self as *mut dyn Read)
-                .as_mut()
-                .expect("this can't be null")
-        };
-        self.seek(SeekFrom::Start(position))?;
+        self.data_file.seek(SeekFrom::Start(position))?;
         let mut crc32_hasher = crc32fast::Hasher::new();
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
-            reader.read_exact(&mut key_size)?;
+            self.data_file.read_exact(&mut key_size)?;
             crc32_hasher.update(&key_size);
             u16::from_le_bytes(key_size)
         } else {
@@ -680,20 +612,20 @@ where
         } as usize;
 
         let mut val_size_buf = [0_u8; 4];
-        reader.read_exact(&mut val_size_buf)?;
+        self.data_file.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         self.key_buffer_read.resize(key_size, 0);
-        reader.read_exact(&mut self.key_buffer_read[..])?;
+        self.data_file.read_exact(&mut self.key_buffer_read[..])?;
         crc32_hasher.update(&self.key_buffer_read);
         let key = K::deserialize(&self.key_buffer_read[..]).map_err(FetchError::DeserializeKey)?;
         self.value_buffer.resize(val_size as usize, 0);
-        reader.read_exact(&mut self.value_buffer[..])?;
+        self.data_file.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);
         let calc_crc32 = crc32_hasher.finalize();
         let val = V::deserialize(&self.value_buffer[..]).map_err(FetchError::DeserializeValue)?;
         let mut buf_u32 = [0_u8; 4];
-        reader.read_exact(&mut buf_u32)?;
+        self.data_file.read_exact(&mut buf_u32)?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
@@ -705,20 +637,10 @@ where
     /// The position needs to be valid, attempting to read an invalid area will
     /// produce an error or invalid key.  This is a truncated read and DOES NOT do a CRC32 check.
     fn read_key(&mut self, position: u64) -> Result<K, ReadKeyError> {
-        // Turn self into a reference to a Read trait with it's own lifetime.
-        // This is so we can call read_exact with a buffer owned by self.  There will not be any
-        // overlap doing this so should be safe, restricting the reference to the Read trait to help
-        // enforce this.
-        let reader: &mut dyn Read = unsafe {
-            (self as *mut dyn Read)
-                .as_mut()
-                .expect("this can't be null")
-        };
-
-        self.seek(SeekFrom::Start(position))?;
+        self.data_file.seek(SeekFrom::Start(position))?;
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
-            self.read_exact(&mut key_size)?;
+            self.data_file.read_exact(&mut key_size)?;
             let key_size = u16::from_le_bytes(key_size);
             key_size as usize
         } else {
@@ -726,8 +648,8 @@ where
         };
         self.key_buffer_read.resize(key_size, 0);
         // Skip the value size and read the key.
-        self.seek(SeekFrom::Current(4))?;
-        reader.read_exact(&mut self.key_buffer_read[..])?;
+        self.data_file.seek(SeekFrom::Current(4))?;
+        self.data_file.read_exact(&mut self.key_buffer_read[..])?;
         let key = K::deserialize(&self.key_buffer_read[..])?;
 
         Ok(key)
@@ -740,28 +662,12 @@ where
         let dat_file = { self.data_file.try_clone()? };
         DbRawIter::with_file(dat_file)
     }
-
-    /// Copy bytes form the read buffer into buf.  This expects seek_pos to be within the
-    /// read_buffer (will panic if called incorrectly).
-    fn copy_read_buffer(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut size = buf.len();
-        let read_depth = self.seek_pos as usize - self.read_buffer_start;
-        if read_depth + size > self.read_buffer_len {
-            size = self.read_buffer_len - read_depth;
-        }
-        buf[..size].copy_from_slice(&self.read_buffer[read_depth..read_depth + size]);
-        self.seek_pos += size as u64;
-        if size == 0 {
-            panic!("Invalid call to from_read_buffer, size: {}, read buffer index: {}, seek pos: {}, read buffer start: {}",
-                   size, read_depth, self.seek_pos, self.read_buffer_start);
-        }
-        Ok(size)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     //use crate::err_info;
     //use crate::error::source::SourceError;
     //use std::io::ErrorKind;

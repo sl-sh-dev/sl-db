@@ -251,16 +251,11 @@ where
     dirty_bucket_cache: FxHashMap<u64, Vec<u8>>,
     hdx_file: File,
     // Note, if odx_file is ever replaced in HdxIndex then see bucket_iter for undefined behaviour.
-    odx_file: File,
+    pub(crate) odx_file: File,
     capacity: u64,
     cached_buckets: usize,
     _key: PhantomData<K>,
 }
-
-// Used for bucket_iter().
-/// Combine the Read and Seek traits.
-pub trait ReadSeek: Read + Seek {}
-impl ReadSeek for File {}
 
 impl<K, const KSIZE: u16> HdxIndex<K, KSIZE>
 where
@@ -350,22 +345,12 @@ where
     /// can also lead to undefined behaviour if an iterator is in use (odx_file is never recreated at
     /// time of writing).  In short use these iterators locally and let them go- never save or return
     /// them to a public API.
-    pub(crate) unsafe fn bucket_iter<'b>(
-        &mut self,
-        bucket: u64,
-        hash: Option<u64>,
-    ) -> BucketIter<'b, dyn ReadSeek> {
-        // Turn odx_file into a reference to a Read + Seek trait.
-        // Need this to break away the odx file lifetime to use in the iter.
-        // The ODX file should not change under the iterator and is therefore safe.
-        let odx_reader: &mut dyn ReadSeek = unsafe {
-            (&mut self.odx_file as *mut dyn ReadSeek)
-                .as_mut()
-                .expect("this can't be null")
-        };
-        // Note, maybe investigate a try_clone on odx_file to get rid of some of the unsafety.
-        let buffer = self.get_bucket(bucket);
-        BucketIter::new(odx_reader, buffer, hash)
+    pub(crate) unsafe fn bucket_iter(&mut self, bucket: u64, hash: Option<u64>) -> BucketIter {
+        if let Ok(buffer) = self.get_bucket_ref(bucket) {
+            BucketIter::new(buffer, hash)
+        } else {
+            BucketIter::new_empty()
+        }
     }
 
     /// Set the data_file_length field.
@@ -416,24 +401,36 @@ where
         }
     }
 
-    /// Read bucket from source.  Always allocate the buffer, if in cache copy it.
-    /// If there is an IO error then return an empty buffer.
-    pub fn get_bucket(&mut self, bucket: u64) -> Vec<u8> {
-        let mut buffer = vec![0; self.header.bucket_size as usize];
+    /// Return a reference to bucket.  If it is already cached then return that reference otherwise
+    /// load it into the read cache and return the newly cached reference.
+    /// This is unsafe because it coerces the reference to static and will only be valid while
+    /// the caches are stable (used for bucket_iter() so should be fine when that is used within
+    /// it's invariants).
+    /// Returns an IO error if it fails to load a bucket.
+    unsafe fn get_bucket_ref(&mut self, bucket: u64) -> Result<&'static Vec<u8>, io::Error> {
         if let Some(bucket) = self.get_bucket_cache(bucket) {
-            buffer.copy_from_slice(bucket);
-            // These cached buffers may be missing their crc32 so add it now.
-            add_crc32(&mut buffer[..]);
+            Ok(unsafe {
+                (bucket as *const Vec<u8>)
+                    .as_ref()
+                    .expect("this can't be null")
+            })
         } else {
             let bucket_size = self.header.bucket_size as usize;
+            let mut buffer = vec![0; bucket_size];
             let bucket_pos: u64 =
                 (self.header.header_size() + (bucket as usize * bucket_size)) as u64;
-            if self.hdx_file.seek(SeekFrom::Start(bucket_pos)).is_ok() {
-                let _ = self.hdx_file.read_exact(&mut buffer[..]);
-                self.bucket_cache.insert(bucket, buffer.clone());
-            }
+            self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
+            self.hdx_file.read_exact(&mut buffer[..])?;
+            self.bucket_cache.insert(bucket, buffer);
+            Ok(unsafe {
+                (self
+                    .bucket_cache
+                    .get(&bucket)
+                    .expect("just added this bucket!") as *const Vec<u8>)
+                    .as_ref()
+                    .expect("this can't be null")
+            })
         }
-        buffer
     }
 
     /// Return the buffer for bucket, if found in cache then remove and return that buffer vs allocate.
@@ -548,7 +545,7 @@ where
         let mut buffer2 = vec![0; bucket_size];
 
         let mut iter = unsafe { self.bucket_iter(split_bucket, None) };
-        for (rec_hash, rec_pos) in &mut iter {
+        while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
             if rec_pos > 0 {
                 let bucket = self.hash_to_bucket(rec_hash);
                 if bucket != split_bucket && bucket != new_bucket {
