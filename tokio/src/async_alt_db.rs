@@ -43,6 +43,7 @@ where
     // There should be little to no contention for this and using async can be inconvenient as
     // using blocking_lock() if a tokio runtime is in use will panic.
     config: parking_lot::Mutex<DbConfig>,
+    allow_dups: bool,
 }
 
 impl<K, V, const KSIZE: u16, S> Drop for AsyncAltDb<K, V, KSIZE, S>
@@ -81,12 +82,14 @@ where
         let db_thread = std::thread::spawn(move || {
             write_thread(db, read_db_clone, write_cache_clone, insert_rx)
         });
+        let allow_dups = config.duplicate_inserts();
         Ok(Self {
             read_db,
             write_cache,
             insert_tx,
             insert_thread: Some(db_thread),
             config: parking_lot::Mutex::new(config),
+            allow_dups,
         })
     }
 
@@ -131,7 +134,7 @@ where
     ///   - key data
     ///   - value data
     pub async fn insert(&self, key: K, value: V) {
-        if !self.write_cache.contains_key(&key) {
+        if self.allow_dups || !self.write_cache.contains_key(&key) {
             self.write_cache.insert(key.clone(), value);
             // An error here indicates the receiver in the insert thread was closed/dropped.
             let _ = self.insert_tx.send(InsertCommand::Insert(key)).await;
@@ -215,11 +218,13 @@ fn commit_bg_thread<K, V, const KSIZE: u16, S>(
     drop(read_lock);
     match res {
         Ok(()) => {
-            if let Some(tx) = result_tx {
-                let _ = tx.send(Ok(()));
-            }
+            // Need to purge the write cache BEFORE we inform the caller lest we have race a condition
+            // when allowing duplicate keys.
             for key in inserts.drain(..) {
                 write_cache.remove(&key);
+            }
+            if let Some(tx) = result_tx {
+                let _ = tx.send(Ok(()));
             }
         }
         Err(err) => {
@@ -309,7 +314,12 @@ mod tests {
             DbConfig::with_data_path("db_tests", "dup_commits", 3).allow_duplicate_inserts();
         let db: Arc<AsyncAltDb<u64, String, 8>> =
             Arc::new(AsyncAltDb::open(config, 100_000).unwrap());
-        assert_eq!(db.raw_iter().await.unwrap().count(), 5);
+        let mut count = 0;
+        for v in db.raw_iter().await.unwrap() {
+            count += 1;
+        }
+        //assert_eq!(db.raw_iter().await.unwrap().count(), 5);
+        assert_eq!(count, 5);
         //assert_eq!(db.len(), 1);  // Have a bug here on duplicate keys.
         let v = db.fetch(key).await.unwrap();
         assert_eq!(v, "Value Five");

@@ -151,6 +151,11 @@ impl DbConfig {
         self
     }
 
+    /// Do we allow duplicate keys to be inserted?
+    pub fn duplicate_inserts(&self) -> bool {
+        self.allow_duplicate_inserts
+    }
+
     /// Set the bucket size to size, will adjust bucket_elements to the largest size that will fit.
     /// Calling this will overwrite values set by set_bucket_elements, and vice-versa.
     /// Panics if size is less than 8 + BUCKET_ELEMENT_SIZE.
