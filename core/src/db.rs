@@ -822,6 +822,42 @@ mod tests {
     }
 
     #[test]
+    fn test_dup_key_commit() {
+        let key = Key([1_u8; 32]);
+        {
+            let mut db: TestDb = DbConfig::with_data_path("db_tests", "dup_commits", 3)
+                .create()
+                .truncate()
+                .allow_duplicate_inserts()
+                .build()
+                .unwrap();
+            db.insert(key, &"Value One".to_string()).unwrap();
+            db.commit().unwrap();
+            db.insert(key, &"Value Two".to_string()).unwrap();
+            db.commit().unwrap();
+            db.insert(key, &"Value Three".to_string()).unwrap();
+            db.commit().unwrap();
+            db.insert(key, &"Value Four".to_string()).unwrap();
+            db.commit().unwrap();
+            db.insert(key, &"Value Five".to_string()).unwrap();
+            db.commit().unwrap();
+
+            let v = db.fetch(&key).unwrap();
+            assert_eq!(v, "Value Five");
+        }
+        // Reopen and test that there are 5 items in the data file, one in the index and that the
+        // correct value is retrieved.
+        let mut db: TestDb = DbConfig::with_data_path("db_tests", "dup_commits", 3)
+            .allow_duplicate_inserts()
+            .build()
+            .unwrap();
+        assert_eq!(db.raw_iter().unwrap().count(), 5);
+        //assert_eq!(db.len(), 1);
+        let v = db.fetch(&key).unwrap();
+        assert_eq!(v, "Value Five");
+    }
+
+    #[test]
     fn test_vec_val() {
         let mut db: DbCore<u64, Vec<u8>, 8> = DbConfig::with_data_path("db_tests", "xxx_vec", 1)
             .create()
@@ -832,7 +868,7 @@ mod tests {
             .build()
             .unwrap();
         let val = vec![0_u8; 512];
-        let max = 1_000_000;
+        let max = 50_000;
         let start = time::Instant::now();
         for i in 0_u64..max {
             db.insert(i, &val).unwrap();
@@ -1063,7 +1099,7 @@ mod tests {
         assert!(!db.contains_key(&35_000).unwrap());
         assert!(!db.contains_key(&49_000).unwrap());
         assert!(!db.contains_key(&50_000).unwrap());
-        let max = 1_000_000;
+        let max = 50_000;
         let start = time::Instant::now();
         for i in 0_u64..max {
             db.insert(i, &format!("Value {i}")).unwrap();

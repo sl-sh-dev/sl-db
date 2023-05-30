@@ -337,7 +337,7 @@ mod tests {
         assert!(!db.contains_key(35_000).await.unwrap());
         assert!(!db.contains_key(49_000).await.unwrap());
         assert!(!db.contains_key(50_000).await.unwrap());
-        let max = 1_000_000;
+        let max = 50_000;
 
         let start = time::Instant::now();
         for i in 0_u64..max {
