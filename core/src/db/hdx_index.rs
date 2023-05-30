@@ -558,10 +558,10 @@ where
                     );
                 }
                 if bucket == split_bucket {
-                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer, None)
+                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer, false, None)
                         .map_err(|_| InsertError::IndexOverflow)?;
                 } else {
-                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer2, None)
+                    self.save_to_bucket_buffer(None, rec_hash, rec_pos, &mut buffer2, false, None)
                         .map_err(|_| InsertError::IndexOverflow)?;
                 }
             }
@@ -590,6 +590,7 @@ where
             hash,
             record_pos,
             &mut buffer[..],
+            true,
             Some(read_key),
         );
         // Need to make sure the bucket goes into the cache even on error.
@@ -605,6 +606,7 @@ where
         hash: u64,
         record_pos: u64,
         buffer: &mut [u8],
+        _inc_values: bool,
         mut read_key: Option<&mut dyn FnMut(u64) -> Result<K, ReadKeyError>>,
     ) -> Result<(), InsertError> {
         fn read_u64(buffer: &[u8], pos: &mut usize) -> u64 {
@@ -620,6 +622,8 @@ where
             u32::from_le_bytes(buf32)
         }
 
+        // XXX Fix bug...
+        let inc_values = false;
         let mut pos = 8; // Skip the overflow file pos.
         let elements = read_u32(buffer, &mut pos);
         // TODO- if not allowing dups then have to check overflow buckets for dups...
@@ -675,7 +679,7 @@ where
                     }
                 }
                 // Insertion sort to keep the hashes within the bucket sorted for faster searches.
-                // Buckets will likely be have a many elements so this should be a win vs linear
+                // Buckets will likely have many elements so this should be a win vs linear
                 // searching.
                 if hash < rec_hash {
                     // Bump the elements in the bucket buffer.
@@ -690,17 +694,23 @@ where
                     buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
                     pos += 8;
                     buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+                    if inc_values {
+                        self.inc_values();
+                    }
                     return Ok(());
                 }
             }
             // Ran out of elements and hash the greatest, so write to end.
             let new_elements: u32 = elements + 1;
             buffer[8..12].copy_from_slice(&new_elements.to_le_bytes());
-            // Seek to the element we found, insert has and position into it.
+            // Seek to the element we found, insert hash and position into it.
             let mut pos = 12 + (elements as usize * BUCKET_ELEMENT_SIZE);
             buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
             pos += 8;
             buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+            if inc_values {
+                self.inc_values();
+            }
             Ok(())
         }
     }

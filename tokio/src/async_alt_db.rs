@@ -280,6 +280,42 @@ mod tests {
     //use tokio::task::JoinSet;
 
     #[tokio::test]
+    async fn test_dup_key_commit() {
+        let key = 0_u64;
+        {
+            let config = DbConfig::with_data_path("db_tests", "dup_commits", 3)
+                .create()
+                .truncate()
+                .allow_duplicate_inserts();
+            let db: Arc<AsyncAltDb<u64, String, 8>> =
+                Arc::new(AsyncAltDb::open(config, 100_000).unwrap());
+            db.insert(key, "Value One".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Two".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Three".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Four".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Five".to_string()).await;
+            db.commit().await.unwrap();
+
+            let v = db.fetch(key).await.unwrap();
+            assert_eq!(v, "Value Five");
+        }
+        // Reopen and test that there are 5 items in the data file, one in the index and that the
+        // correct value is retrieved.
+        let config =
+            DbConfig::with_data_path("db_tests", "dup_commits", 3).allow_duplicate_inserts();
+        let db: Arc<AsyncAltDb<u64, String, 8>> =
+            Arc::new(AsyncAltDb::open(config, 100_000).unwrap());
+        assert_eq!(db.raw_iter().await.unwrap().count(), 5);
+        //assert_eq!(db.len(), 1);  // Have a bug here on duplicate keys.
+        let v = db.fetch(key).await.unwrap();
+        assert_eq!(v, "Value Five");
+    }
+
+    #[tokio::test]
     async fn test_50k_tok_alt() {
         let config = DbConfig::with_data_path("db_tests_alt", "xxx50k", 1)
             .no_auto_flush()

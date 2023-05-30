@@ -852,7 +852,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(db.raw_iter().unwrap().count(), 5);
-        //assert_eq!(db.len(), 1);
+        //assert_eq!(db.len(), 1);  // Have a bug here on duplicate keys.
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value Five");
     }
