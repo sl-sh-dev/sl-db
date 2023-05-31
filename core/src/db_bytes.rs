@@ -29,6 +29,48 @@ impl DbBytes<String> for String {
     }
 }
 
+impl DbBytes<u8> for u8 {
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
+        buffer.resize(1, 0);
+        buffer.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<u8, DeserializeError> {
+        let mut buf = [0_u8; 1];
+        buf.copy_from_slice(buffer);
+        Ok(Self::from_le_bytes(buf))
+    }
+}
+
+impl DbBytes<u16> for u16 {
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
+        buffer.resize(2, 0);
+        buffer.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<u16, DeserializeError> {
+        let mut buf = [0_u8; 2];
+        buf.copy_from_slice(buffer);
+        Ok(Self::from_le_bytes(buf))
+    }
+}
+
+impl DbBytes<u32> for u32 {
+    fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
+        buffer.resize(4, 0);
+        buffer.copy_from_slice(&self.to_le_bytes());
+        Ok(())
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<u32, DeserializeError> {
+        let mut buf = [0_u8; 4];
+        buf.copy_from_slice(buffer);
+        Ok(Self::from_le_bytes(buf))
+    }
+}
+
 impl DbBytes<u64> for u64 {
     fn serialize(&self, buffer: &mut Vec<u8>) -> Result<(), SerializeError> {
         buffer.resize(8, 0);

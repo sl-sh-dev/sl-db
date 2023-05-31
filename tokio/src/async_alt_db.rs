@@ -314,13 +314,8 @@ mod tests {
             DbConfig::with_data_path("db_tests", "dup_commits", 3).allow_duplicate_inserts();
         let db: Arc<AsyncAltDb<u64, String, 8>> =
             Arc::new(AsyncAltDb::open(config, 100_000).unwrap());
-        let mut count = 0;
-        for v in db.raw_iter().await.unwrap() {
-            count += 1;
-        }
-        //assert_eq!(db.raw_iter().await.unwrap().count(), 5);
-        assert_eq!(count, 5);
-        //assert_eq!(db.len(), 1);  // Have a bug here on duplicate keys.
+        assert_eq!(db.raw_iter().await.unwrap().count(), 5);
+        assert_eq!(db.len().await, 1);
         let v = db.fetch(key).await.unwrap();
         assert_eq!(v, "Value Five");
     }

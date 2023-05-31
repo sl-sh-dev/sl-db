@@ -23,6 +23,9 @@ pub trait DbKey<const KSIZE: u16>: Eq + Hash + Debug {
 }
 
 impl DbKey<0> for String {}
+impl DbKey<1> for u8 {}
+impl DbKey<2> for u16 {}
+impl DbKey<4> for u32 {}
 impl DbKey<8> for u64 {}
 /// Allow raw bytes to be used as a key.
 impl DbKey<0> for Vec<u8> {}

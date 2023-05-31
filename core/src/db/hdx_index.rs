@@ -606,7 +606,7 @@ where
         hash: u64,
         record_pos: u64,
         buffer: &mut [u8],
-        _inc_values: bool,
+        inc_values: bool,
         mut read_key: Option<&mut dyn FnMut(u64) -> Result<K, ReadKeyError>>,
     ) -> Result<(), InsertError> {
         fn read_u64(buffer: &[u8], pos: &mut usize) -> u64 {
@@ -623,11 +623,11 @@ where
         }
 
         // XXX Fix bug...
-        let inc_values = false;
+        //let inc_values = false;
         let mut pos = 8; // Skip the overflow file pos.
         let elements = read_u32(buffer, &mut pos);
         // TODO- if not allowing dups then have to check overflow buckets for dups...
-        if elements >= self.header.bucket_elements() as u32 {
+        let res = if elements >= self.header.bucket_elements() as u32 {
             // Current bucket is full so overflow.
             // First, save bucket as an overflow record and add to the fresh bucket.
             let overflow_pos = self
@@ -708,10 +708,11 @@ where
             buffer[pos..pos + 8].copy_from_slice(&hash.to_le_bytes());
             pos += 8;
             buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-            if inc_values {
-                self.inc_values();
-            }
             Ok(())
+        };
+        if inc_values {
+            self.inc_values();
         }
+        res
     }
 }

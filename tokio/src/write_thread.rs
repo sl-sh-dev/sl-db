@@ -35,11 +35,13 @@ fn commit_bg_thread<K, V, const KSIZE: u16, S>(
     let res = db.blocking_lock().commit();
     match res {
         Ok(()) => {
-            if let Some(tx) = result_tx {
-                let _ = tx.send(Ok(()));
-            }
+            // Need to purge the write cache BEFORE we inform the caller lest we have race a condition
+            // when allowing duplicate keys.
             for key in inserts.drain(..) {
                 write_cache.remove(&key);
+            }
+            if let Some(tx) = result_tx {
+                let _ = tx.send(Ok(()));
             }
         }
         Err(err) => {

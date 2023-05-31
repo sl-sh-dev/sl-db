@@ -300,7 +300,6 @@ where
                 if let Err(err) = db.save_to_bucket(&key, hash, record_pos) {
                     return Err(OpenError::RebuildIndex(err));
                 }
-                db.hdx_index.inc_values();
             } else {
                 last_err = true;
             }
@@ -410,9 +409,6 @@ where
         // Save the key to the index, do this now so the data file will not have been written if the
         // index update fails.
         self.save_to_bucket(&key, hash, record_pos)?;
-        // Since the inserted data will still be "available" even after an error after this point go
-        // ahead and increment the values.
-        self.hdx_index.inc_values();
 
         let mut crc32_hasher = crc32fast::Hasher::new();
         // If we have a variable sized key write it's size otherwise no need.
@@ -852,7 +848,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(db.raw_iter().unwrap().count(), 5);
-        //assert_eq!(db.len(), 1);  // Have a bug here on duplicate keys.
+        assert_eq!(db.len(), 1); // Have a bug here on duplicate keys.
         let v = db.fetch(&key).unwrap();
         assert_eq!(v, "Value Five");
     }

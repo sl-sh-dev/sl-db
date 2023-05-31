@@ -321,6 +321,43 @@ mod tests {
     //use tokio::task::JoinSet;
 
     #[tokio::test]
+    async fn test_dup_key_commit() {
+        let shard_bits = 2;
+        let key = 0_u32;
+        {
+            let config = DbConfig::with_data_path("db_tests", "adup_commits", 3)
+                .create()
+                .truncate()
+                .allow_duplicate_inserts();
+            let db: Arc<ShardedDb<u32, String, 4>> =
+                Arc::new(ShardedDb::open(config, shard_bits, 100_000).unwrap());
+            db.insert(key, "Value One".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Two".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Three".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Four".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Five".to_string()).await;
+            db.commit().await.unwrap();
+
+            let v = db.fetch(key).await.unwrap();
+            assert_eq!(v, "Value Five");
+        }
+        // Reopen and test that there are 5 items in the data file, one in the index and that the
+        // correct value is retrieved.
+        let config =
+            DbConfig::with_data_path("db_tests", "adup_commits", 3).allow_duplicate_inserts();
+        let db: Arc<ShardedDb<u32, String, 4>> =
+            Arc::new(ShardedDb::open(config, shard_bits, 100_000).unwrap());
+        assert_eq!(db.raw_iter().await.unwrap().count(), 5);
+        assert_eq!(db.len().await, 1);
+        let v = db.fetch(key).await.unwrap();
+        assert_eq!(v, "Value Five");
+    }
+
+    #[tokio::test]
     async fn test_50k_tok_shard() {
         let shard_bits = 2;
         let config = DbConfig::with_data_path("shard_tests", "xxx50k", 1)

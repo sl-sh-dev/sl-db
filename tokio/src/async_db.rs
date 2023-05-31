@@ -42,6 +42,7 @@ where
     // There should be little to no contention for this and using async can be inconvenient as
     // using blocking_lock() if a tokio runtime is in use will panic.
     config: parking_lot::Mutex<DbConfig>,
+    allow_dups: bool,
 }
 
 impl<K, V, const KSIZE: u16, S> Drop for AsyncDb<K, V, KSIZE, S>
@@ -78,12 +79,14 @@ where
         let db_clone = db.clone();
         let db_thread =
             std::thread::spawn(move || write_thread(db_clone, write_cache_clone, insert_rx));
+        let allow_dups = config.duplicate_inserts();
         Ok(Self {
             db,
             write_cache,
             insert_tx,
             insert_thread: Some(db_thread),
             config: parking_lot::Mutex::new(config),
+            allow_dups,
         })
     }
 
@@ -128,7 +131,7 @@ where
     ///   - key data
     ///   - value data
     pub async fn insert(&self, key: K, value: V) {
-        if !self.write_cache.contains_key(&key) {
+        if self.allow_dups || !self.write_cache.contains_key(&key) {
             self.write_cache.insert(key.clone(), value);
             // An error here indicates the receiver in the insert thread was closed/dropped.
             let _ = self.insert_tx.send(InsertCommand::Insert(key)).await;
@@ -199,6 +202,41 @@ mod tests {
     use super::*;
     use std::time;
     //use tokio::task::JoinSet;
+
+    #[tokio::test]
+    async fn test_dup_key_commit() {
+        let key = 0_u64;
+        {
+            let config = DbConfig::with_data_path("db_tests", "adup_commits", 3)
+                .create()
+                .truncate()
+                .allow_duplicate_inserts();
+            let db: Arc<AsyncDb<u64, String, 8>> =
+                Arc::new(AsyncDb::open(config, 100_000).unwrap());
+            db.insert(key, "Value One".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Two".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Three".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Four".to_string()).await;
+            db.commit().await.unwrap();
+            db.insert(key, "Value Five".to_string()).await;
+            db.commit().await.unwrap();
+
+            let v = db.fetch(key).await.unwrap();
+            assert_eq!(v, "Value Five");
+        }
+        // Reopen and test that there are 5 items in the data file, one in the index and that the
+        // correct value is retrieved.
+        let config =
+            DbConfig::with_data_path("db_tests", "adup_commits", 3).allow_duplicate_inserts();
+        let db: Arc<AsyncDb<u64, String, 8>> = Arc::new(AsyncDb::open(config, 100_000).unwrap());
+        assert_eq!(db.raw_iter().await.unwrap().count(), 5);
+        assert_eq!(db.len().await, 1);
+        let v = db.fetch(key).await.unwrap();
+        assert_eq!(v, "Value Five");
+    }
 
     #[tokio::test]
     async fn test_50k_tok() {
