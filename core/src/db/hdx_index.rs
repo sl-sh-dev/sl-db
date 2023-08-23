@@ -471,18 +471,18 @@ where
     pub(crate) fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
         let bucket_size = self.header.bucket_size as usize;
         let header_size = self.header.header_size();
-        if self.bucket_cache.len() > self.cached_buckets {
-            // Simple cache clear when it gets to large.
-            // TODO- do better here.
-            self.bucket_cache.clear();
-            self.bucket_cache.shrink_to_fit();
-        }
+        // Simple cache clear.
+        // If we do not do this then MUST add the dirty buffers to this cache below.
+        // TODO- do better here?  Maybe a setting as a performance tweak?
+        self.bucket_cache.clear();
+        self.bucket_cache.shrink_to_fit();
         for (bucket, mut buffer) in self.dirty_bucket_cache.drain() {
             let bucket_pos: u64 = (header_size + (bucket as usize * bucket_size)) as u64;
             add_crc32(&mut buffer[..]);
             // Seeking and writing past the file end extends it.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer[..])?;
+            // If we don't clear the bucket cache then do this: self.bucket_cache.insert(bucket, buffer);
         }
         self.dirty_bucket_cache.shrink_to_fit();
         Ok(())
@@ -632,9 +632,17 @@ where
         let mut pos = 0;
         let overflow_pos = read_u64(buffer, &mut pos);
         let elements = read_u32(buffer, &mut pos);
-        if overflow_pos > 0 && !self.config.allow_duplicate_inserts {
+        if read_key.is_some() && overflow_pos > 0 && !self.config.allow_duplicate_inserts {
+            let bucket = self.hash_to_bucket(hash);
             // If we don't allow dups and have an overflow buckets then we have to check them for dups...
-            let mut bucket_iter = BucketIter::new_from_overflow(overflow_pos, Some(hash));
+            // This code is a bummer, ideally not a lot of overflow but still stinky.
+            let mut bucket_iter = unsafe {
+                if let Ok(buffer) = self.get_bucket_ref(bucket) {
+                    BucketIter::new_from_overflow(buffer, overflow_pos, Some(hash))
+                } else {
+                    BucketIter::new_empty()
+                }
+            };
             while let Some((_hash, rec_pos)) = self.next_bucket_element(&mut bucket_iter) {
                 if let (Some(key), Some(read_key)) = (key, &mut read_key) {
                     if let Ok(rkey) = read_key(rec_pos) {

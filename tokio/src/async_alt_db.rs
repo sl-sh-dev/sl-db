@@ -3,7 +3,6 @@
 //! Provide a tokio async wrapper around DbCore.  This is tokio specific but should be easily
 //! adaptable to other runtimes.
 
-use std::collections::HashMap;
 use crate::write_thread::InsertCommand;
 use crate::CommitError;
 use sldb_core::db::DbCore;
@@ -14,6 +13,7 @@ use sldb_core::db_key::DbKey;
 use sldb_core::error::insert::InsertError;
 use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError};
 use sldb_core::fxhasher::FxHasher;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ where
     V: Send + Sync + Debug + Clone + 'static,
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
-    inner: Arc<RwLock<HashMap<K, V, S>>>
+    inner: Arc<RwLock<HashMap<K, V, S>>>,
 }
 
 impl<K, V, S> ConHashMap<K, V, S>
@@ -247,7 +247,7 @@ where
     }
 }
 
-/// Do a commit for teh background thread.
+/// Do a commit for the background thread.
 fn commit_bg_thread<K, V, const KSIZE: u16, S>(
     db: &mut DbCore<K, V, KSIZE, S>,
     read_db: &Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
@@ -325,6 +325,7 @@ fn write_thread<K, V, const KSIZE: u16, S>(
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

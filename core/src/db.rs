@@ -189,7 +189,7 @@ where
     key_buffer: Vec<u8>,
     key_buffer_read: Vec<u8>,
     value_buffer: Vec<u8>,
-    hdx_index: HdxIndex<K, KSIZE>,
+    hdx_index: Option<HdxIndex<K, KSIZE>>, // Only optional so we can remove it from self for some uses.
     config: DbConfig,
     failed: bool,
     _key: PhantomData<K>,
@@ -263,7 +263,7 @@ where
                 header,
                 data_file,
                 hasher,
-                hdx_index,
+                hdx_index: Some(hdx_index),
                 key_buffer: Vec::new(),
                 key_buffer_read: Vec::new(),
                 value_buffer: Vec::new(),
@@ -319,6 +319,16 @@ where
         Ok(db)
     }
 
+    /// Retrieve a reference to the index, will panic if missing for some reason.
+    fn hdx_index(&self) -> &HdxIndex<K, KSIZE> {
+        self.hdx_index.as_ref().expect("Missing the index!")
+    }
+
+    /// Retrieve a reference to the index, will panic if missing for some reason.
+    fn hdx_index_mut(&mut self) -> &mut HdxIndex<K, KSIZE> {
+        self.hdx_index.as_mut().expect("Missing the index!")
+    }
+
     /// Close and destroy the DB (remove all it's files).
     /// If it can not remove a file it will silently ignore this.
     pub fn destroy(self) {
@@ -341,10 +351,10 @@ where
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, key: &K) -> Result<V, FetchError> {
         let hash = self.hash(key);
-        let bucket = self.hdx_index.hash_to_bucket(hash);
+        let bucket = self.hdx_index().hash_to_bucket(hash);
 
-        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket, Some(hash)) };
-        while let Some((rec_hash, rec_pos)) = self.hdx_index.next_bucket_element(&mut iter) {
+        let mut iter = unsafe { self.hdx_index_mut().bucket_iter(bucket, Some(hash)) };
+        while let Some((rec_hash, rec_pos)) = self.hdx_index_mut().next_bucket_element(&mut iter) {
             if hash == rec_hash {
                 let (rkey, val) = self.read_record(rec_pos)?;
                 if &rkey == key {
@@ -364,9 +374,9 @@ where
     /// True if the database contains key.
     pub fn contains_key(&mut self, key: &K) -> Result<bool, ReadKeyError> {
         let hash = self.hash(key);
-        let bucket = self.hdx_index.hash_to_bucket(hash);
-        let mut iter = unsafe { self.hdx_index.bucket_iter(bucket, Some(hash)) };
-        while let Some((rec_hash, rec_pos)) = self.hdx_index.next_bucket_element(&mut iter) {
+        let bucket = self.hdx_index().hash_to_bucket(hash);
+        let mut iter = unsafe { self.hdx_index_mut().bucket_iter(bucket, Some(hash)) };
+        while let Some((rec_hash, rec_pos)) = self.hdx_index_mut().next_bucket_element(&mut iter) {
             // rec_pos > 0 handles degenerate case of a 0 hash.
             if hash == rec_hash && rec_pos > 0 {
                 let rkey = self.read_key(rec_pos)?;
@@ -386,7 +396,7 @@ where
     /// Useful if the DB is also opened for writing.
     pub fn refresh_index(&mut self) {
         if !self.config.write {
-            self.hdx_index.reload_header();
+            self.hdx_index_mut().reload_header();
             self.data_file.refresh_data_file_end();
         }
     }
@@ -475,7 +485,7 @@ where
 
     /// Return the number of records in Db.
     pub fn len(&self) -> usize {
-        self.hdx_index.values() as usize
+        self.hdx_index().values() as usize
     }
 
     /// Is the DB empty?
@@ -501,13 +511,13 @@ where
     /// Return the DB index salt (generated at creation).
     /// Can be used with the pepper to test the hasher.
     pub fn salt(&self) -> u64 {
-        self.hdx_index.header().salt()
+        self.hdx_index().header().salt()
     }
 
     /// Return the DB pepper (generated at creation from the salt with Hasher).
     /// Can be used with the salt to test the hasher.
     pub fn pepper(&self) -> u64 {
-        self.hdx_index.header().pepper()
+        self.hdx_index().header().pepper()
     }
 
     /// Flush any caches to disk and sync the data and index file.
@@ -521,7 +531,7 @@ where
         self.data_file
             .sync_all()
             .map_err(CommitError::DataFileSync)?;
-        self.hdx_index.sync()?;
+        self.hdx_index_mut().sync()?;
         Ok(())
     }
 
@@ -532,12 +542,12 @@ where
             return Err(FlushError::ReadOnly);
         }
         self.data_file.flush().map_err(FlushError::WriteData)?;
-        self.hdx_index
+        self.hdx_index_mut()
             .save_bucket_cache()
             .map_err(FlushError::WriteIndexData)?;
-        self.hdx_index
-            .set_data_file_length(self.data_file.data_file_end());
-        self.hdx_index
+        let file_end = self.data_file.data_file_end();
+        self.hdx_index_mut().set_data_file_length(file_end);
+        self.hdx_index_mut()
             .write_header()
             .map_err(FlushError::IndexHeader)?;
         Ok(())
@@ -576,20 +586,20 @@ where
     /// Capacity is number of elements per bucket * number of buckets.
     /// If current length >= capacity * load factor then split buckets until this is not true.
     fn expand_buckets(&mut self) -> Result<(), InsertError> {
-        self.hdx_index.expand_buckets()
+        self.hdx_index_mut().expand_buckets()
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     fn save_to_bucket(&mut self, key: &K, hash: u64, record_pos: u64) -> Result<(), InsertError> {
-        // Make a self with a new lifetime so we can pass in the read_key closure.
-        // read_key should not mutate hdx_index so this should be fine.
-        let unsafe_db: &mut DbInner<K, V, KSIZE, S> = unsafe {
-            (self as *mut DbInner<K, V, KSIZE, S>)
-                .as_mut()
-                .expect("this can't be null")
-        };
-        self.hdx_index
-            .save_to_bucket(key, hash, record_pos, &mut |pos| unsafe_db.read_key(pos))
+        if let Some(mut hdx_index) = self.hdx_index.take() {
+            // Note that read_key can NOT access the index or it will panic...
+            let r = hdx_index.save_to_bucket(key, hash, record_pos, &mut |pos| self.read_key(pos));
+            // Return the index self or DB will panic.
+            self.hdx_index = Some(hdx_index);
+            r
+        } else {
+            panic!("No index!");
+        }
     }
 
     /// Read the record at position.
@@ -633,6 +643,8 @@ where
     /// The position needs to be valid, attempting to read an invalid area will
     /// produce an error or invalid key.  This is a truncated read and DOES NOT do a CRC32 check.
     fn read_key(&mut self, position: u64) -> Result<K, ReadKeyError> {
+        // Note that read_key can NOT access the index or it will panic...
+        // It is used in a closure that requires the index to be taken while it is use.
         self.data_file.seek(SeekFrom::Start(position))?;
         let key_size = if K::is_variable_key_size() {
             let mut key_size = [0_u8; 2];
