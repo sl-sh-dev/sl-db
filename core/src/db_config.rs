@@ -52,9 +52,9 @@ impl DbConfig {
             allow_duplicate_inserts: false,
             cache_writes: true,
             auto_flush: true,
-            read_buffer_size: 16 * 1024,         // 16kb default.
-            write_buffer_size: 16 * 1024,        // 16kb default.
-            bucket_cache_size: 32 * 1024 * 1024, // 32mb default.
+            read_buffer_size: 16 * 1024,        // 16kb default.
+            write_buffer_size: 16 * 1024,       // 16kb default.
+            bucket_cache_size: 2 * 1024 * 1024, // 2mb default.
         }
     }
 

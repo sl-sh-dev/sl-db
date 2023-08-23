@@ -319,10 +319,7 @@ where
         let modulus = (header.buckets + 1).next_power_of_two();
         let capacity = header.buckets() as u64 * header.bucket_elements() as u64;
         let cached_buckets = (config.bucket_cache_size / config.bucket_size as u32) as usize;
-        let bucket_cache = FxHashMap::with_capacity_and_hasher(
-            cached_buckets,
-            BuildHasherDefault::<FxHasher>::default(),
-        );
+        let bucket_cache = FxHashMap::with_hasher(BuildHasherDefault::<FxHasher>::default());
         Ok(Self {
             header,
             config,
@@ -421,6 +418,12 @@ where
                 (self.header.header_size() + (bucket as usize * bucket_size)) as u64;
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.read_exact(&mut buffer[..])?;
+            if self.bucket_cache.len() > self.cached_buckets {
+                // Simple cache clear when it gets to large.
+                // TODO- do better here.
+                self.bucket_cache.clear();
+                self.bucket_cache.shrink_to_fit();
+            }
             self.bucket_cache.insert(bucket, buffer);
             Ok(unsafe {
                 (self
@@ -470,7 +473,9 @@ where
         let header_size = self.header.header_size();
         if self.bucket_cache.len() > self.cached_buckets {
             // Simple cache clear when it gets to large.
+            // TODO- do better here.
             self.bucket_cache.clear();
+            self.bucket_cache.shrink_to_fit();
         }
         for (bucket, mut buffer) in self.dirty_bucket_cache.drain() {
             let bucket_pos: u64 = (header_size + (bucket as usize * bucket_size)) as u64;
@@ -478,8 +483,8 @@ where
             // Seeking and writing past the file end extends it.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer[..])?;
-            self.bucket_cache.insert(bucket, buffer);
         }
+        self.dirty_bucket_cache.shrink_to_fit();
         Ok(())
     }
 
@@ -500,7 +505,9 @@ where
             self.header = header;
             self.modulus = (self.header.buckets() + 1).next_power_of_two();
             self.bucket_cache.clear();
+            self.bucket_cache.shrink_to_fit();
             self.dirty_bucket_cache.clear();
+            self.dirty_bucket_cache.shrink_to_fit();
         }
     }
 

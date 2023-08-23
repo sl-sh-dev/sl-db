@@ -223,6 +223,7 @@ fn commit_bg_thread<K, V, const KSIZE: u16, S>(
             for key in inserts.drain(..) {
                 write_cache.remove(&key);
             }
+            write_cache.shrink_to_fit();
             if let Some(tx) = result_tx {
                 let _ = tx.send(Ok(()));
             }
