@@ -77,6 +77,31 @@ impl BucketIter {
         }
     }
 
+    pub(super) fn new_from_overflow(overflow_pos: u64, hash: Option<u64>) -> Self {
+        let elements = 0;
+        let start_pos = 0;
+        let end_pos = elements as usize;
+        let bucket_pos = 0;
+        let overflow_buffer = vec![];
+        let buffer = unsafe {
+            (&overflow_buffer as *const Vec<u8>)
+                .as_ref()
+                .expect("this can't be null")
+        };
+        Self {
+            buffer,
+            overflow_buffer,
+            bucket_pos,
+            start_pos,
+            end_pos,
+            overflow_pos,
+            elements,
+            hash,
+            hash_found: false,
+            crc_failure: true, // Force next to always return None.
+        }
+    }
+
     pub(super) fn crc_failure(&self) -> bool {
         self.crc_failure
     }

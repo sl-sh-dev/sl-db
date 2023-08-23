@@ -622,11 +622,23 @@ where
             u32::from_le_bytes(buf32)
         }
 
-        // XXX Fix bug...
-        //let inc_values = false;
-        let mut pos = 8; // Skip the overflow file pos.
+        let mut pos = 0;
+        let overflow_pos = read_u64(buffer, &mut pos);
         let elements = read_u32(buffer, &mut pos);
-        // TODO- if not allowing dups then have to check overflow buckets for dups...
+        if overflow_pos > 0 && !self.config.allow_duplicate_inserts {
+            // If we don't allow dups and have an overflow buckets then we have to check them for dups...
+            let mut bucket_iter = BucketIter::new_from_overflow(overflow_pos, Some(hash));
+            while let Some((_hash, rec_pos)) = self.next_bucket_element(&mut bucket_iter) {
+                if let (Some(key), Some(read_key)) = (key, &mut read_key) {
+                    if let Ok(rkey) = read_key(rec_pos) {
+                        if &rkey == key {
+                            // Don't allow duplicates so error out (caller should roll back insert).
+                            return Err(InsertError::DuplicateKey);
+                        }
+                    }
+                }
+            }
+        }
         let res = if elements >= self.header.bucket_elements() as u32 {
             // Current bucket is full so overflow.
             // First, save bucket as an overflow record and add to the fresh bucket.
