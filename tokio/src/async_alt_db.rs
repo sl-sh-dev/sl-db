@@ -3,9 +3,9 @@
 //! Provide a tokio async wrapper around DbCore.  This is tokio specific but should be easily
 //! adaptable to other runtimes.
 
+use std::collections::HashMap;
 use crate::write_thread::InsertCommand;
 use crate::CommitError;
-use dashmap::DashMap;
 use sldb_core::db::DbCore;
 use sldb_core::db_bytes::DbBytes;
 use sldb_core::db_config::DbConfig;
@@ -19,6 +19,53 @@ use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::*;
+
+#[derive(Clone, Debug)]
+struct ConHashMap<K, V, S = BuildHasherDefault<FxHasher>>
+where
+    K: Send + Sync + Eq + Hash + Clone + 'static,
+    V: Send + Sync + Debug + Clone + 'static,
+    S: Send + Sync + Clone + BuildHasher + Default + 'static,
+{
+    inner: Arc<RwLock<HashMap<K, V, S>>>
+}
+
+impl<K, V, S> ConHashMap<K, V, S>
+where
+    K: Send + Sync + Eq + Hash + Clone + 'static,
+    V: Send + Sync + Debug + Clone + 'static,
+    S: Send + Sync + Clone + BuildHasher + Default + 'static,
+{
+    fn with_hasher(hasher: S) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::with_hasher(hasher))),
+        }
+    }
+
+    async fn get(&self, key: &K) -> Option<V> {
+        self.inner.read().await.get(key).cloned()
+    }
+
+    fn get_sync(&self, key: &K) -> Option<V> {
+        self.inner.blocking_read().get(key).cloned()
+    }
+
+    async fn contains_key(&self, key: &K) -> bool {
+        self.inner.read().await.contains_key(key)
+    }
+
+    async fn insert(&self, key: K, value: V) -> Option<V> {
+        self.inner.write().await.insert(key, value)
+    }
+
+    fn remove(&self, key: &K) -> Option<V> {
+        self.inner.blocking_write().remove(key)
+    }
+
+    fn shrink_to_fit(&self) {
+        self.inner.blocking_write().shrink_to_fit();
+    }
+}
 
 /// This provides an async wrapper around DbCore.
 /// It will shard the DB into multiple DbCore instances to increase performance.  It is also
@@ -37,7 +84,7 @@ where
     S: Send + Sync + Clone + BuildHasher + Default + 'static,
 {
     read_db: Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
-    write_cache: Arc<DashMap<K, V, S>>,
+    write_cache: ConHashMap<K, V, S>,
     insert_tx: mpsc::Sender<InsertCommand<K, KSIZE>>,
     insert_thread: Option<std::thread::JoinHandle<()>>,
     // There should be little to no contention for this and using async can be inconvenient as
@@ -76,7 +123,7 @@ where
         let db = DbCore::open_with_recover(config.clone())?;
         let read_db = Arc::new(Mutex::new(DbCore::open(config.clone().read_only())?));
         let (insert_tx, insert_rx) = mpsc::channel(channel_depth);
-        let write_cache = Arc::new(DashMap::with_hasher(S::default()));
+        let write_cache = ConHashMap::with_hasher(S::default());
         let write_cache_clone = write_cache.clone();
         let read_db_clone = read_db.clone();
         let db_thread = std::thread::spawn(move || {
@@ -111,8 +158,8 @@ where
 
     /// Fetch the value stored at key.  Will return an error if not found.
     pub async fn fetch(&self, key: K) -> Result<V, FetchError> {
-        if let Some(val) = self.write_cache.get(&key) {
-            Ok(val.clone())
+        if let Some(val) = self.write_cache.get(&key).await {
+            Ok(val)
         } else {
             self.read_db.lock().await.fetch(&key)
         }
@@ -120,7 +167,7 @@ where
 
     /// True if the database contains key.
     pub async fn contains_key(&self, key: K) -> Result<bool, ReadKeyError> {
-        if self.write_cache.contains_key(&key) {
+        if self.write_cache.contains_key(&key).await {
             Ok(true)
         } else {
             self.read_db.lock().await.contains_key(&key)
@@ -134,8 +181,8 @@ where
     ///   - key data
     ///   - value data
     pub async fn insert(&self, key: K, value: V) {
-        if self.allow_dups || !self.write_cache.contains_key(&key) {
-            self.write_cache.insert(key.clone(), value);
+        if self.allow_dups || !self.write_cache.contains_key(&key).await {
+            self.write_cache.insert(key.clone(), value).await;
             // An error here indicates the receiver in the insert thread was closed/dropped.
             let _ = self.insert_tx.send(InsertCommand::Insert(key)).await;
         }
@@ -204,7 +251,7 @@ where
 fn commit_bg_thread<K, V, const KSIZE: u16, S>(
     db: &mut DbCore<K, V, KSIZE, S>,
     read_db: &Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
-    write_cache: &DashMap<K, V, S>,
+    write_cache: &ConHashMap<K, V, S>,
     inserts: &mut Vec<K>,
     result_tx: Option<oneshot::Sender<Result<(), CommitError>>>,
 ) where
@@ -240,7 +287,7 @@ fn commit_bg_thread<K, V, const KSIZE: u16, S>(
 fn write_thread<K, V, const KSIZE: u16, S>(
     mut db: DbCore<K, V, KSIZE, S>,
     read_db: Arc<Mutex<DbCore<K, V, KSIZE, S>>>,
-    write_cache: Arc<DashMap<K, V, S>>,
+    write_cache: ConHashMap<K, V, S>,
     mut insert_rx: mpsc::Receiver<InsertCommand<K, KSIZE>>,
 ) where
     K: Send + Sync + Eq + Hash + DbKey<KSIZE> + DbBytes<K> + Clone + 'static,
@@ -253,13 +300,12 @@ fn write_thread<K, V, const KSIZE: u16, S>(
     while !done {
         match insert_rx.blocking_recv() {
             Some(InsertCommand::Insert(key)) => {
-                if let Some(value) = write_cache.get(&key) {
+                if let Some(value) = write_cache.get_sync(&key) {
                     match db.insert(key.clone(), &value) {
                         Err(InsertError::DuplicateKey) => {} // Silently ignore duplicate keys...
                         Err(err) => last_insert_error = Some(err),
                         Ok(_) => {}
                     }
-                    drop(value);
                     inserts.push(key);
                 }
             }
@@ -283,7 +329,6 @@ fn write_thread<K, V, const KSIZE: u16, S>(
 mod tests {
     use super::*;
     use std::time;
-    //use tokio::task::JoinSet;
 
     #[tokio::test]
     async fn test_dup_key_commit() {
