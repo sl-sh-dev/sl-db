@@ -14,7 +14,7 @@ use sldb_core::db_key::DbKey;
 use sldb_core::error::{FetchError, LoadHeaderError, OpenError, ReadKeyError};
 use sldb_core::fxhasher::FxHasher;
 use std::fmt::Debug;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io};
@@ -306,10 +306,8 @@ where
         if self.shard_bits == 0 {
             0
         } else {
-            let mut hasher = self.hasher.build_hasher();
-            key.hash(&mut hasher);
             // Use the top bits for shard that should not overlap with buckets.
-            hasher.finish() as usize >> (64 - self.shard_bits)
+            self.hasher.hash_one(key) as usize >> (64 - self.shard_bits)
         }
     }
 }

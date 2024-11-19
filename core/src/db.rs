@@ -16,7 +16,7 @@ use crate::error::{CommitError, FetchError, LoadHeaderError, OpenError};
 use crate::fxhasher::FxHasher;
 use std::fmt::Debug;
 use std::fs;
-use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 
@@ -102,11 +102,13 @@ where
     }
 
     /// Insert a new key/value pair in Db.
+    ///
     /// For the data file this means inserting:
     ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
     ///   - value size (u32)
     ///   - key data
     ///   - value data
+    ///
     /// For the erros IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
     /// failed state and become read only.  These errors all indicate serious underlying issues that
     /// can not be trivially fixed, a reopen/repair might help.
@@ -281,8 +283,8 @@ where
     /// (they will be garbage in the data file but won't be indexed).
     pub fn reindex(config: DbConfig) -> Result<Self, OpenError> {
         let config = config.create();
-        let _ = fs::remove_file(&config.files.hdx_path());
-        let _ = fs::remove_file(&config.files.odx_path());
+        let _ = fs::remove_file(config.files.hdx_path());
+        let _ = fs::remove_file(config.files.odx_path());
 
         let mut db = Self::open_internal(config, false, false)?;
 
@@ -453,12 +455,14 @@ where
     }
 
     /// Insert a new key/value pair in Db.
+    ///
     /// For the data file this means inserting:
     ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
     ///   - value size (u32)
     ///   - key data
     ///   - value data
-    /// For the erros IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
+    ///
+    /// For the errors IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
     /// failed state and become read only.  These errors all indicate serious underlying issues that
     /// can not be trivially fixed, a reopen/repair might help.
     pub fn insert(&mut self, key: K, value: &V) -> Result<(), InsertError> {
@@ -577,9 +581,7 @@ where
 
     /// Return the u64 hash of key.
     fn hash(&self, key: &K) -> u64 {
-        let mut hasher = self.hasher.build_hasher();
-        key.hash(&mut hasher);
-        hasher.finish()
+        self.hasher.hash_one(key)
     }
 
     /// Add buckets to expand capacity.

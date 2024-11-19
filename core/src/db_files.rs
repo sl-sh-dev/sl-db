@@ -9,17 +9,17 @@ use std::{fmt, fs, io};
 ///
 /// There are three ways to create a set of files:
 /// - Supply a directory and name.  This will use the the directory as a root, add a new path
-/// element for name and store the files in that directory with default names (db.dat, db.hdx, db.obx).
-/// The name is incorporated into the directory path to for the DB.
-/// For example with directory set to "/some/dir" and name set to "test_db" all the DB files will be
-/// stored at the path /some/dir/test_db/{db.dat, db.hdx, db.odx}.
+///   element for name and store the files in that directory with default names (db.dat, db.hdx, db.obx).
+///   The name is incorporated into the directory path to for the DB.
+///   For example with directory set to "/some/dir" and name set to "test_db" all the DB files will be
+///   stored at the path /some/dir/test_db/{db.dat, db.hdx, db.odx}.
 /// - Supply a data directory, index directory and name.  This works the same as above except the data
-/// file (db.dat) will be stored in the data directory and the index files (db.hdx and db.odx) will
-/// be stored in the index directory.  Use this to put the data and index files on different devices
-/// for instance.
+///   file (db.dat) will be stored in the data directory and the index files (db.hdx and db.odx) will
+///   be stored in the index directory.  Use this to put the data and index files on different devices
+///   for instance.
 /// - Supply the full paths to each file (db.dat, db.hdx and db.odx).  Use this for full control of
-/// where the files are stored.  If you use this method it is an error to try to rename the DB.
-/// Also name will just be informational when using this method.
+///   where the files are stored.  If you use this method it is an error to try to rename the DB.
+///   Also name will just be informational when using this method.
 ///
 /// The first way should be your default, second if you need to split files across devices and third
 /// if you have some requirement the first two methods don't satisfy.

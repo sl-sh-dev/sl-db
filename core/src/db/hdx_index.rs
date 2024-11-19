@@ -11,7 +11,7 @@ use crate::error::insert::InsertError;
 use crate::error::{CommitError, LoadHeaderError, ReadKeyError};
 use crate::fxhasher::{FxHashMap, FxHasher};
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -272,16 +272,14 @@ where
             .write(config.write)
             .create(config.create && config.write)
             .truncate(config.truncate && config.write)
-            .open(&config.files.hdx_path())?;
+            .open(config.files.hdx_path())?;
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
             let mut fx_hasher = FxHasher::default();
             fx_hasher.write_u64(data_header.uid());
             let salt = fx_hasher.finish();
-            let mut hasher = hasher.build_hasher();
-            salt.hash(&mut hasher);
-            let pepper = hasher.finish();
+            let pepper = hasher.hash_one(salt);
             let mut header = HdxHeader::from_data_header(data_header, &config, salt, pepper);
             header.write_header(&mut hdx_file)?;
             let bucket_size = header.bucket_size() as usize;
@@ -306,9 +304,7 @@ where
             // Check the salt/pepper.  This will make sure you are using the same hasher and it seems
             // to be stable (not the default Rust hasher for instance) since changing the hasher would
             // invalidate the index.
-            let mut hasher = hasher.build_hasher();
-            header.salt().hash(&mut hasher);
-            if header.pepper() != hasher.finish() {
+            if header.pepper() != hasher.hash_one(header.salt()) {
                 return Err(LoadHeaderError::InvalidHasher);
             }
             header
